@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Gateway error classifications now carry a failure owner and retry/failover disposition (`credential_permanent`, `provider_transient`, `policy_terminal`, …); provider status codes stay authoritative over message wording, and context-overflow detection reuses the central classifier.
+
 ## [18.0.8] - 2026-08-27
 
 ### Added
