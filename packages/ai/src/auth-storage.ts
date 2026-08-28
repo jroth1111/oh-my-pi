@@ -126,6 +126,10 @@ function isConservativeIdentityEnrichment(oldFingerprint: string, newFingerprint
 	return true;
 }
 
+function turnReservationKey(credentialId: number, incarnation: number): string {
+	return `${credentialId}:${incarnation}`;
+}
+
 const WORKSPACE_DEACTIVATED_PATTERN = /\bdeactivated_workspace\b|\bdeactivated[_ ](?:org|organization|workspace)\b/i;
 const SESSION_STICKY_CACHE_PREFIX = "session:sticky:";
 /**
@@ -796,6 +800,21 @@ export interface UsageLimitMarkResult {
 	retryAtMs?: number;
 }
 
+/** Default in-flight turn reservation TTL; at least the gateway's 255s idleTimeout. */
+export const DEFAULT_TURN_RESERVATION_TTL_MS = 255_000;
+
+export interface TurnReservation {
+	credentialId: number;
+	incarnation: number;
+	requestId: string;
+	expiresAtMs: number;
+	release(): void;
+}
+
+export type TurnReservationResult =
+	| { ok: true; reservation: TurnReservation }
+	| { ok: false; heldByRequestId: string; expiresAtMs: number };
+
 export type ModelUsageHealthState = "healthy" | "reserve" | "depleted" | "unknown";
 
 export interface ModelUsageAccountHealth {
@@ -1395,6 +1414,11 @@ export class AuthStorage {
 	#closed = false;
 	#probeLeases = new QuotaProbeLeaseBook();
 	#credentialIncarnation = new Map<number, number>();
+	#turnReservations = new Map<
+		string,
+		{ requestId: string; expiresAtMs: number; credentialId: number; incarnation: number; token: number }
+	>();
+	#turnReservationToken = 0;
 	#inflightProbes = new Map<string, { credentialId: number; blockScope: string; leaseId: string }>();
 
 	constructor(store: AuthCredentialStore, options: AuthStorageOptions = {}) {
@@ -1691,6 +1715,7 @@ export class AuthStorage {
 		this.#clearSessionStickiesForCredential(provider, credentialId);
 		this.#clearCredentialBlocks(provider, credentialId);
 		this.#probeLeases.purgeCredential(credentialId);
+		this.#purgeTurnReservationsForCredential(credentialId);
 		this.#invalidateUsageReportCache(provider);
 		logger.info("auth-storage credential incarnation bumped after identity change", {
 			provider,
@@ -1709,6 +1734,28 @@ export class AuthStorage {
 			}
 		}
 		this.#clearProviderSessionCredentialCache(provider);
+	}
+
+	#purgeTurnReservationsForCredential(credentialId: number): void {
+		const prefix = `${credentialId}:`;
+		for (const key of [...this.#turnReservations.keys()]) {
+			if (key.startsWith(prefix)) this.#turnReservations.delete(key);
+		}
+	}
+
+	#activeTurnReservation(
+		credentialId: number,
+		incarnation: number,
+		nowMs: number = Date.now(),
+	): { requestId: string; expiresAtMs: number } | undefined {
+		const key = turnReservationKey(credentialId, incarnation);
+		const held = this.#turnReservations.get(key);
+		if (!held) return undefined;
+		if (held.expiresAtMs <= nowMs) {
+			this.#turnReservations.delete(key);
+			return undefined;
+		}
+		return held;
 	}
 
 	#fanOutWorkspaceDeactivation(
@@ -1936,6 +1983,7 @@ export class AuthStorage {
 		providerKey: string,
 		credentialIndex: number,
 		blockScopeOrScopes: string | readonly string[] | undefined = undefined,
+		requestId?: string,
 	): number | undefined {
 		const nowMs = Date.now();
 		const scopes = (
@@ -1971,6 +2019,11 @@ export class AuthStorage {
 				blockedUntil = persistedScopedBlockedUntil;
 			}
 		}
+		const incarnation = this.#credentialIncarnation.get(credentialId) ?? 1;
+		const held = this.#activeTurnReservation(credentialId, incarnation, nowMs);
+		if (held && held.requestId !== requestId && (blockedUntil === undefined || held.expiresAtMs > blockedUntil)) {
+			blockedUntil = held.expiresAtMs;
+		}
 		return blockedUntil;
 	}
 
@@ -1980,8 +2033,11 @@ export class AuthStorage {
 		providerKey: string,
 		credentialIndex: number,
 		blockScope: string | readonly string[] | undefined = undefined,
+		requestId?: string,
 	): boolean {
-		return this.#getCredentialBlockedUntil(provider, providerKey, credentialIndex, blockScope) !== undefined;
+		return (
+			this.#getCredentialBlockedUntil(provider, providerKey, credentialIndex, blockScope, requestId) !== undefined
+		);
 	}
 
 	/** Marks a credential as blocked until the specified time. */
@@ -2221,6 +2277,7 @@ export class AuthStorage {
 					args.providerKey,
 					selection.index,
 					args.blockScopes ?? args.blockScope,
+					args.options?.requestId,
 				);
 				if (blockedUntil !== undefined) {
 					return { selection, usage: null, usageChecked: false, blockedUntil };
@@ -2246,6 +2303,7 @@ export class AuthStorage {
 					args.providerKey,
 					selection.index,
 					args.blockScopes ?? args.blockScope,
+					args.options?.requestId,
 				);
 				return { selection, usage: null, usageChecked: false, blockedUntil };
 			});
@@ -2318,7 +2376,7 @@ export class AuthStorage {
 		if (!strategy) {
 			for (const idx of order) {
 				const candidate = credentials[idx];
-				if (!this.#isCredentialBlocked(provider, providerKey, candidate.index)) {
+				if (!this.#isCredentialBlocked(provider, providerKey, candidate.index, undefined, options?.requestId)) {
 					return candidate;
 				}
 			}
@@ -4701,6 +4759,50 @@ export class AuthStorage {
 		return this.#credentialIncarnation.get(credentialId) ?? 1;
 	}
 
+	tryAcquireTurnReservation(args: {
+		credentialId: number;
+		incarnation: number;
+		requestId: string;
+		ttlMs?: number;
+	}): TurnReservationResult {
+		const nowMs = Date.now();
+		const ttlMs = args.ttlMs ?? DEFAULT_TURN_RESERVATION_TTL_MS;
+		const key = turnReservationKey(args.credentialId, args.incarnation);
+		const held = this.#activeTurnReservation(args.credentialId, args.incarnation, nowMs);
+		if (held && held.requestId !== args.requestId) {
+			return { ok: false, heldByRequestId: held.requestId, expiresAtMs: held.expiresAtMs };
+		}
+		const expiresAtMs = nowMs + ttlMs;
+		this.#turnReservationToken += 1;
+		const token = this.#turnReservationToken;
+		this.#turnReservations.set(key, {
+			requestId: args.requestId,
+			expiresAtMs,
+			credentialId: args.credentialId,
+			incarnation: args.incarnation,
+			token,
+		});
+		const reservation: TurnReservation = {
+			credentialId: args.credentialId,
+			incarnation: args.incarnation,
+			requestId: args.requestId,
+			expiresAtMs,
+			release: () => {
+				const current = this.#turnReservations.get(key);
+				if (current?.requestId === args.requestId && current.token === token) {
+					this.#turnReservations.delete(key);
+				}
+			},
+		};
+		return { ok: true, reservation };
+	}
+
+	releaseTurnReservation(requestId: string): void {
+		for (const [key, held] of this.#turnReservations) {
+			if (held.requestId === requestId) this.#turnReservations.delete(key);
+		}
+	}
+
 	settleQuotaProbeSuccess(requestId: string): boolean {
 		const probe = this.#inflightProbes.get(requestId);
 		if (!probe) return false;
@@ -4842,6 +4944,7 @@ export class AuthStorage {
 					args.providerKey,
 					selection.index,
 					args.blockScopes ?? args.blockScope,
+					args.options?.requestId,
 				);
 				let usage: UsageReport | null = null;
 				let usageChecked = false;
@@ -4856,6 +4959,7 @@ export class AuthStorage {
 						args.providerKey,
 						selection.index,
 						args.blockScopes ?? args.blockScope,
+						args.options?.requestId,
 					);
 				}
 				if (blockedUntil !== undefined) return { selection, usage, usageChecked, blockedUntil };
@@ -4995,7 +5099,7 @@ export class AuthStorage {
 		const sessionPreferredIsAvailable =
 			sessionPreferredIndex !== undefined &&
 			sessionPreferredCanRefreshOrUse &&
-			!this.#isCredentialBlocked(provider, providerKey, sessionPreferredIndex, blockScopes);
+			!this.#isCredentialBlocked(provider, providerKey, sessionPreferredIndex, blockScopes, options?.requestId);
 		const shouldRank = checkUsage && (!sessionPreferredIsAvailable || !sessionPreferredIsWarm || hasPlanRequirement);
 		// When ranking, seed the pinned credential first in the evaluation order so it wins genuine
 		// ties (the ranked comparator falls back to `orderPos`) without overriding a strictly-better
@@ -5038,8 +5142,13 @@ export class AuthStorage {
 		if (!shouldRank && sessionPreferredIndex !== undefined && !hasPlanRequirement) {
 			const sessionPreferredCandidate = candidates.findIndex(
 				candidate =>
-					!this.#isCredentialBlocked(provider, providerKey, candidate.selection.index, blockScopes) &&
-					candidate.selection.index === sessionPreferredIndex,
+					!this.#isCredentialBlocked(
+						provider,
+						providerKey,
+						candidate.selection.index,
+						blockScopes,
+						options?.requestId,
+					) && candidate.selection.index === sessionPreferredIndex,
 			);
 			if (sessionPreferredCandidate > 0) {
 				const [preferred] = candidates.splice(sessionPreferredCandidate, 1);
@@ -5178,8 +5287,13 @@ export class AuthStorage {
 		if (hasPlanRequirement && sessionPreferredIndex !== undefined) {
 			const sessionPreferredCandidate = candidates.findIndex(
 				candidate =>
-					!this.#isCredentialBlocked(provider, providerKey, candidate.selection.index, blockScopes) &&
-					candidate.selection.index === sessionPreferredIndex,
+					!this.#isCredentialBlocked(
+						provider,
+						providerKey,
+						candidate.selection.index,
+						blockScopes,
+						options?.requestId,
+					) && candidate.selection.index === sessionPreferredIndex,
 			);
 			if (sessionPreferredCandidate > 0) {
 				const preferred = candidates[sessionPreferredCandidate]!;
@@ -5504,7 +5618,13 @@ export class AuthStorage {
 		} = usageOptions;
 		if (
 			!allowBlocked &&
-			this.#isCredentialBlocked(provider, providerKey, selection.index, blockScopes ?? blockScope)
+			this.#isCredentialBlocked(
+				provider,
+				providerKey,
+				selection.index,
+				blockScopes ?? blockScope,
+				options?.requestId,
+			)
 		) {
 			const entries = this.#getStoredCredentials(provider);
 			const blockedId = entries[selection.index]?.id;
@@ -5520,6 +5640,8 @@ export class AuthStorage {
 					!this.#isCredentialBlocked(provider, providerKey, index, blockScopes ?? blockScope),
 			);
 			if (hasUsableSibling) return undefined;
+			const held = this.#activeTurnReservation(blockedId, this.getCredentialIncarnation(blockedId));
+			if (held && held.requestId !== options?.requestId) return undefined;
 			const probeScope = blockScope ?? "";
 			const lease = this.tryAcquireQuotaProbeLease(blockedId, probeScope);
 			if (!lease) return undefined;
@@ -5529,6 +5651,17 @@ export class AuthStorage {
 					blockScope: probeScope,
 					leaseId: lease,
 				});
+			}
+		}
+		if (options?.requestId) {
+			const reserveId = this.#getStoredCredentials(provider)[selection.index]?.id;
+			if (reserveId !== undefined) {
+				const acquired = this.tryAcquireTurnReservation({
+					credentialId: reserveId,
+					incarnation: this.getCredentialIncarnation(reserveId),
+					requestId: options.requestId,
+				});
+				if (!acquired.ok) return undefined;
 			}
 		}
 
