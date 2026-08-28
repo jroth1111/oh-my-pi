@@ -199,4 +199,18 @@ describe("RouteRegistry", () => {
 		expect(route?.fallbacks.context_overflow).toEqual(["overflow-backup"]);
 		expect(route?.fallbacks.context_overflow ?? []).not.toContain("quota-backup");
 	});
+
+	it("get returns registered virtual routes and ignores catalog models (negative)", () => {
+		const registry = new RouteRegistry(id => (id === "gpt-5" ? fakeModel("gpt-5") : undefined));
+		registry.register({
+			id: "virtual-impl",
+			root: { type: "target", model: "other" },
+		});
+		const virtual = registry.get("virtual-impl");
+		expect(virtual?.id).toBe("virtual-impl");
+		expect(virtual?.targets).toEqual(["other"]);
+		expect(registry.get("gpt-5")).toBeUndefined();
+		expect(registry.get("missing")).toBeUndefined();
+		expect(registry.resolve("gpt-5")?.id).toBe("gpt-5");
+	});
 });
