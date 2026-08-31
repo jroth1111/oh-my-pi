@@ -681,12 +681,11 @@ function recordProviderHealthFailure(
 
 function rememberPromptCacheHit(
 	cacheStore: PromptCacheAffinityStore,
-	body: unknown,
-	requestId: string,
+	fingerprint: string,
 	model: Model<Api>,
 	sessionId: string,
 ): void {
-	cacheStore.remember(resolvePromptCacheKey(body) ?? requestId, {
+	cacheStore.remember(fingerprint, {
 		provider: model.provider,
 		model: model.id,
 		accountId: sessionId,
@@ -700,6 +699,7 @@ async function handleFormatEndpoint(
 	peer: string,
 	health: ProviderHealthBook,
 	cacheStore: PromptCacheAffinityStore,
+	pathname?: string,
 ): Promise<Response> {
 	const startedAt = performance.now();
 	const requestId = crypto.randomUUID();
@@ -754,6 +754,16 @@ async function handleFormatEndpoint(
 		if (controller.signal.aborted) return clientClosedResponse(route);
 		const message = error instanceof Error ? error.message : String(error);
 		return route.module.formatError(400, "invalid_request_error", message);
+	}
+	// Native Gemini clients select streaming via the URL (`streamGenerateContent`)
+	// rather than a `stream` body field. Default generateContent to JSON; only the
+	// stream URL (or an explicit body.stream) opts into SSE.
+	if (
+		route.label === "gemini-v1beta" &&
+		!(isRecord(body) && typeof body.stream === "boolean") &&
+		pathname !== undefined
+	) {
+		parsed.stream = pathname.includes("streamGenerateContent");
 	}
 	await runHook(bootOpts.hooks?.beforeRequest, {
 		requestId,
@@ -1053,7 +1063,7 @@ async function handleFormatEndpoint(
 						return formatError(classified.status, classified.type, errorMessage);
 					}
 					bootOpts.storage.settleQuotaProbeSuccess(requestId);
-					rememberPromptCacheHit(cacheStore, body, requestId, model, sessionId);
+					rememberPromptCacheHit(cacheStore, fingerprint, model, sessionId);
 					await runHook(bootOpts.hooks?.afterRequest, {
 						requestId,
 						routeId: compiled.id,
@@ -1178,7 +1188,7 @@ async function handleFormatEndpoint(
 			return clientClosedResponse(route);
 		}
 		sseStream = releaseTurnOnStreamEnd(held.stream, bootOpts.storage, requestId, commitGate);
-		rememberPromptCacheHit(cacheStore, body, requestId, model, sessionId);
+		rememberPromptCacheHit(cacheStore, fingerprint, model, sessionId);
 		await runHook(bootOpts.hooks?.afterRequest, {
 			requestId,
 			routeId: compiled.id,
@@ -1543,7 +1553,7 @@ async function handlePiNative(
 						return formatError(classified.status, classified.type, errorMessage);
 					}
 					bootOpts.storage.settleQuotaProbeSuccess(requestId);
-					rememberPromptCacheHit(cacheStore, body, requestId, model, sessionId);
+					rememberPromptCacheHit(cacheStore, fingerprint, model, sessionId);
 					return json(200, { message }, gatewayResponseHeaders(model, { requestId, message, startedAt }));
 				} catch (error) {
 					if (controller.signal.aborted) return aborted();
@@ -1655,7 +1665,7 @@ async function handlePiNative(
 			return aborted();
 		}
 		sseStream = releaseTurnOnStreamEnd(held.stream, bootOpts.storage, requestId, commitGate);
-		rememberPromptCacheHit(cacheStore, body, requestId, model, sessionId);
+		rememberPromptCacheHit(cacheStore, fingerprint, model, sessionId);
 		return new Response(sseStream, {
 			status: 200,
 			headers: {
@@ -1971,7 +1981,7 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 				// Provider-format dispatch.
 				const formatRoute = FORMAT_ROUTES[pathname];
 				if (formatRoute && req.method === "POST") {
-					return withCors(await handleFormatEndpoint(formatRoute, boot, req, peer, health, cacheStore), req);
+					return withCors(await handleFormatEndpoint(formatRoute, boot, req, peer, health, cacheStore, pathname), req);
 				}
 
 				// Pi-native fast path. Same auth + provider plumbing as the
