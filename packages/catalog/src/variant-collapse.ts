@@ -32,7 +32,7 @@
  * generator, and the model-manager merge point.
  */
 import { buildCompat, buildModel } from "./build";
-import { Effort } from "./effort";
+import { Effort, THINKING_EFFORTS } from "./effort";
 import { stripThinkingVariantToken } from "./identity/family";
 import { resolveModelThinking } from "./model-thinking";
 import type { Api, Model, ModelSpec, Provider, ThinkingConfig } from "./types";
@@ -58,6 +58,15 @@ export interface EffortVariantFamily {
 	 */
 	members: readonly string[];
 	/**
+	 * Preferred default wire id: overrides the member-order default for the
+	 * collapsed spec's `requestModelId` when this member is live. Lets a
+	 * mandatory-reasoning family advertise a canonical tier that is not its
+	 * numeric floor (Cursor Grok 4.5/4.6 default to `-medium`, the only tier the
+	 * Start plan serves; the `-low` floor is refused). Ignored when absent from
+	 * the input or retired.
+	 */
+	defaultMember?: string;
+	/**
 	 * Wire ids upstream no longer serves (e.g. a deployment killed while
 	 * discovery still advertises it). Fresh collapsing never routes to them,
 	 * and stale collapsed snapshots (bundled catalog, cache rows,
@@ -72,8 +81,14 @@ export interface EffortVariantFamily {
 	 * efforts fall back to `requestModelId ?? id`.
 	 */
 	routing: Readonly<Partial<Record<Effort | "off", string>>>;
-	/** Explicit capability surface for the collapsed spec — no inference. */
-	thinking: Readonly<Omit<ThinkingConfig, "effortRouting" | "suppressWhenOff">>;
+	/**
+	 * Explicit capability surface for the collapsed spec — no inference. Omit
+	 * for single-wire-id renames on providers where effort is encoded in the
+	 * upstream id itself (Devin): with one member and no routing there is no
+	 * controllable surface, and the collapsed spec must carry no thinking
+	 * rather than an effort ladder whose every tier resolves to one wire id.
+	 */
+	thinking?: Readonly<Omit<ThinkingConfig, "effortRouting" | "suppressWhenOff">>;
 	/** Thinking-off requests must explicitly suppress thinking on the wire. */
 	suppressWhenOff?: boolean;
 	/**
@@ -89,6 +104,15 @@ export interface EffortVariantFamily {
 
 export interface VariantCollapseTable {
 	families: readonly EffortVariantFamily[];
+	/**
+	 * Provider-scoped selector aliases: short native-CLI names and dotted
+	 * upstream spellings → logical model id. Unlike family members and
+	 * `extraAliases` these are deliberately invisible to the bare-id lookup
+	 * ({@link resolveBareVariantAlias}) and to the reverse index — a generic
+	 * label like `gpt` or `opus` only means something once a provider is
+	 * named, and must never hijack an unqualified selector or re-key config.
+	 */
+	providerAliases?: Readonly<Record<string, string>>;
 }
 
 /** `X` + `X-thinking` hand family: off routes to the bare id, efforts to `-thinking`. */
@@ -111,18 +135,25 @@ function thinkingPair(baseId: string, name: string): EffortVariantFamily {
 	};
 }
 
-type DevinTierRoutes = Partial<Record<"off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max", string>>;
+type TierRoutes = Partial<Record<"off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max", string>>;
 
 /** Devin families with a `-max` sibling: five wire tiers, `low` floor. */
 const DEVIN_FIVE_TIER_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max];
 /** Pre-5.6 Devin GPT families top out at `-xhigh`: four wire tiers, `low` floor. */
 const DEVIN_FOUR_TIER_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh];
 
-function devinTierFamily(
+/**
+ * Build one effort-tier family from a tier→wire-id map: routing keeps only the
+ * listed efforts, `members` dedupes the targets in tier order, and thinking is
+ * `mode: "effort"` (mandatory when the family has no `off` route). Shared by the
+ * Devin and Cursor tables, whose per-effort siblings follow the same shape.
+ */
+function tierFamily(
 	id: string,
 	name: string,
-	routes: DevinTierRoutes,
+	routes: TierRoutes,
 	efforts: readonly Effort[],
+	defaultMember?: string,
 ): EffortVariantFamily {
 	const routing: Partial<Record<Effort | "off", string>> = {};
 	if (routes.off) routing.off = routes.off;
@@ -167,6 +198,27 @@ function devinTierFamily(
 			efforts,
 			...(routes.off ? undefined : { requiresEffort: true }),
 		},
+		...(defaultMember !== undefined ? { defaultMember } : undefined),
+	};
+}
+
+/** Devin tier family with a server-declared default effort. */
+function devinTierFamily(
+	id: string,
+	name: string,
+	routes: TierRoutes,
+	efforts: readonly Effort[],
+	defaultEffort?: Effort,
+): EffortVariantFamily {
+	const family = tierFamily(id, name, routes, efforts);
+	if (defaultEffort === undefined || family.thinking === undefined) return family;
+	const defaultMember = family.routing[defaultEffort];
+	return {
+		...family,
+		...(defaultMember !== undefined
+			? { members: [defaultMember, ...family.members.filter(member => member !== defaultMember)], defaultMember }
+			: undefined),
+		thinking: { ...family.thinking, defaultLevel: defaultEffort },
 	};
 }
 
@@ -177,7 +229,7 @@ function devinTierFamily(
 function devinGpt56Families(variant: "luna" | "sol" | "terra", name: string): readonly EffortVariantFamily[] {
 	const base = `gpt-5-6-${variant}`;
 	return [
-		devinTierFamily(
+		tierFamily(
 			base,
 			name,
 			{
@@ -190,7 +242,7 @@ function devinGpt56Families(variant: "luna" | "sol" | "terra", name: string): re
 			},
 			DEVIN_FIVE_TIER_EFFORTS,
 		),
-		devinTierFamily(
+		tierFamily(
 			`${base}-fast`,
 			`${name} Fast`,
 			{
@@ -290,7 +342,7 @@ function geminiLevelFlashFamily(version: "3.6" | "3.7", ...additionalMembers: st
 }
 
 const GEMINI_36_FLASH_FAMILY = geminiLevelFlashFamily("3.6", "gemini-3.6-flash-tiered");
-const GEMINI_37_FLASH_FAMILY = geminiLevelFlashFamily("3.7");
+const GEMINI_37_FLASH_FAMILY = geminiLevelFlashFamily("3.7", "gemini-3.7-flash-tiered");
 
 function geminiProFamily(mode: "budget" | "google-level"): EffortVariantFamily {
 	const budget = mode === "budget";
@@ -395,7 +447,7 @@ export const GEMINI_CLI_VARIANT_COLLAPSE_TABLE: VariantCollapseTable = {
 };
 export const DEVIN_VARIANT_COLLAPSE_TABLE: VariantCollapseTable = {
 	families: [
-		devinTierFamily(
+		tierFamily(
 			"claude-opus-5",
 			"Claude Opus 5",
 			{
@@ -407,7 +459,7 @@ export const DEVIN_VARIANT_COLLAPSE_TABLE: VariantCollapseTable = {
 			},
 			DEVIN_FIVE_TIER_EFFORTS,
 		),
-		devinTierFamily(
+		tierFamily(
 			"claude-opus-5-fast",
 			"Claude Opus 5 Fast",
 			{
@@ -419,7 +471,7 @@ export const DEVIN_VARIANT_COLLAPSE_TABLE: VariantCollapseTable = {
 			},
 			DEVIN_FIVE_TIER_EFFORTS,
 		),
-		devinTierFamily(
+		tierFamily(
 			"claude-fable-5",
 			"Claude Fable 5",
 			{
@@ -431,7 +483,7 @@ export const DEVIN_VARIANT_COLLAPSE_TABLE: VariantCollapseTable = {
 			},
 			DEVIN_FIVE_TIER_EFFORTS,
 		),
-		devinTierFamily(
+		tierFamily(
 			"claude-sonnet-5",
 			"Claude Sonnet 5",
 			{
@@ -443,7 +495,7 @@ export const DEVIN_VARIANT_COLLAPSE_TABLE: VariantCollapseTable = {
 			},
 			DEVIN_FIVE_TIER_EFFORTS,
 		),
-		devinTierFamily(
+		tierFamily(
 			"claude-opus-4-7",
 			"Claude Opus 4.7",
 			{
@@ -455,7 +507,7 @@ export const DEVIN_VARIANT_COLLAPSE_TABLE: VariantCollapseTable = {
 			},
 			DEVIN_FIVE_TIER_EFFORTS,
 		),
-		devinTierFamily(
+		tierFamily(
 			"claude-opus-4-7-fast",
 			"Claude Opus 4.7 Fast",
 			{
@@ -467,7 +519,7 @@ export const DEVIN_VARIANT_COLLAPSE_TABLE: VariantCollapseTable = {
 			},
 			DEVIN_FIVE_TIER_EFFORTS,
 		),
-		devinTierFamily(
+		tierFamily(
 			"claude-opus-4-8",
 			"Claude Opus 4.8",
 			{
@@ -479,7 +531,7 @@ export const DEVIN_VARIANT_COLLAPSE_TABLE: VariantCollapseTable = {
 			},
 			DEVIN_FIVE_TIER_EFFORTS,
 		),
-		devinTierFamily(
+		tierFamily(
 			"claude-opus-4-8-fast",
 			"Claude Opus 4.8 Fast",
 			{
@@ -491,7 +543,7 @@ export const DEVIN_VARIANT_COLLAPSE_TABLE: VariantCollapseTable = {
 			},
 			DEVIN_FIVE_TIER_EFFORTS,
 		),
-		devinTierFamily(
+		tierFamily(
 			"gpt-5-2",
 			"GPT-5.2",
 			{
@@ -503,7 +555,7 @@ export const DEVIN_VARIANT_COLLAPSE_TABLE: VariantCollapseTable = {
 			},
 			DEVIN_FOUR_TIER_EFFORTS,
 		),
-		devinTierFamily(
+		tierFamily(
 			"gpt-5-3-codex",
 			"GPT-5.3 Codex",
 			{
@@ -514,7 +566,7 @@ export const DEVIN_VARIANT_COLLAPSE_TABLE: VariantCollapseTable = {
 			},
 			DEVIN_FOUR_TIER_EFFORTS,
 		),
-		devinTierFamily(
+		tierFamily(
 			"gpt-5-3-codex-fast",
 			"GPT-5.3 Codex Fast",
 			{
@@ -525,7 +577,7 @@ export const DEVIN_VARIANT_COLLAPSE_TABLE: VariantCollapseTable = {
 			},
 			DEVIN_FOUR_TIER_EFFORTS,
 		),
-		devinTierFamily(
+		tierFamily(
 			"gpt-5-4",
 			"GPT-5.4",
 			{
@@ -537,7 +589,7 @@ export const DEVIN_VARIANT_COLLAPSE_TABLE: VariantCollapseTable = {
 			},
 			DEVIN_FOUR_TIER_EFFORTS,
 		),
-		devinTierFamily(
+		tierFamily(
 			"gpt-5-4-fast",
 			"GPT-5.4 Fast",
 			{
@@ -549,7 +601,7 @@ export const DEVIN_VARIANT_COLLAPSE_TABLE: VariantCollapseTable = {
 			},
 			DEVIN_FOUR_TIER_EFFORTS,
 		),
-		devinTierFamily(
+		tierFamily(
 			"gpt-5-4-mini",
 			"GPT-5.4 Mini",
 			{
@@ -560,7 +612,7 @@ export const DEVIN_VARIANT_COLLAPSE_TABLE: VariantCollapseTable = {
 			},
 			DEVIN_FOUR_TIER_EFFORTS,
 		),
-		devinTierFamily(
+		tierFamily(
 			"gpt-5-5",
 			"GPT-5.5",
 			{
@@ -572,7 +624,7 @@ export const DEVIN_VARIANT_COLLAPSE_TABLE: VariantCollapseTable = {
 			},
 			DEVIN_FOUR_TIER_EFFORTS,
 		),
-		devinTierFamily(
+		tierFamily(
 			"gpt-5-5-fast",
 			"GPT-5.5 Fast",
 			{
@@ -587,7 +639,7 @@ export const DEVIN_VARIANT_COLLAPSE_TABLE: VariantCollapseTable = {
 		...devinGpt56Families("luna", "GPT-5.6 Luna"),
 		...devinGpt56Families("sol", "GPT-5.6 Sol"),
 		...devinGpt56Families("terra", "GPT-5.6 Terra"),
-		devinTierFamily(
+		tierFamily(
 			"kimi-k3",
 			"Kimi K3",
 			{
@@ -597,7 +649,7 @@ export const DEVIN_VARIANT_COLLAPSE_TABLE: VariantCollapseTable = {
 			},
 			[Effort.Low, Effort.High, Effort.Max],
 		),
-		devinTierFamily(
+		tierFamily(
 			"swe-1-7",
 			"SWE-1.7",
 			{
@@ -606,7 +658,7 @@ export const DEVIN_VARIANT_COLLAPSE_TABLE: VariantCollapseTable = {
 			},
 			[Effort.Medium, Effort.Max],
 		),
-		devinTierFamily(
+		tierFamily(
 			"grok-4-5",
 			"Grok 4.5",
 			{
@@ -616,7 +668,7 @@ export const DEVIN_VARIANT_COLLAPSE_TABLE: VariantCollapseTable = {
 			},
 			[Effort.Low, Effort.Medium, Effort.High],
 		),
-		devinTierFamily(
+		tierFamily(
 			"inkling",
 			"Inkling",
 			{
@@ -629,7 +681,7 @@ export const DEVIN_VARIANT_COLLAPSE_TABLE: VariantCollapseTable = {
 			},
 			DEVIN_FIVE_TIER_EFFORTS,
 		),
-		devinTierFamily(
+		tierFamily(
 			"gemini-3-1-pro",
 			"Gemini 3.1 Pro",
 			{
@@ -638,7 +690,7 @@ export const DEVIN_VARIANT_COLLAPSE_TABLE: VariantCollapseTable = {
 			},
 			[Effort.Low, Effort.High],
 		),
-		devinTierFamily(
+		tierFamily(
 			"gemini-3-5-flash",
 			"Gemini 3.5 Flash",
 			{
@@ -649,7 +701,7 @@ export const DEVIN_VARIANT_COLLAPSE_TABLE: VariantCollapseTable = {
 			},
 			[Effort.Minimal, Effort.Low, Effort.Medium, Effort.High],
 		),
-		devinTierFamily(
+		tierFamily(
 			"gemini-3-6-flash",
 			"Gemini 3.6 Flash",
 			{
@@ -660,7 +712,7 @@ export const DEVIN_VARIANT_COLLAPSE_TABLE: VariantCollapseTable = {
 			},
 			[Effort.Minimal, Effort.Low, Effort.Medium, Effort.High],
 		),
-		devinTierFamily(
+		tierFamily(
 			"gemini-3-flash",
 			"Gemini 3 Flash",
 			{
@@ -694,7 +746,7 @@ export const DEVIN_VARIANT_COLLAPSE_TABLE: VariantCollapseTable = {
 		},
 		// GLM-5.2 1M — paid variants that consume weekly quota.  Collapse the
 		// three 1M-context variants into one entry with proper effort routing.
-		devinTierFamily(
+		tierFamily(
 			"glm-5-2-1m",
 			"GLM-5.2 1M",
 			{
@@ -704,14 +756,334 @@ export const DEVIN_VARIANT_COLLAPSE_TABLE: VariantCollapseTable = {
 			},
 			[Effort.High, Effort.XHigh],
 		),
+		// Gemini 3.7 Flash — four wire tiers, native default `-medium`.
+		devinTierFamily(
+			"gemini-3-7-flash",
+			"Gemini 3.7 Flash",
+			{
+				minimal: "gemini-3-7-flash-minimal",
+				low: "gemini-3-7-flash-low",
+				medium: "gemini-3-7-flash-medium",
+				high: "gemini-3-7-flash-high",
+			},
+			[Effort.Minimal, Effort.Low, Effort.Medium, Effort.High],
+			Effort.Medium,
+		),
+		// SWE-1.7 Lightning — like SWE-1.7, the top tier is the bare wire uid.
+		devinTierFamily(
+			"swe-1-7-lightning",
+			"SWE-1.7 Lightning",
+			{
+				medium: "swe-1-7-lightning-medium",
+				max: "swe-1-7-lightning",
+			},
+			[Effort.Medium, Effort.Max],
+			Effort.Medium,
+		),
+		devinTierFamily(
+			"grok-4-6",
+			"Grok 4.6",
+			{
+				low: "grok-4-6-low",
+				medium: "grok-4-6-medium",
+				high: "grok-4-6-high",
+				xhigh: "grok-4-6-xhigh",
+			},
+			DEVIN_FOUR_TIER_EFFORTS,
+			Effort.Medium,
+		),
+		devinTierFamily(
+			"deepseek-v4-flash",
+			"DeepSeek V4 Flash",
+			{
+				low: "deepseek-v4-flash-low",
+				high: "deepseek-v4-flash-high",
+				max: "deepseek-v4-flash-max",
+			},
+			[Effort.Low, Effort.High, Effort.Max],
+			Effort.High,
+		),
+		devinTierFamily(
+			"deepseek-v4-pro",
+			"DeepSeek V4 Pro",
+			{
+				low: "deepseek-v4-pro-low",
+				high: "deepseek-v4-pro-high",
+				max: "deepseek-v4-pro-max",
+			},
+			[Effort.Low, Effort.High, Effort.Max],
+			Effort.High,
+		),
+		devinTierFamily(
+			"nemotron-3-ultra",
+			"Nemotron 3 Ultra",
+			{
+				off: "nemotron-3-ultra-none",
+				medium: "nemotron-3-ultra-medium",
+				high: "nemotron-3-ultra-high",
+			},
+			[Effort.Medium, Effort.High],
+			Effort.High,
+		),
+		// Claude Haiku 4.5 ships under one opaque wire uid with no tier
+		// siblings: a rename-only collapse. Devin encodes effort in the uid, so
+		// a single-member family has no controllable surface — no `thinking`.
+		{
+			id: "claude-haiku-4-5",
+			name: "Claude Haiku 4.5",
+			members: ["MODEL_PRIVATE_11"],
+			routing: {},
+		},
+	],
+	/**
+	 * Devin CLI selector parity. The native picker accepts short family labels
+	 * (`opus`, `swe`) and the dotted upstream spelling of each current family.
+	 * Both are only meaningful under `devin/`, so they stay provider-scoped:
+	 * a bare `gpt` or `claude` must keep resolving by the global rules.
+	 */
+	providerAliases: {
+		claude: "claude-sonnet-5",
+		codex: "gpt-5-3-codex",
+		gemini: "gemini-3-7-flash",
+		gpt: "gpt-5-6-terra",
+		haiku: "claude-haiku-4-5",
+		opus: "claude-opus-5",
+		sonnet: "claude-sonnet-5",
+		swe: "swe-1-7-lightning",
+		"claude-haiku-4.5": "claude-haiku-4-5",
+		"gemini-3.7-flash": "gemini-3-7-flash",
+		"glm-5.2": "glm-5-2",
+		"gpt-5.6-luna": "gpt-5-6-luna",
+		"gpt-5.6-sol": "gpt-5-6-sol",
+		"gpt-5.6-terra": "gpt-5-6-terra",
+		"grok-4.6": "grok-4-6",
+		"swe-1.7": "swe-1-7",
+		"swe-1.7-lightning": "swe-1-7-lightning",
+	},
+};
+
+/** Cursor's Grok tier tokens equal the effort id, so routing is a direct map. */
+const CURSOR_GROK_45_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effort.High];
+const CURSOR_GROK_46_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh];
+/** Cursor GPT-5.6 (Luna/Sol/Terra) serves the full five-tier `low..max` scale. */
+const CURSOR_GPT_56_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max];
+
+/**
+ * Cursor serves Grok 4.5/4.6 as per-effort sibling ids
+ * (`cursor-grok-4.6-low|-medium|-high|-xhigh`) alongside a parallel `-fast`
+ * service-tier lane (`-low-fast`, …). Each lane collapses into its own logical
+ * model — the `-fast` axis is a sibling family, never a second routing
+ * dimension — with effort routing onto the live sibling wire ids. The mandatory
+ * `-medium` default is the tier Cursor's Start plan serves at fixed settings;
+ * the `-low` floor is refused there (issue #9478).
+ */
+function cursorGrokFamilies(version: "4.5" | "4.6", efforts: readonly Effort[]): readonly EffortVariantFamily[] {
+	const build = (fast: boolean): EffortVariantFamily => {
+		const suffix = fast ? "-fast" : "";
+		const routes: TierRoutes = {};
+		for (const effort of efforts) {
+			routes[effort] = `cursor-grok-${version}-${effort}${suffix}`;
+		}
+		return tierFamily(
+			`cursor-grok-${version}${suffix}`,
+			`Grok ${version}${fast ? " Fast" : ""}`,
+			routes,
+			efforts,
+			`cursor-grok-${version}-${Effort.Medium}${suffix}`,
+		);
+	};
+	return [build(false), build(true)];
+}
+
+/**
+ * Cursor serves GPT-5.6 (Luna/Sol/Terra) as per-tier sibling ids
+ * (`gpt-5.6-luna-none|-low|-medium|-high|-xhigh|-max`) with a parallel `-fast`
+ * service-tier lane (`gpt-5.6-luna-high-fast`, …). Same shape as Devin's
+ * `devinGpt56Families`, but cursor keys the version with a dot, marks the
+ * thinking-off tier `-none`, and names the fast lane with `-fast` (Devin uses
+ * `-priority`). Each lane collapses into its own logical model — `-fast` is a
+ * sibling SKU, never a second routing dimension — while the 1M / Max Mode SKU
+ * stays a separate row (handled by discovery's context-window resolution).
+ */
+function cursorGpt56Families(variant: "luna" | "sol" | "terra", name: string): readonly EffortVariantFamily[] {
+	const build = (fast: boolean): EffortVariantFamily => {
+		const suffix = fast ? "-fast" : "";
+		const base = `gpt-5.6-${variant}`;
+		return tierFamily(
+			`${base}${suffix}`,
+			`${name}${fast ? " Fast" : ""}`,
+			{
+				off: `${base}-none${suffix}`,
+				low: `${base}-low${suffix}`,
+				medium: `${base}-medium${suffix}`,
+				high: `${base}-high${suffix}`,
+				xhigh: `${base}-xhigh${suffix}`,
+				max: `${base}-max${suffix}`,
+			},
+			CURSOR_GPT_56_EFFORTS,
+		);
+	};
+	return [build(false), build(true)];
+}
+
+/** `cursor` per-effort sibling families collapsed per service-tier lane: Grok 4.5/4.6 plus GPT-5.6 Luna/Sol/Terra. */
+export const CURSOR_VARIANT_COLLAPSE_TABLE: VariantCollapseTable = {
+	families: [
+		...cursorGrokFamilies("4.5", CURSOR_GROK_45_EFFORTS),
+		...cursorGrokFamilies("4.6", CURSOR_GROK_46_EFFORTS),
+		...cursorGpt56Families("luna", "GPT-5.6 Luna"),
+		...cursorGpt56Families("sol", "GPT-5.6 Sol"),
+		...cursorGpt56Families("terra", "GPT-5.6 Terra"),
 	],
 };
+
+type CursorTierToken = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
+interface CursorTierMember<TSpec extends VariantSpecLike> {
+	baseId: string;
+	fast: boolean;
+	spec: TSpec;
+	tier: CursorTierToken;
+}
+
+const CURSOR_TIER_ID_PATTERN = /^(.+?)-(extra-high|none|minimal|low|medium|high|xhigh|max)(-fast)?$/;
+const CURSOR_TIER_BASE_PATTERN = /-(extra-high|none|minimal|low|medium|high|xhigh|max)$/;
+const CURSOR_THINKING_TOKEN_PATTERN = /(^|-)thinking($|-)/;
+const CURSOR_TIER_BY_TOKEN: Readonly<Record<string, CursorTierToken | undefined>> = {
+	none: "none",
+	minimal: "minimal",
+	low: "low",
+	medium: "medium",
+	high: "high",
+	"extra-high": "xhigh",
+	xhigh: "xhigh",
+	max: "max",
+};
+
+/** Whether an existing logical row already routes every live member in `members`. */
+function collapsedCursorLogicalMatches<TSpec extends VariantSpecLike>(
+	spec: TSpec,
+	members: readonly CursorTierMember<TSpec>[],
+): boolean {
+	const routing = spec.thinking?.effortRouting;
+	if (!routing) return false;
+	for (const member of members) {
+		if (spec.requestModelId === member.spec.id) continue;
+		let matched = false;
+		for (const effort of VARIANT_ROUTING_KEYS) {
+			if (routing[effort] === member.spec.id) {
+				matched = true;
+				break;
+			}
+		}
+		if (!matched) return false;
+	}
+	return true;
+}
+
+/**
+ * Derive safe Cursor per-effort families from live wire ids. A family is
+ * intentionally left expanded when its base is an independent live SKU, any
+ * member already has a thinking ladder, member metadata differs, or a tier
+ * token is also part of a product name.
+ */
+function deriveCursorEffortFamilies<TSpec extends VariantSpecLike>(specs: readonly TSpec[]): EffortVariantFamily[] {
+	const byId = new Map<string, TSpec>();
+	const groups = new Map<string, CursorTierMember<TSpec>[]>();
+	const candidateBases = new Set<string>();
+
+	for (const spec of specs) {
+		if (!byId.has(spec.id)) byId.set(spec.id, spec);
+		const match = CURSOR_TIER_ID_PATTERN.exec(spec.id);
+		if (!match) continue;
+		const baseId = match[1];
+		const tier = CURSOR_TIER_BY_TOKEN[match[2] ?? ""];
+		const fast = match[3] !== undefined;
+		if (!baseId || !tier) continue;
+		const member = { baseId, fast, spec, tier };
+		const key = `${baseId}\0${fast ? "fast" : "standard"}`;
+		const group = groups.get(key);
+		if (group) {
+			group.push(member);
+		} else {
+			groups.set(key, [member]);
+		}
+		candidateBases.add(baseId);
+	}
+
+	const unsafeBases = new Set<string>();
+	for (const group of groups.values()) {
+		const first = group[0];
+		if (!first) continue;
+		const { baseId } = first;
+		const standardGroup = groups.get(`${baseId}\0standard`) ?? [];
+		const standardBase = byId.get(baseId);
+		const laneBase = byId.get(`${baseId}${first.fast ? "-fast" : ""}`);
+		const independentStandardBase =
+			standardBase !== undefined && !collapsedCursorLogicalMatches(standardBase, standardGroup);
+		const independentLaneBase = laneBase !== undefined && !collapsedCursorLogicalMatches(laneBase, group);
+		if (
+			independentStandardBase ||
+			independentLaneBase ||
+			new Set(group.map(member => member.tier)).size !== group.length ||
+			CURSOR_TIER_BASE_PATTERN.test(baseId) ||
+			CURSOR_THINKING_TOKEN_PATTERN.test(baseId) ||
+			candidateBases.has(`${baseId}-thinking`) ||
+			byId.has(`${baseId}-thinking`) ||
+			byId.has(`${baseId}-thinking-fast`) ||
+			byId.has(`${baseId}-fast-thinking`) ||
+			group.some(member => member.spec.thinking !== undefined || member.spec.requestModelId !== undefined) ||
+			group.some(member => candidateBases.has(`${baseId}-${member.tier}`))
+		) {
+			unsafeBases.add(baseId);
+		}
+	}
+
+	const families: EffortVariantFamily[] = [];
+	for (const group of groups.values()) {
+		const first = group[0];
+		if (!first || group.length < 2 || unsafeBases.has(first.baseId)) continue;
+		if (
+			group.some(
+				member =>
+					member.spec.api !== first.spec.api ||
+					member.spec.baseUrl !== first.spec.baseUrl ||
+					member.spec.contextWindow !== first.spec.contextWindow ||
+					member.spec.maxTokens !== first.spec.maxTokens ||
+					member.spec.cursorMaxMode !== first.spec.cursorMaxMode ||
+					!Bun.deepEquals(member.spec.cost, first.spec.cost) ||
+					!Bun.deepEquals(member.spec.compat, first.spec.compat),
+			)
+		) {
+			continue;
+		}
+
+		const routes: TierRoutes = {};
+		for (const member of group) {
+			if (member.tier === "none") {
+				routes.off = member.spec.id;
+			} else {
+				routes[member.tier] = member.spec.id;
+			}
+		}
+		const efforts = THINKING_EFFORTS.filter(effort => routes[effort] !== undefined);
+		if (efforts.length === 0) continue;
+		const strippedName = first.spec.name
+			.replace(/\s+(extra-high|none|minimal|low|medium|high|xhigh|max)(\s+fast)?$/i, "")
+			.trim();
+		const baseName = strippedName === first.spec.id ? first.baseId : strippedName || first.baseId;
+		const suffix = first.fast ? "-fast" : "";
+		families.push(tierFamily(`${first.baseId}${suffix}`, `${baseName}${first.fast ? " Fast" : ""}`, routes, efforts));
+	}
+	return families;
+}
 
 /** Provider id → hand collapse table. The CCA providers diverge on thinking transport. */
 export const VARIANT_COLLAPSE_TABLES: Readonly<Record<string, VariantCollapseTable>> = {
 	"google-antigravity": ANTIGRAVITY_VARIANT_COLLAPSE_TABLE,
 	"google-gemini-cli": GEMINI_CLI_VARIANT_COLLAPSE_TABLE,
 	devin: DEVIN_VARIANT_COLLAPSE_TABLE,
+	cursor: CURSOR_VARIANT_COLLAPSE_TABLE,
 };
 
 /**
@@ -908,9 +1280,10 @@ function refreshCollapsedThinking<TSpec extends VariantSpecLike>(
 	// Scope snapshot self-heal to families carrying a curated per-effort budget
 	// contract (Antigravity gemini-3.x). Their routing targets are all verified
 	// live, so rebuilding routing here is safe; families without `effortBudgets`
-	// (derived `X`/`X-thinking` pairs, claude pairs) keep their presence-filtered
-	// snapshot routing untouched.
-	if (!spec.reasoning || family.thinking.effortBudgets === undefined) return spec;
+	// (derived `X`/`X-thinking` pairs, claude pairs, surface-less renames) keep
+	// their presence-filtered snapshot routing untouched.
+	const familyThinking = family.thinking;
+	if (!spec.reasoning || familyThinking?.effortBudgets === undefined) return spec;
 	const routing: Partial<Record<Effort | "off", string>> = {};
 	let hasRouting = false;
 	for (const effortKey in family.routing) {
@@ -920,7 +1293,7 @@ function refreshCollapsedThinking<TSpec extends VariantSpecLike>(
 			hasRouting = true;
 		}
 	}
-	const thinking: ThinkingConfig = { ...family.thinking };
+	const thinking: ThinkingConfig = { ...familyThinking };
 	if (hasRouting) thinking.effortRouting = routing;
 	if (family.suppressWhenOff) thinking.suppressWhenOff = true;
 	const offTarget = family.routing.off;
@@ -930,6 +1303,37 @@ function refreshCollapsedThinking<TSpec extends VariantSpecLike>(
 		return spec;
 	}
 	return { ...spec, thinking, ...(requestModelId !== undefined ? { requestModelId } : {}) };
+}
+
+/**
+ * Re-point a collapsed snapshot's default wire id to the family's declared
+ * {@link EffortVariantFamily.defaultMember} when the snapshot still advertises a
+ * different default. Bundled catalog and cache rows freeze `requestModelId` from
+ * before a family gained a preferred default (Cursor Grok 4.5/4.6 → `-medium`),
+ * and neither the existing-collapsed pass-through nor `refreshCollapsedThinking`
+ * (scoped to `effortBudgets` families) would otherwise correct them — leaving an
+ * effort-less request clamped to the refused `-low` tier (issue #9478). Only
+ * re-points when the target is a live route in the snapshot's own
+ * `effortRouting`. Returns `spec` by reference when unchanged.
+ */
+function reconcileDefaultMember<TSpec extends VariantSpecLike>(
+	spec: TSpec,
+	family: EffortVariantFamily,
+	presentMembers?: ReadonlySet<string>,
+): TSpec {
+	const defaultMember = family.defaultMember;
+	if (defaultMember === undefined || defaultMember === spec.id) return spec;
+	const target =
+		presentMembers === undefined || presentMembers.has(defaultMember)
+			? defaultMember
+			: family.members.find(id => presentMembers.has(id));
+	if (target === undefined || spec.requestModelId === target) return spec;
+	const routing = spec.thinking?.effortRouting;
+	if (routing === undefined) return spec;
+	for (const key in routing) {
+		if (routing[key as Effort | "off"] === target) return { ...spec, requestModelId: target };
+	}
+	return spec;
 }
 
 /**
@@ -972,7 +1376,7 @@ export function collapseEffortVariants<TSpec extends VariantSpecLike>(
 			// Recycled extraAliases rows are healed in a later pass.
 			const refreshed =
 				existing !== undefined && existingCollapsed
-					? refreshCollapsedThinking(reconciled ?? existing, family, retired)
+					? reconcileDefaultMember(refreshCollapsedThinking(reconciled ?? existing, family, retired), family)
 					: reconciled;
 			if (refreshed !== undefined && refreshed !== existing) {
 				familyIdBySpecId.set(family.id, family.id);
@@ -985,9 +1389,11 @@ export function collapseEffortVariants<TSpec extends VariantSpecLike>(
 		if (existing) familyIdBySpecId.set(family.id, family.id);
 
 		if (existingCollapsed) {
-			// Mixed input: the collapsed entry (live truth) wins; stale raw
-			// members are deduped away. Retired targets are re-pointed first.
-			replacement.set(family.id, reconciled as TSpec);
+			// Mixed input: the collapsed entry wins; stale raw members are deduped
+			// away. Retired targets are re-pointed first, then the default wire id
+			// prefers the family's declared member when live and otherwise falls
+			// back to the first member the account actually advertised.
+			replacement.set(family.id, reconcileDefaultMember(reconciled as TSpec, family, new Set(rawPresent)));
 			continue;
 		}
 
@@ -1014,9 +1420,12 @@ export function collapseEffortVariants<TSpec extends VariantSpecLike>(
 		// A family that routes efforts to a live thinking backing id reasons
 		// even when upstream metadata forgot to mark the members.
 		const reasoning = memberSpecs.some(spec => spec.reasoning) || hasEffortRoute;
-		const thinking: ThinkingConfig = { ...family.thinking };
-		if (hasRouting) thinking.effortRouting = routing;
-		if (family.suppressWhenOff) thinking.suppressWhenOff = true;
+		const familyThinking = family.thinking;
+		const thinking: ThinkingConfig | undefined = familyThinking ? { ...familyThinking } : undefined;
+		if (thinking !== undefined) {
+			if (hasRouting) thinking.effortRouting = routing;
+			if (family.suppressWhenOff) thinking.suppressWhenOff = true;
+		}
 
 		const input: ("text" | "image")[] = [];
 		if (memberSpecs.some(spec => spec.input.includes("text"))) input.push("text");
@@ -1031,10 +1440,17 @@ export function collapseEffortVariants<TSpec extends VariantSpecLike>(
 			contextWindow: maxOrNull(memberSpecs.map(spec => spec.contextWindow)),
 			maxTokens: maxOrNull(memberSpecs.map(spec => spec.maxTokens)),
 		};
-		// The default wire id is the highest-priority live member; omit when it
-		// equals the logical id (bare/thinking pairs) — `resolveWireModelId`
-		// falls back. Retired members never become the default.
-		const defaultWireId = rawPresent.find(id => !retired?.has(id)) ?? rawPresent[0];
+		// The default wire id is the family's declared `defaultMember` when live,
+		// else the highest-priority live member. Omitted when it equals the
+		// logical id (bare/thinking pairs) — `resolveWireModelId` falls back.
+		// Retired members never become the default.
+		const preferredDefault =
+			family.defaultMember !== undefined &&
+			presentSet.has(family.defaultMember) &&
+			!retired?.has(family.defaultMember)
+				? family.defaultMember
+				: undefined;
+		const defaultWireId = preferredDefault ?? rawPresent.find(id => !retired?.has(id)) ?? rawPresent[0];
 		if (defaultWireId === family.id) {
 			if (usedAbsentEffortRoute) {
 				collapsed.requestModelId = defaultWireId as string;
@@ -1044,7 +1460,10 @@ export function collapseEffortVariants<TSpec extends VariantSpecLike>(
 		} else {
 			collapsed.requestModelId = defaultWireId as string;
 		}
-		if (reasoning) {
+		// A surface-less family (single wire id, uid-encoded effort) keeps
+		// `reasoning` but carries no thinking: every tier would resolve to the
+		// same upstream id, so there is nothing to select.
+		if (reasoning && thinking !== undefined) {
 			collapsed.thinking = thinking;
 		} else {
 			delete collapsed.thinking;
@@ -1091,10 +1510,59 @@ export function collapseEffortVariants<TSpec extends VariantSpecLike>(
 }
 
 /**
- * Collapse a full mixed-provider list: per provider, the hand table (when
- * registered) plus the automatic `X`/`X-thinking` pair rule. Used by the
- * catalog generator; the runtime equivalent lives at the model-manager merge
- * point. Output is regrouped by provider — callers re-sort.
+ * Re-key model-to-model configuration after collapse removes a referenced
+ * member id. Qualified targets keep their provider; bare targets remain bare.
+ */
+function retargetCollapsedModelReferences<TSpec extends VariantSpecLike>(specs: TSpec[]): void {
+	const liveIdsByProvider = new Map<string, Set<string>>();
+	for (const spec of specs) {
+		const provider = spec.provider.toLowerCase();
+		let liveIds = liveIdsByProvider.get(provider);
+		if (!liveIds) {
+			liveIds = new Set<string>();
+			liveIdsByProvider.set(provider, liveIds);
+		}
+		liveIds.add(spec.id.toLowerCase());
+	}
+
+	for (let index = 0; index < specs.length; index++) {
+		const spec = specs[index];
+		if (!spec) continue;
+		const contextPromotionTarget = resolveCollapsedModelReference(
+			spec.contextPromotionTarget,
+			spec.provider,
+			liveIdsByProvider,
+		);
+		const compactionModel = resolveCollapsedModelReference(spec.compactionModel, spec.provider, liveIdsByProvider);
+		if (contextPromotionTarget === spec.contextPromotionTarget && compactionModel === spec.compactionModel) continue;
+		specs[index] = { ...spec, contextPromotionTarget, compactionModel };
+	}
+}
+
+function resolveCollapsedModelReference(
+	target: string | undefined,
+	currentProvider: Provider,
+	liveIdsByProvider: ReadonlyMap<string, ReadonlySet<string>>,
+): string | undefined {
+	if (target === undefined) return undefined;
+	const separator = target.indexOf("/");
+	const provider = separator >= 0 ? target.slice(0, separator) : currentProvider;
+	const providerId = provider.toLowerCase();
+	const modelId = separator >= 0 ? target.slice(separator + 1) : target;
+	const normalizedModelId = modelId.trim().toLowerCase();
+	const liveIds = liveIdsByProvider.get(providerId);
+	if (liveIds?.has(normalizedModelId)) return target;
+	const alias = resolveRegisteredVariantAlias(provider, normalizedModelId);
+	if (alias === undefined || !liveIds?.has(alias.toLowerCase())) return target;
+	return separator >= 0 ? `${provider}/${alias}` : alias;
+}
+
+/**
+ * Collapse a full mixed-provider list: per provider, the hand table, Cursor's
+ * conservative live effort-sibling rule, and the automatic `X`/`X-thinking`
+ * pair rule. Used by the catalog generator; the runtime equivalent lives at
+ * the model-manager merge point. Output is regrouped by provider — callers
+ * re-sort.
  */
 export function collapseEffortVariantsAcrossProviders<TSpec extends VariantSpecLike>(specs: readonly TSpec[]): TSpec[] {
 	const byProvider = new Map<string, TSpec[]>();
@@ -1110,12 +1578,20 @@ export function collapseEffortVariantsAcrossProviders<TSpec extends VariantSpecL
 	for (const [provider, slice] of byProvider) {
 		const table = VARIANT_COLLAPSE_TABLES[provider];
 		let result = table ? collapseEffortVariants(slice, table) : slice;
+		if (provider === "cursor") {
+			const cursorDerived = deriveCursorEffortFamilies(result);
+			if (cursorDerived.length > 0) {
+				result = collapseEffortVariants(result, { families: cursorDerived });
+			}
+		}
 		const derived = deriveThinkingPairFamilies(result, table);
 		if (derived.length > 0) {
 			result = collapseEffortVariants(result, { families: derived });
 		}
+		registerCollapsedVariantAliases(provider, result);
 		out.push(...result);
 	}
+	retargetCollapsedModelReferences(out);
 	return out;
 }
 
@@ -1138,11 +1614,19 @@ export function collapseBuiltModelVariants<TApi extends Api>(models: readonly Mo
 interface VariantAliasIndex {
 	/** lowercased retired id → replacement model id. */
 	forward: Map<string, string>;
+	/**
+	 * lowercased provider-scoped alias → replacement model id. Kept apart from
+	 * `forward` so bare-id and reverse lookups never see it.
+	 */
+	providerScoped: Map<string, string>;
 	/** replacement model id → retired ids that resolve to it. */
-	reverse: Map<string, readonly string[]>;
-	/** Collapsed logical ids declared by the table. */
+	reverse: Map<string, string[]>;
+	/** Collapsed logical ids declared by the table or observed at runtime. */
 	familyIds: Set<string>;
 }
+
+const dynamicAliasIndexes = new Map<string, VariantAliasIndex>();
+const VARIANT_ROUTING_KEYS: readonly (Effort | "off")[] = ["off", ...THINKING_EFFORTS];
 
 const kAliasIndex = Symbol("variant-collapse.aliasIndex");
 
@@ -1150,72 +1634,118 @@ interface TableWithAliasIndex extends VariantCollapseTable {
 	[kAliasIndex]?: VariantAliasIndex;
 }
 
+function createAliasIndex(): VariantAliasIndex {
+	return {
+		forward: new Map<string, string>(),
+		providerScoped: new Map<string, string>(),
+		reverse: new Map<string, string[]>(),
+		familyIds: new Set<string>(),
+	};
+}
+
+function addVariantAlias(index: VariantAliasIndex, from: string, to: string): boolean {
+	if (from === to || index.forward.has(from.toLowerCase())) return false;
+	index.forward.set(from.toLowerCase(), to);
+	const sources = index.reverse.get(to);
+	if (sources) {
+		sources.push(from);
+	} else {
+		index.reverse.set(to, [from]);
+	}
+	return true;
+}
+
+/**
+ * Persist aliases embedded in collapsed routing so generated catalog rows and
+ * newly discovered families expose the same selector migrations as hand tables.
+ */
+function registerCollapsedVariantAliases(provider: Provider, specs: readonly VariantSpecLike[]): void {
+	const providerId = provider.toLowerCase();
+	let index = dynamicAliasIndexes.get(providerId);
+	for (const spec of specs) {
+		const routing = spec.thinking?.effortRouting;
+		if (!routing) continue;
+		let registered = false;
+		for (const effort of VARIANT_ROUTING_KEYS) {
+			const source = routing[effort];
+			if (!source || source === spec.id) continue;
+			index ??= createAliasIndex();
+			registered = addVariantAlias(index, source, spec.id) || registered;
+		}
+		if (spec.requestModelId && spec.requestModelId !== spec.id) {
+			index ??= createAliasIndex();
+			registered = addVariantAlias(index, spec.requestModelId, spec.id) || registered;
+		}
+		if (registered) index?.familyIds.add(spec.id);
+	}
+	if (index) dynamicAliasIndexes.set(providerId, index);
+}
+
+function resolveRegisteredVariantAlias(provider: Provider, normalizedModelId: string): string | undefined {
+	const providerId = provider.toLowerCase();
+	const table = VARIANT_COLLAPSE_TABLES[provider] ?? VARIANT_COLLAPSE_TABLES[providerId];
+	return (
+		(table ? getAliasIndex(table).forward.get(normalizedModelId) : undefined) ??
+		dynamicAliasIndexes.get(providerId)?.forward.get(normalizedModelId)
+	);
+}
+
 function getAliasIndex(table: VariantCollapseTable): VariantAliasIndex {
 	const tagged = table as TableWithAliasIndex;
 	const cached = tagged[kAliasIndex];
 	if (cached) return cached;
-	const forward = new Map<string, string>();
-	const reverse = new Map<string, string[]>();
-	const add = (from: string, to: string) => {
-		if (from === to) return;
-		forward.set(from.toLowerCase(), to);
-		const sources = reverse.get(to);
-		if (sources) {
-			sources.push(from);
-		} else {
-			reverse.set(to, [from]);
-		}
-	};
-	const familyIds = new Set<string>();
+	const index = createAliasIndex();
 	for (const family of table.families) {
-		familyIds.add(family.id);
-		for (const member of family.members) add(member, family.id);
-		for (const alias of family.extraAliases ?? []) add(alias, family.id);
+		index.familyIds.add(family.id);
+		for (const member of family.members) addVariantAlias(index, member, family.id);
+		for (const alias of family.extraAliases ?? []) addVariantAlias(index, alias, family.id);
 	}
-	const index: VariantAliasIndex = { forward, reverse, familyIds };
+	for (const alias in table.providerAliases) {
+		const target = table.providerAliases[alias] as string;
+		if (alias !== target) index.providerScoped.set(alias.toLowerCase(), target);
+	}
 	tagged[kAliasIndex] = index;
 	return index;
 }
 
 /**
- * Resolve a retired effort-tier variant id (collapsed member, recycled id) to
- * its replacement model id for `provider` via the hand table. Returns
- * `undefined` when the id is not a known alias; derived `X-thinking` members
- * resolve through `stripThinkingVariantToken` instead. Callers must try an
- * exact model lookup first — a live model always wins over an alias.
+ * Resolve a retired effort-tier variant id, registered live alias, or
+ * provider-scoped native alias to its replacement model id for `provider`.
+ * Returns `undefined` when the id is unknown. Callers must try an exact model
+ * lookup first because a live model always wins over an alias.
  */
 export function resolveVariantAlias(provider: Provider, modelId: string): string | undefined {
+	const normalized = modelId.trim().toLowerCase();
+	const registered = resolveRegisteredVariantAlias(provider, normalized);
+	if (registered !== undefined) return registered;
 	const table = VARIANT_COLLAPSE_TABLES[provider] ?? VARIANT_COLLAPSE_TABLES[provider.toLowerCase()];
-	if (!table) return undefined;
-	return getAliasIndex(table).forward.get(modelId.trim().toLowerCase());
+	return table ? getAliasIndex(table).providerScoped.get(normalized) : undefined;
 }
 
 /** Bare-id alias hit: replacement id plus the providers declaring it. */
 export interface BareVariantAliasHit {
 	id: string;
-	/** Providers whose table declares the alias — candidates from these win ties. */
+	/** Providers declaring the alias — candidates from these win ties. */
 	providers: readonly Provider[];
 }
 
 /**
- * Provider-agnostic hand-table alias lookup for bare-id selectors. Returns
- * the declaring providers so callers can prefer their models when the
- * replacement id exists on unrelated providers too (e.g. a retired Cursor
- * tier id must not resolve to `openai/gpt-5.4`).
+ * Provider-agnostic alias lookup for bare-id selectors. Returns the declaring
+ * providers so callers can prefer their models when the replacement id exists
+ * on unrelated providers too (e.g. a retired Cursor tier id must not resolve
+ * to `openai/gpt-5.4`).
  */
 export function resolveBareVariantAlias(modelId: string): BareVariantAliasHit | undefined {
 	const normalized = modelId.trim().toLowerCase();
-	for (const provider in VARIANT_COLLAPSE_TABLES) {
-		const table = VARIANT_COLLAPSE_TABLES[provider] as VariantCollapseTable;
-		const hit = getAliasIndex(table).forward.get(normalized);
+	const providerIds = new Set<string>();
+	for (const provider in VARIANT_COLLAPSE_TABLES) providerIds.add(provider);
+	for (const provider of dynamicAliasIndexes.keys()) providerIds.add(provider);
+	for (const provider of providerIds) {
+		const hit = resolveRegisteredVariantAlias(provider, normalized);
 		if (hit === undefined) continue;
 		const providers: Provider[] = [];
-		for (const candidate in VARIANT_COLLAPSE_TABLES) {
-			// Match by resolved alias target, not table identity: the CCA providers
-			// now hold distinct table objects that still share these aliases.
-			if (
-				getAliasIndex(VARIANT_COLLAPSE_TABLES[candidate] as VariantCollapseTable).forward.get(normalized) === hit
-			) {
+		for (const candidate of providerIds) {
+			if (resolveRegisteredVariantAlias(candidate, normalized) === hit) {
 				providers.push(candidate);
 			}
 		}
@@ -1226,14 +1756,18 @@ export function resolveBareVariantAlias(modelId: string): BareVariantAliasHit | 
 
 /**
  * Reverse alias lookup: the retired ids that resolve to `modelId` for
- * `provider` via the hand table. Used to re-key config keyed by raw member
- * ids (models.yml `modelOverrides`, suppressed selectors) onto the collapsed
- * model. Empty for providers without a table.
+ * `provider` via hand-table or registered live aliases. Used to re-key config
+ * keyed by raw member ids (models.yml `modelOverrides`, suppressed selectors)
+ * onto the collapsed model.
  */
 export function getVariantAliasSources(provider: Provider, modelId: string): readonly string[] {
-	const table = VARIANT_COLLAPSE_TABLES[provider] ?? VARIANT_COLLAPSE_TABLES[provider.toLowerCase()];
-	if (!table) return [];
-	return getAliasIndex(table).reverse.get(modelId) ?? [];
+	const providerId = provider.toLowerCase();
+	const table = VARIANT_COLLAPSE_TABLES[provider] ?? VARIANT_COLLAPSE_TABLES[providerId];
+	const staticSources = table ? getAliasIndex(table).reverse.get(modelId) : undefined;
+	const dynamicSources = dynamicAliasIndexes.get(providerId)?.reverse.get(modelId);
+	if (!staticSources) return dynamicSources ?? [];
+	if (!dynamicSources) return staticSources;
+	return [...new Set([...staticSources, ...dynamicSources])];
 }
 
 function maxOrNull(values: ReadonlyArray<number | null>): number | null {

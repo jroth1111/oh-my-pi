@@ -19,7 +19,7 @@
  */
 
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
-import { extractHttpStatusFromError, extractRetryHint, logger } from "@oh-my-pi/pi-utils";
+import { $env, extractHttpStatusFromError, extractRetryHint, logger } from "@oh-my-pi/pi-utils";
 import type { ApiKeyResolver } from "../auth-retry";
 import type { AuthStorage } from "../auth-storage";
 import * as AIError from "../error";
@@ -30,7 +30,8 @@ import * as openaiChat from "../providers/openai-chat-server";
 import * as openaiResponses from "../providers/openai-responses-server";
 import * as piNative from "../providers/pi-native-server";
 import { completeSimple, streamSimple } from "../stream";
-import type { Api, AssistantMessageEventStream, Context, Model, SimpleStreamOptions } from "../types";
+import type { Api, AssistantMessage, AssistantMessageEventStream, Context, Model, SimpleStreamOptions } from "../types";
+import type { ClientUsageIdentity } from "../usage";
 import { deterministicUuid } from "../utils/deterministic-id";
 import { parseBind } from "../utils/parse-bind";
 import {
@@ -39,6 +40,7 @@ import {
 	gatewayResponseHeaders,
 	isAuthorized,
 	json,
+	resolveClientIdentity,
 	resolvePeer,
 	withCors,
 } from "./http";
@@ -53,6 +55,15 @@ import { DEFAULT_AUTH_GATEWAY_BIND } from "./types";
 // ParsedFormatRequest / ParsedFormatOptions / FormatModule come from ./types.
 
 export type ModelResolver = (modelId: string) => Model<Api> | undefined;
+
+/**
+ * Default cooldown for Cursor credentials that fail with a non-usage-limit
+ * auth error in the gateway path. Cursor 401s are often temporary token
+ * expiries; a short cooldown lets the OAuth refresh fix the token while a
+ * sibling credential handles traffic. Overridable via
+ * `CURSOR_GATEWAY_COOLDOWN_MS` env var.
+ */
+const CURSOR_GATEWAY_DEFAULT_COOLDOWN_MS = 60_000;
 
 export interface AuthGatewayBootOptions extends AuthGatewayServerOptions {
 	/** Source of credentials. Caller wires this to a broker-backed AuthStorage. */
@@ -160,6 +171,21 @@ function buildStreamOptions(parsed: ParsedFormatRequest, api: Api, signal: Abort
 	if (options.serviceTier !== undefined) opts.serviceTier = options.serviceTier;
 	if (options.cacheRetention !== undefined) opts.cacheRetention = options.cacheRetention;
 	if (options.include !== undefined) opts.include = options.include;
+	// Cursor-specific gateway options
+	if (options.cursorAutoMode !== undefined) opts.cursorAutoMode = options.cursorAutoMode;
+	if (options.cursorToolPassthrough !== undefined) opts.cursorToolPassthrough = options.cursorToolPassthrough;
+	// Cursor control headers without a first-class `SimpleStreamOptions` slot
+	// are threaded through `opts.headers` so Cursor's backend receives them
+	// (cursor.ts spreads caller headers into the upstream request).
+	if (options.cursorExcludeTools !== undefined) {
+		opts.headers = { ...(opts.headers ?? {}), "x-cursor-agent-exclude-tools": options.cursorExcludeTools };
+	}
+	if (options.cursorLocalCliMode) {
+		opts.headers = { ...(opts.headers ?? {}), "local-cli-mode": "true" };
+	}
+	if (options.cursorDevExperimentOverrides !== undefined) {
+		opts.headers = { ...(opts.headers ?? {}), "x-dev-experiment-overrides": options.cursorDevExperimentOverrides };
+	}
 	// Client-supplied `prompt_cache_key` wins; otherwise derive a stable
 	// key from the model + system + tools so prefix caching engages on
 	// Codex-class backends across turns of the same logical conversation.
@@ -263,6 +289,40 @@ async function refreshGatewayApiKeyAfterAuthError(
 		if (!switched) return undefined;
 		return storage.getApiKey(provider, sessionId, { modelId: model.id, signal });
 	}
+	// Cursor auth failures are often temporary token expiries rather than
+	// permanently bad credentials. Apply a short cooldown (default 60s) via
+	// `markUsageLimitReached` so the OAuth refresh has a chance to fix the
+	// token and a sibling credential is used in the meantime. Only fall
+	// through to permanent invalidation when no sibling is available.
+	if (provider === "cursor") {
+		const rawCooldown = $env.CURSOR_GATEWAY_COOLDOWN_MS;
+		const parsedCooldown = rawCooldown !== undefined && rawCooldown !== "" ? Number(rawCooldown) : undefined;
+		const cooldownMs =
+			parsedCooldown !== undefined && Number.isFinite(parsedCooldown) && parsedCooldown >= 0
+				? parsedCooldown
+				: CURSOR_GATEWAY_DEFAULT_COOLDOWN_MS;
+		const { switched, retryAtMs } = await storage.markUsageLimitReached(provider, sessionId, {
+			retryAfterMs: cooldownMs,
+			baseUrl: model.baseUrl,
+			modelId: model.id,
+			apiKey: oldKey,
+			signal,
+		});
+		logger.debug("auth-gateway retrying cursor credential after cooldown block", {
+			format,
+			provider,
+			peer,
+			switched,
+			cooldownMs,
+			retryAtMs,
+			error: message,
+		});
+		if (switched) {
+			return storage.getApiKey(provider, sessionId, { modelId: model.id, signal });
+		}
+		// No sibling available — fall through to invalidation so the next
+		// request re-resolves from scratch after the cooldown expires.
+	}
 	await storage.invalidateCredentialMatching(provider, oldKey, { sessionId, signal });
 	logger.debug("auth-gateway retrying provider request after credential invalidation", {
 		format,
@@ -331,6 +391,31 @@ function clientClosedResponse(route: { module: FormatModule }): Response {
 	return route.module.formatError(499, "request_aborted", "client closed request");
 }
 
+/**
+ * Attribute one settled upstream request to the originating client via the
+ * broker's observed-usage channel (`AuthStorage.recordObservedUsage`, batched
+ * by the remote store). Error/aborted turns still record — the provider
+ * billed whatever tokens the partial turn consumed; zero-usage messages
+ * (pre-flight failures) are skipped.
+ */
+function recordGatewayUsage(
+	storage: AuthStorage,
+	model: Model<Api>,
+	client: ClientUsageIdentity,
+	message: AssistantMessage,
+): void {
+	const usage = message.usage;
+	if (usage.input + usage.output + usage.cacheRead + usage.cacheWrite === 0) return;
+	storage.recordObservedUsage({
+		provider: model.provider,
+		model: model.id,
+		at: message.timestamp || Date.now(),
+		usage: { input: usage.input, output: usage.output, cacheRead: usage.cacheRead, cacheWrite: usage.cacheWrite },
+		costUsd: usage.cost.total,
+		client,
+	});
+}
+
 function mirrorRequestAbort(req: Request): AbortController {
 	const controller = new AbortController();
 	if (req.signal.aborted) {
@@ -378,6 +463,7 @@ async function handleFormatEndpoint(
 	if (!model) {
 		return route.module.formatError(404, "invalid_request_error", `Unknown model: ${modelId}`);
 	}
+	const client = resolveClientIdentity(req.headers);
 
 	// Parse the wire-format request BEFORE resolving the credential so we
 	// have a stable per-conversation `sessionId` to thread into AuthStorage.
@@ -400,8 +486,47 @@ async function handleFormatEndpoint(
 	{
 		const captured = captureRequestHeaders(req.headers);
 		parsed.options.headers = { ...captured, ...(parsed.options.headers ?? {}) };
+		// Cursor-specific control headers: parse into typed options so they
+		// flow through `buildStreamOptions` into `SimpleStreamOptions`.
+		if (captured["x-cursor-auto-mode"] === "true") {
+			parsed.options.cursorAutoMode = true;
+		}
+		if (captured["x-cursor-tool-passthrough"] === "true") {
+			parsed.options.cursorToolPassthrough = true;
+		}
+		if (captured["x-cursor-agent-exclude-tools"]) {
+			parsed.options.cursorExcludeTools = captured["x-cursor-agent-exclude-tools"];
+		}
+		if (captured["local-cli-mode"] === "true") {
+			parsed.options.cursorLocalCliMode = true;
+		}
+		if (captured["x-dev-experiment-overrides"]) {
+			parsed.options.cursorDevExperimentOverrides = captured["x-dev-experiment-overrides"];
+		}
 	}
 	if (controller.signal.aborted) return clientClosedResponse(route);
+
+	const supportsOpenAIImageFileReferences =
+		model.api === "openai-responses" ||
+		model.api === "azure-openai-responses" ||
+		model.api === "openai-codex-responses";
+	if (
+		route.label === "openai-responses" &&
+		!supportsOpenAIImageFileReferences &&
+		parsed.context.messages.some(
+			message =>
+				message.role === "toolResult" &&
+				message.content.some(
+					block => block.type === "image" && block.providerFile?.provider === "openai" && block.providerFile.id,
+				),
+		)
+	) {
+		return route.module.formatError(
+			400,
+			"invalid_request_error",
+			"OpenAI image file IDs in tool outputs require a Responses-compatible upstream model",
+		);
+	}
 
 	// Sticky credential id: honour the client's `prompt_cache_key` when
 	// supplied (so external session ids align), otherwise derive from
@@ -460,6 +585,7 @@ async function handleFormatEndpoint(
 		try {
 			if (controller.signal.aborted) return clientClosedResponse(route);
 			const message = await completeSimple(model, parsed.context, streamOpts);
+			recordGatewayUsage(bootOpts.storage, model, client, message);
 			if (message.stopReason === "aborted" || message.stopReason === "error") {
 				const errorMessage =
 					message.errorMessage ??
@@ -473,12 +599,12 @@ async function handleFormatEndpoint(
 				if (message.stopReason === "aborted") {
 					return route.module.formatError(499, "request_aborted", errorMessage);
 				}
-				const classified = classifyGatewayError(errorMessage);
+				const classified = classifyGatewayError(message.errorClassificationMessage ?? errorMessage);
 				return route.module.formatError(classified.status, classified.type, errorMessage);
 			}
 			return json(
 				200,
-				route.module.encodeResponse(message, parsed.modelId),
+				route.module.encodeResponse(message, parsed.modelId, parsed.options),
 				gatewayResponseHeaders(model, { requestId, message, startedAt }),
 			);
 		} catch (error) {
@@ -503,6 +629,10 @@ async function handleFormatEndpoint(
 		return route.module.formatError(classified.status, classified.type, classified.message);
 	}
 	if (controller.signal.aborted) return clientClosedResponse(route);
+	void events
+		.result()
+		.then(message => recordGatewayUsage(bootOpts.storage, model, client, message))
+		.catch(() => {});
 
 	const sseStream = route.module.encodeStream(events, parsed.modelId, parsed.options, {
 		signal: controller.signal,
@@ -570,6 +700,7 @@ async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, pe
 	if (!model) {
 		return piNative.formatError(404, "invalid_request_error", `Unknown model: ${parsed.modelId}`);
 	}
+	const client = resolveClientIdentity(req.headers);
 	// Pi-native already parsed `streamOpts.sessionId` (when set by the
 	// client); fall back to the derived key so credential-stickiness lines
 	// up with cache-prefix stickiness — same identity used for both means
@@ -643,6 +774,7 @@ async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, pe
 		try {
 			if (controller.signal.aborted) return aborted();
 			const message = await completeSimple(model, parsed.context, streamOpts);
+			recordGatewayUsage(bootOpts.storage, model, client, message);
 			if (message.stopReason === "aborted" || message.stopReason === "error") {
 				const errorMessage =
 					message.errorMessage ??
@@ -656,7 +788,7 @@ async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, pe
 				if (message.stopReason === "aborted") {
 					return piNative.formatError(499, "request_aborted", errorMessage);
 				}
-				const classified = classifyGatewayError(errorMessage);
+				const classified = classifyGatewayError(message.errorClassificationMessage ?? errorMessage);
 				return piNative.formatError(classified.status, classified.type, errorMessage);
 			}
 			return json(200, { message }, gatewayResponseHeaders(model, { requestId, message, startedAt }));
@@ -678,6 +810,10 @@ async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, pe
 		return piNative.formatError(classified.status, classified.type, classified.message);
 	}
 	if (controller.signal.aborted) return aborted();
+	void events
+		.result()
+		.then(message => recordGatewayUsage(bootOpts.storage, model, client, message))
+		.catch(() => {});
 
 	const sseStream = piNative.encodeStream(events, parsed.modelId, parsed.options, {
 		signal: controller.signal,
@@ -730,19 +866,45 @@ async function handleCredentialsCheck(storage: AuthStorage, signal: AbortSignal)
 	return json(200, { generatedAt: Date.now(), credentials });
 }
 
+/**
+ * Row shape for `GET /v1/models`. Beyond the OpenAI-standard `id`/`object`/
+ * `owned_by`, rows advertise the catalog metadata OpenAI-compatible clients
+ * (omp's own proxy discovery, Zed's openai_compatible provider, ...) read to
+ * size and capability-gate discovered models: `context_length`,
+ * `max_output_tokens`, `input_modalities`, and `supports_tools` (only emitted
+ * when the catalog explicitly reports `false`; absent means usable).
+ */
+interface ModelListRow {
+	id: string;
+	object: "model";
+	owned_by: string;
+	api: Api;
+	display_name: string;
+	context_length?: number;
+	max_output_tokens?: number;
+	input_modalities: ("text" | "image")[];
+	supports_tools?: boolean;
+}
+
 function handleModelsList(opts: AuthGatewayBootOptions): Response {
 	const seen = new Set<string>();
-	const data: Array<{ id: string; object: "model"; owned_by: string; api: Api }> = [];
+	const data: ModelListRow[] = [];
 	for (const model of opts.listModels?.() ?? []) {
 		const id = `${model.provider}/${model.id}`;
 		if (seen.has(id)) continue;
 		seen.add(id);
-		data.push({
+		const row: ModelListRow = {
 			id,
 			object: "model",
 			owned_by: model.provider,
 			api: model.api,
-		});
+			display_name: model.name,
+			input_modalities: model.input,
+		};
+		if (model.contextWindow != null) row.context_length = model.contextWindow;
+		if (model.maxTokens != null) row.max_output_tokens = model.maxTokens;
+		if (model.supportsTools === false) row.supports_tools = false;
+		data.push(row);
 	}
 	return json(200, { object: "list", data });
 }

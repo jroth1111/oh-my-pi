@@ -13,26 +13,33 @@ import { type } from "@oh-my-pi/omptype";
 import { logger, structuredCloneJSON } from "@oh-my-pi/pi-utils";
 import { resolvePromptCacheKey } from "../auth-gateway/http";
 import type { AuthGatewayStreamControl, AuthGatewayParsedRequest as ParsedRequest } from "../auth-gateway/types";
+import { resolveAuthGatewayWireModelId } from "../auth-gateway/types";
 import * as AIError from "../error";
 import type {
 	AssistantMessage,
+	AssistantMessageEvent,
 	AssistantMessageEventStream,
 	ComputerAction,
 	ComputerSafetyCheck,
 	ComputerScreenshotRef,
 	Context,
+	ImageContent,
 	Message,
 	TextContent,
 	ThinkingContent,
 	Tool,
 	ToolCall,
 } from "../types";
+import { decodeDataUri } from "./openai-data-uri";
 import {
 	type OpenAIResponsesComputerCallItem,
 	type OpenAIResponsesComputerCallOutputItem,
+	type OpenAIResponsesCustomToolCallOutputItem,
 	type OpenAIResponsesFunctionCallItem,
 	type OpenAIResponsesFunctionCallOutputItem,
 	type OpenAIResponsesInputContent,
+	type OpenAIResponsesInputFileBlock,
+	type OpenAIResponsesInputImageBlock,
 	type OpenAIResponsesOutputContent,
 	type OpenAIResponsesReasoningItem,
 	type OpenAIResponsesTool,
@@ -161,8 +168,8 @@ function extractReasoningTextFromItem(item: OpenAIResponsesReasoningItem): strin
 type InputBlockUnion =
 	| { type: "input_text"; text: string }
 	| { type: "text"; text: string }
-	| { type: "input_image"; detail?: "auto" | "low" | "high" | "original"; image_url?: string; file_id?: string }
-	| { type: "input_file"; file_id?: string; filename?: string; file_data?: string; file_url?: string };
+	| OpenAIResponsesInputImageBlock
+	| OpenAIResponsesInputFileBlock;
 
 /** Walk an input message's content array and retain only text for the generic view.
  * Native image/file references are preserved on the message provider payload. */
@@ -290,21 +297,64 @@ function ensureAssistantPlaceholder(messages: Message[], modelId: string, now: n
 	return placeholder;
 }
 
-/** Flatten a function_call_output array form (text + refusal) into a single string. */
-function flattenFunctionOutputArray(blocks: readonly unknown[]): string {
-	const parts: string[] = [];
-	for (const raw of blocks) {
+function functionOutputContent(output: string | readonly unknown[] | undefined): (TextContent | ImageContent)[] {
+	if (typeof output === "string") return [{ type: "text", text: output }];
+	if (!output) return [{ type: "text", text: "" }];
+
+	const content: (TextContent | ImageContent)[] = [];
+	let legacyText = "";
+	const flushLegacyText = (): void => {
+		if (legacyText.length === 0) return;
+		content.push({ type: "text", text: legacyText });
+		legacyText = "";
+	};
+	for (const raw of output) {
 		if (!isObj(raw)) continue;
-		const t = raw.type;
-		if (t === "output_text" || t === "text") {
+		const blockType = raw.type;
+		if (blockType === "input_text") {
+			flushLegacyText();
 			const text = asString(raw.text);
-			if (text) parts.push(text);
-		} else if (t === "refusal") {
+			if (text !== undefined) content.push({ type: "text", text });
+			continue;
+		}
+		if (blockType === "output_text" || blockType === "text") {
+			const text = asString(raw.text);
+			if (text) legacyText += text;
+			continue;
+		}
+		if (blockType === "refusal") {
 			const refusal = asString(raw.refusal);
-			if (refusal) parts.push(`[refusal: ${refusal}]`);
+			if (refusal) legacyText += `[refusal: ${refusal}]`;
+			continue;
+		}
+		if (blockType === "input_image") {
+			flushLegacyText();
+			const imageUrl = asString(raw.image_url) || undefined;
+			const decoded = imageUrl ? decodeDataUri(imageUrl) : undefined;
+			const detail =
+				raw.detail === "auto" || raw.detail === "low" || raw.detail === "high" || raw.detail === "original"
+					? raw.detail
+					: undefined;
+			if (decoded) {
+				content.push({ type: "image", ...decoded, ...(detail ? { detail } : {}) });
+			} else {
+				const referenceImage: ImageContent = {
+					type: "image",
+					data: "",
+					mimeType: "application/octet-stream",
+					...(detail ? { detail } : {}),
+				};
+				if (imageUrl) {
+					content.push({ ...referenceImage, url: imageUrl });
+				} else {
+					const fileId = asString(raw.file_id) || undefined;
+					if (fileId) content.push({ ...referenceImage, providerFile: { provider: "openai", id: fileId } });
+				}
+			}
 		}
 	}
-	return parts.join("");
+	flushLegacyText();
+	return content.length > 0 ? content : [{ type: "text", text: "" }];
 }
 
 // ─── parseRequest ───────────────────────────────────────────────────────────
@@ -477,18 +527,11 @@ export function parseRequest(body: unknown, headers?: Headers): ParsedRequest {
 			}
 			if (effectiveType === "function_call_output") {
 				const output = item as OpenAIResponsesFunctionCallOutputItem;
-				const toolName = findToolNameById(messages, output.call_id);
-				const text =
-					typeof output.output === "string"
-						? output.output
-						: Array.isArray(output.output)
-							? flattenFunctionOutputArray(output.output)
-							: "";
 				messages.push({
 					role: "toolResult",
 					toolCallId: output.call_id,
-					toolName,
-					content: [{ type: "text", text }],
+					toolName: findToolNameById(messages, output.call_id),
+					content: functionOutputContent(output.output),
 					isError: false,
 					timestamp: now,
 				});
@@ -512,13 +555,13 @@ export function parseRequest(body: unknown, headers?: Headers): ParsedRequest {
 				continue;
 			}
 			if (effectiveType === "custom_tool_call_output") {
-				const output = item as { call_id: string; output: string };
+				const output = item as OpenAIResponsesCustomToolCallOutputItem;
 				const toolName = findToolNameById(messages, output.call_id);
 				messages.push({
 					role: "toolResult",
 					toolCallId: output.call_id,
 					toolName,
-					content: [{ type: "text", text: output.output ?? "" }],
+					content: functionOutputContent(output.output),
 					isError: false,
 					timestamp: now,
 				});
@@ -837,11 +880,15 @@ function buildResponseEnvelope(
 
 // ─── encodeResponse (non-streaming) ─────────────────────────────────────────
 
-export function encodeResponse(message: AssistantMessage, requestedModelId: string): Record<string, unknown> {
+export function encodeResponse(
+	message: AssistantMessage,
+	requestedModelId: string,
+	options?: ParsedRequest["options"],
+): Record<string, unknown> {
 	const items = buildOutputItems(message);
 	return buildResponseEnvelope(
 		message,
-		requestedModelId,
+		resolveAuthGatewayWireModelId(message, requestedModelId, options),
 		makeRespId(),
 		responseStatusForStopReason(message),
 		items,
@@ -895,7 +942,7 @@ function sseEvent(name: string, data: unknown): string {
 export function encodeStream(
 	events: AssistantMessageEventStream,
 	requestedModelId: string,
-	_options?: ParsedRequest["options"],
+	options?: ParsedRequest["options"],
 	control?: AuthGatewayStreamControl,
 ): ReadableStream<Uint8Array> {
 	const encoder = new TextEncoder();
@@ -907,6 +954,22 @@ export function encodeStream(
 	};
 	control?.signal?.addEventListener("abort", markCancelled, { once: true });
 	const seq = () => sequenceNumber++;
+	let effectiveModelId = requestedModelId;
+	// Cursor auto may start as catalog `auto`, discovered `default`, or a concrete
+	// id with `x-cursor-auto-mode: true`. Defer response.created / in_progress until
+	// an explicit `routed_model` event lands (or a terminal event forces emit).
+	let cursorAutoRoutingResolved = false;
+	const deferStartForCursorAuto = (modelId: string | undefined): boolean => {
+		// Cursor's discovered auto wire id is `default` (OpenRouter uses `auto`).
+		// Defer `default` even without the auto-mode header so gateway clients that
+		// select the bundled Cursor default still wait for routing.
+		if (modelId === "default") return true;
+		// Only Cursor auto intent buffers the literal `auto` id — otherwise OpenRouter
+		// (and similar) models named `auto` would non-stream until done.
+		if (options?.cursorAutoMode !== true) return false;
+		if (modelId === "auto") return true;
+		return !cursorAutoRoutingResolved;
+	};
 
 	return new ReadableStream<Uint8Array>({
 		async start(controller) {
@@ -938,7 +1001,7 @@ export function encodeStream(
 				object: "response",
 				created_at: createdAt,
 				status,
-				model: requestedModelId,
+				model: effectiveModelId,
 				output,
 				usage: null,
 				incomplete_details: incompleteDetailsForStatus(status),
@@ -1166,24 +1229,41 @@ export function encodeStream(
 			};
 			let finalMessage: AssistantMessage | undefined;
 			let failureMessage: AssistantMessage | undefined;
+			let envelopesStarted = false;
+			const noteRoutedModel = (model: string | undefined) => {
+				if (!model) return;
+				const allowRewrite =
+					options?.cursorAutoMode === true || requestedModelId === "default" || requestedModelId === "auto";
+				if (allowRewrite && model !== effectiveModelId) effectiveModelId = model;
+			};
+			const markAutoRoutingResolved = (model: string | undefined) => {
+				noteRoutedModel(model);
+				cursorAutoRoutingResolved = true;
+			};
+			const ensureEnvelopes = () => {
+				if (envelopesStarted) return;
+				envelopesStarted = true;
+				emit("response.created", { response: responseSnapshot("in_progress", []) });
+				emit("response.in_progress", { response: responseSnapshot("in_progress", []) });
+			};
 			try {
 				if (cancelled) {
 					controller.close();
 					return;
 				}
-				for await (const ev of events) {
-					if (cancelled) return;
+				// Hold content events until Cursor auto routing resolves so
+				// response.created is not permanently stamped with the pre-route
+				// placeholder when text/thinking/tools arrive before the checkpoint.
+				const pendingWhileRouting: AssistantMessageEvent[] = [];
+				const processEvent = (ev: AssistantMessageEvent): void => {
 					switch (ev.type) {
 						case "start": {
 							createdAt = Math.floor((ev.partial.timestamp || Date.now()) / 1000);
-							// response.created — initial envelope.
-							emit("response.created", { response: responseSnapshot("in_progress", []) });
-							// response.in_progress — mirrors real OpenAI; some clients gate
-							// on it before reading items.
-							emit("response.in_progress", { response: responseSnapshot("in_progress", []) });
+							ensureEnvelopes();
 							break;
 						}
 						case "text_start": {
+							ensureEnvelopes();
 							let cur: OpenMessage;
 							const textBlock = ev.partial.content[ev.contentIndex];
 							const signature =
@@ -1255,6 +1335,7 @@ export function encodeStream(
 							break;
 						}
 						case "thinking_start": {
+							ensureEnvelopes();
 							openReasoning(ev.partial, ev.contentIndex);
 							break;
 						}
@@ -1293,6 +1374,7 @@ export function encodeStream(
 							break;
 						}
 						case "toolcall_start": {
+							ensureEnvelopes();
 							openToolCall(ev.partial, ev.contentIndex);
 							break;
 						}
@@ -1364,14 +1446,56 @@ export function encodeStream(
 							break;
 						}
 						case "done": {
+							ensureEnvelopes();
 							finalMessage = ev.message;
 							break;
 						}
 						case "error": {
+							ensureEnvelopes();
 							failureMessage = ev.error;
 							break;
 						}
 					}
+				};
+				const flushPending = (): void => {
+					const held = pendingWhileRouting.splice(0);
+					for (const heldEv of held) processEvent(heldEv);
+				};
+				for await (const ev of events) {
+					if (cancelled) return;
+					if (ev.type === "routed_model") {
+						// Explicit InteractionUpdate.routedModel / checkpoint signal —
+						// never treat repeated partial.model observations as proof.
+						markAutoRoutingResolved(ev.model);
+						flushPending();
+						continue;
+					}
+					if ("partial" in ev) noteRoutedModel(ev.partial.model);
+					if ("message" in ev) noteRoutedModel(ev.message.model);
+
+					// Terminal events must release any held content (force envelopes with the
+					// best-known model) so clients still get a coherent SSE envelope when
+					// routing never arrives.
+					if (ev.type === "done" || ev.type === "error") {
+						ensureEnvelopes();
+						flushPending();
+						processEvent(ev);
+						continue;
+					}
+
+					const deferring = !envelopesStarted && deferStartForCursorAuto(effectiveModelId);
+					if (deferring) {
+						// Capture timestamp from start; buffer everything else until routing lands.
+						if (ev.type === "start") {
+							createdAt = Math.floor((ev.partial.timestamp || Date.now()) / 1000);
+						} else {
+							pendingWhileRouting.push(ev);
+						}
+						continue;
+					}
+
+					flushPending();
+					processEvent(ev);
 				}
 
 				if (failureMessage) {
@@ -1417,7 +1541,7 @@ export function encodeStream(
 								object: "response",
 								created_at: createdAt,
 								status,
-								model: requestedModelId,
+								model: effectiveModelId,
 								output: items,
 								usage,
 								incomplete_details: incompleteDetailsForStatus(status),
@@ -1442,7 +1566,7 @@ export function encodeStream(
 									object: "response",
 									created_at: Math.floor(Date.now() / 1000),
 									status: "failed",
-									model: requestedModelId,
+									model: effectiveModelId,
 									output: [],
 									error: { message: err instanceof Error ? err.message : String(err) },
 									incomplete_details: null,

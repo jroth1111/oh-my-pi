@@ -1,9 +1,11 @@
 import { once } from "@oh-my-pi/pi-utils";
+import { buildModel } from "../build";
 import { type CodexModelDiscoveryResult, fetchCodexModels } from "../discovery/codex";
 import type { DevinModelDiscoveryOptions } from "../discovery/devin";
 import { buildGitLabDuoWorkflowFallbackModel, fetchGitLabDuoWorkflowModels } from "../discovery/gitlab-duo-workflow";
 import type { ModelManagerOptions } from "../model-manager";
-import type { FetchImpl, ModelSpec } from "../types";
+import type { FetchImpl, Model, ModelSpec } from "../types";
+import { DEVIN_DEFAULT_BASE_URL } from "../wire/devin";
 import { resolveModelCacheProviderId } from "./cache-provider-id";
 
 // ---------------------------------------------------------------------------
@@ -113,6 +115,32 @@ export function cursorModelManagerOptions(config: CursorModelManagerConfig = {})
 
 const cursorDiscovery = once(() => import("../discovery/cursor"));
 
+/**
+ * Synthetic Cursor "auto" model. Cursor's backend routes the wire id "default"
+ * to a per-turn model selection (the same way Cursor's own UI does). The
+ * cursor provider translates the external id "auto" to the wire id "default"
+ * (see `resolveCursorWireModel` in providers/cursor.ts).
+ *
+ * Exposed as a prebuilt catalog entry so id-resolving callers — notably the
+ * auth-gateway, where an external OpenAI-compatible client can send
+ * `{"model":"auto"}` — get a valid `Model<"cursor-agent">` instead of a 404,
+ * and so "auto" can surface in `/v1/models` listings. Limits are conservative
+ * defaults because the routed model is unknown upfront; cost is zero since
+ * Cursor does not bill per-token for auto routing.
+ */
+export const CURSOR_AUTO_MODEL: Model<"cursor-agent"> = buildModel({
+	id: "auto",
+	name: "Cursor Auto",
+	api: "cursor-agent",
+	provider: "cursor",
+	baseUrl: "https://api2.cursor.sh",
+	reasoning: true,
+	input: ["text"],
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	contextWindow: 200_000,
+	maxTokens: 16_384,
+});
+
 // ---------------------------------------------------------------------------
 // GitLab Duo Workflow
 // ---------------------------------------------------------------------------
@@ -185,10 +213,61 @@ export interface DevinModelManagerConfig {
 	fetch?: DevinModelDiscoveryOptions["fetch"];
 }
 
+/**
+ * Curated Devin seed — the entire bundled surface for the provider. The
+ * Cascade catalog is credential-scoped (gated per account/team), so catalog
+ * generation never fetches it: baking one account's roster into the shared
+ * bundle would misstate every other account's entitlements and leave zombie
+ * rows behind (see CREDENTIAL_SCOPED_PROVIDERS in generate-models.ts). Both
+ * SWE-1.6 lanes are verified live against `GetCliModelConfigs`; the
+ * descriptor's `defaultModel` (`swe-1-6`) must resolve synchronously at
+ * boot, before credential-scoped runtime discovery replaces the seed. Field
+ * shape mirrors `devinModelSpec` so seeded and discovered rows are
+ * indistinguishable downstream.
+ */
+export const DEVIN_STATIC_MODELS: readonly ModelSpec<"devin-agent">[] = [
+	{
+		id: "swe-1-6-fast",
+		name: "SWE-1.6 Fast",
+		api: "devin-agent",
+		provider: "devin",
+		baseUrl: DEVIN_DEFAULT_BASE_URL,
+		reasoning: true,
+		// SWE-1.6 lanes ignore inline images despite upstream `supports_images`
+		// (see DEVIN_IMAGE_BLIND_UIDS in ../discovery/devin.ts).
+		input: ["text"],
+		supportsTools: true,
+		cost: { input: 0.3, output: 1.5, cacheRead: 0.03, cacheWrite: 0 },
+		contextWindow: 200_000,
+		maxTokens: 128_000,
+		compat: { supportsParallelToolCalls: true },
+	},
+	{
+		id: "swe-1-6",
+		name: "SWE-1.6",
+		api: "devin-agent",
+		provider: "devin",
+		baseUrl: DEVIN_DEFAULT_BASE_URL,
+		reasoning: true,
+		input: ["text"],
+		supportsTools: true,
+		// Included in the Coding Plan: upstream reports no cost dimensions.
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 200_000,
+		maxTokens: 128_000,
+		compat: { supportsParallelToolCalls: true },
+	},
+];
+
 export function devinModelManagerOptions(config: DevinModelManagerConfig = {}): ModelManagerOptions<"devin-agent"> {
 	const { apiKey, baseUrl, fetch } = config;
 	return {
 		providerId: "devin",
+		// A configured host serves its own Cascade deployment; keep the seed on it.
+		staticModels:
+			baseUrl === undefined || baseUrl === DEVIN_DEFAULT_BASE_URL
+				? DEVIN_STATIC_MODELS
+				: DEVIN_STATIC_MODELS.map(model => ({ ...model, baseUrl })),
 		...(apiKey ? { dynamicModelsAuthoritative: true } : undefined),
 		...(apiKey
 			? {

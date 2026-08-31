@@ -5,7 +5,10 @@
  * and peer-resolution logic.
  */
 import { timingSafeEqual as nodeTimingSafeEqual } from "node:crypto";
+import * as os from "node:os";
+import { getInstallId } from "@oh-my-pi/pi-utils";
 import type { Api, AssistantMessage, Model } from "../types";
+import type { ClientUsageIdentity } from "../usage";
 
 const JSON_HEADERS = {
 	"Content-Type": "application/json",
@@ -119,6 +122,18 @@ const PASSTHROUGH_HEADER_NAMES: Record<string, true> = {
 	"x-prompt-cache-key": true,
 	"x-session-id": true,
 	"x-conversation-id": true,
+	// Cursor-specific gateway control headers. `x-cursor-auto-mode` enables
+	// Cursor's per-turn model selection; `x-cursor-tool-passthrough` surfaces
+	// tool calls as OpenAI `tool_calls` without local execution.
+	// `x-cursor-agent-exclude-tools` is the complement to `allowed-tools`,
+	// dropping named tools from the model's tool set; `local-cli-mode` signals
+	// local CLI mode to Cursor's backend; `x-dev-experiment-overrides` carries
+	// Statsig experiment overrides for feature-flag testing.
+	"x-cursor-auto-mode": true,
+	"x-cursor-tool-passthrough": true,
+	"x-cursor-agent-exclude-tools": true,
+	"local-cli-mode": true,
+	"x-dev-experiment-overrides": true,
 };
 
 /**
@@ -136,6 +151,31 @@ export function captureRequestHeaders(headers: Headers): Record<string, string> 
 		}
 	});
 	return out;
+}
+
+/**
+ * Resolve the usage-attribution identity for an inbound gateway request.
+ *
+ * pi-native omp clients send `x-omp-install-id` / `x-omp-hostname` /
+ * `x-omp-app` (see `providers/pi-native-client.ts`); any client may set them.
+ * Requests without an install id fall back to the gateway host's identity
+ * under the `gateway` app label, so unlabeled foreign-SDK traffic (llm-git,
+ * openai/anthropic SDKs) still lands in per-client burn tracking instead of
+ * vanishing. These headers are attribution-only — they are deliberately
+ * absent from {@link captureRequestHeaders}'s allow-list and never reach the
+ * upstream provider.
+ */
+export function resolveClientIdentity(headers: Headers): ClientUsageIdentity {
+	const read = (name: string): string | undefined => {
+		const value = headers.get(name)?.trim();
+		return value ? value : undefined;
+	};
+	const installId = read("x-omp-install-id");
+	const app = read("x-omp-app");
+	if (!installId) {
+		return { installId: getInstallId(), hostname: os.hostname(), app: app ?? "gateway" };
+	}
+	return { installId, hostname: read("x-omp-hostname"), app: app ?? "gateway" };
 }
 
 /**
@@ -195,7 +235,7 @@ const CORS_HEADERS: Record<string, string> = {
 	"Access-Control-Allow-Origin": "*",
 	"Access-Control-Allow-Methods": "GET, POST, OPTIONS",
 	"Access-Control-Allow-Headers":
-		"authorization, content-type, anthropic-version, anthropic-beta, openai-organization, openai-project, x-stainless-*, x-api-key",
+		"authorization, content-type, anthropic-version, anthropic-beta, openai-organization, openai-project, x-stainless-*, x-api-key, x-cursor-auto-mode, x-cursor-tool-passthrough, x-cursor-agent-exclude-tools, local-cli-mode, x-dev-experiment-overrides",
 	"Access-Control-Expose-Headers":
 		"x-request-id, request-id, x-litellm-model-id, x-litellm-model-api-base, x-litellm-response-cost, x-litellm-response-duration-ms, openai-processing-ms",
 	"Access-Control-Max-Age": "86400",

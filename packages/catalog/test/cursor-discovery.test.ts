@@ -4,11 +4,15 @@ import * as http2 from "node:http2";
 import type * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
-import { create, toBinary } from "@bufbuild/protobuf";
 // Import from source, not the package specifier: the workspace `node_modules`
 // copy resolves to the primary checkout, not this worktree.
 import { fetchCursorUsableModels } from "../src/discovery/cursor";
-import { GetUsableModelsResponseSchema, ModelDetailsSchema } from "../src/discovery/cursor-gen/agent_pb";
+import {
+	GetDefaultModelForCliResponseSchema,
+	GetUsableModelsResponseSchema,
+	ModelDetailsSchema,
+} from "../src/discovery/cursor-gen/agent_pb";
+import { create, toBinary } from "../src/discovery/protobuf";
 import { resolveProviderModels } from "../src/model-manager";
 import { cursorModelManagerOptions } from "../src/provider-models/special";
 import type { ModelSpec } from "../src/types";
@@ -18,13 +22,25 @@ const FIXTURE_MODEL_IDS = [
 	"claude-opus-4-8-99999999",
 	"gpt-5.5-codex-20991231",
 	"gemini-4-pro-exp",
-	// Reference-less ids from text-only families.
-	"composer-3",
-	// Reference-less K3 effort variants omit Cursor thinkingDetails.
+	// Cursor-only families verified to accept direct image attachments.
 	"kimi-k3-high",
 	"kimi-k3-low",
 	"kimi-k3-max",
+	"cursor-grok-4.5",
+	"cursor-grok-4.5-fast",
+	"cursor-grok-4.6",
+	"cursor-grok-4.6-fast",
+	"composer-2.5",
+	"composer-2.5-fast",
+	// Similar but unverified ids must not inherit image routing.
+	"composer-3",
+	"composer-2.50",
+	"cursor-grok-5",
 	"grok-code-fast-2",
+	"k3-256k",
+	// Versioned Cursor Grok siblings: the id marks them reasoning.
+	"cursor-grok-4.5-high",
+	"cursor-grok-4.6-xhigh",
 	// Bundled-reference ids: the reference stays authoritative.
 	"claude-4.5-opus-high",
 	"claude-4.6-opus-high",
@@ -79,10 +95,13 @@ describe("cursor discovery input modalities (issue #4726)", () => {
 		expect(byId.get("gemini-4-pro-exp")?.input).toEqual(["text", "image"]);
 	});
 
-	it("keeps reference-less text-only families text-only", async () => {
+	it("keeps unverified Cursor-only families text-only", async () => {
 		const byId = await discover();
 		expect(byId.get("composer-3")?.input).toEqual(["text"]);
+		expect(byId.get("composer-2.50")?.input).toEqual(["text"]);
+		expect(byId.get("cursor-grok-5")?.input).toEqual(["text"]);
 		expect(byId.get("grok-code-fast-2")?.input).toEqual(["text"]);
+		expect(byId.get("k3-256k")?.input).toEqual(["text"]);
 	});
 
 	it("recognizes reference-less Kimi K3 effort variants as reasoning models", async () => {
@@ -92,10 +111,36 @@ describe("cursor discovery input modalities (issue #4726)", () => {
 		expect(byId.get("kimi-k3-max")?.reasoning).toBe(true);
 	});
 
-	it("keeps bundled references authoritative for input modalities", async () => {
+	it("routes verified Cursor-only model variants as text+image", async () => {
 		const byId = await discover();
-		// Bundled cursor references carry their own input classification; the
-		// id-based inference must not override it in either direction.
+		const verifiedIds = [
+			"kimi-k3-high",
+			"kimi-k3-low",
+			"kimi-k3-max",
+			"cursor-grok-4.5",
+			"cursor-grok-4.5-fast",
+			"cursor-grok-4.6",
+			"cursor-grok-4.6-fast",
+			"composer-2.5",
+			"composer-2.5-fast",
+		];
+		for (const id of verifiedIds) {
+			expect(byId.get(id)?.input).toEqual(["text", "image"]);
+		}
+	});
+
+	it("marks versioned Cursor Grok ids as reasoning despite reasoning:false references (issue #8803)", async () => {
+		const byId = await discover();
+		expect(byId.get("cursor-grok-4.5-high")?.reasoning).toBe(true);
+		expect(byId.get("cursor-grok-4.6-xhigh")?.reasoning).toBe(true);
+		// grok-code-* coding models lack the version digit and stay non-reasoning.
+		expect(byId.get("grok-code-fast-2")?.reasoning).toBe(false);
+	});
+
+	it("keeps bundled references authoritative outside verified image families", async () => {
+		const byId = await discover();
+		// The id-based native-family inference must not override bundled
+		// classifications in either direction.
 		expect(byId.get("claude-4.5-opus-high")?.input).toEqual(["text", "image"]);
 		expect(byId.get("claude-4.6-opus-high")?.input).toEqual(["text"]);
 		expect(byId.get("composer-1")?.input).toEqual(["text"]);
@@ -141,14 +186,15 @@ function requireTcpAddress(address: string | net.AddressInfo | null): net.Addres
 	return address;
 }
 
-function startCursorDiscoveryServer(body: Uint8Array): Promise<string> {
+function startCursorDiscoveryServer(body: Uint8Array, defaultBody: Uint8Array = new Uint8Array()): Promise<string> {
 	const { promise, resolve, reject } = Promise.withResolvers<string>();
 	const srv = http2.createServer();
 	servers.add(srv);
 	srv.once("error", reject);
-	srv.on("stream", (stream: http2.ServerHttp2Stream) => {
+	srv.on("stream", (stream: http2.ServerHttp2Stream, headers: http2.IncomingHttpHeaders) => {
 		stream.respond({ ":status": 200, "content-type": "application/proto" });
-		stream.end(Buffer.from(body));
+		const path = headers[":path"] ?? "";
+		stream.end(Buffer.from(path.endsWith("GetDefaultModelForCli") ? defaultBody : body));
 	});
 	srv.listen(0, "127.0.0.1", () => {
 		resolve(`http://127.0.0.1:${requireTcpAddress(srv.address()).port}`);
@@ -201,6 +247,25 @@ describe("fetchCursorUsableModels", () => {
 				cursorMaxMode: true,
 			}),
 		]);
+	});
+
+	it("appends the GetDefaultModelForCli default when it is not in the usable list", async () => {
+		const response = create(GetUsableModelsResponseSchema, {
+			models: [create(ModelDetailsSchema, { modelId: "cursor-composer-max", displayName: "Composer Max" })],
+		});
+		const defaultResponse = create(GetDefaultModelForCliResponseSchema, {
+			modelId: "composer-1",
+			displayName: "Composer",
+		});
+		const baseUrl = await startCursorDiscoveryServer(
+			toBinary(GetUsableModelsResponseSchema, response),
+			toBinary(GetDefaultModelForCliResponseSchema, defaultResponse),
+		);
+
+		const models = await fetchCursorUsableModels({ apiKey: "test-token", baseUrl, timeoutMs: 1_000 });
+		expect(models).not.toBeNull();
+
+		expect(models?.map(model => model.id)).toEqual(["composer-1", "cursor-composer-max"]);
 	});
 
 	it("assigns the 1M window from display-name labels across families", async () => {

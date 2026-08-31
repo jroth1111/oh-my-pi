@@ -1,16 +1,24 @@
 import * as http2 from "node:http2";
-import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { type } from "@oh-my-pi/omptype";
+import { $env } from "@oh-my-pi/pi-utils";
 import { isKimiK3ModelId } from "../identity";
 import { bareModelId, parseGlmModel, semverGte } from "../identity/classify";
 import { getBundledModels } from "../models";
 import { toModelSpec } from "../provider-models/bundled-references";
 import type { Model, ModelSpec } from "../types";
-import { GetUsableModelsRequestSchema, GetUsableModelsResponseSchema } from "./cursor-gen/agent_pb";
+import {
+	GetDefaultModelForCliRequestSchema,
+	type GetDefaultModelForCliResponse,
+	GetDefaultModelForCliResponseSchema,
+	GetUsableModelsRequestSchema,
+	GetUsableModelsResponseSchema,
+} from "./cursor-gen/agent_pb";
+import { create, fromBinary, toBinary } from "./protobuf";
 
 const CURSOR_DEFAULT_BASE_URL = "https://api2.cursor.sh";
 const CURSOR_DEFAULT_CLIENT_VERSION = "cli-2026.02.13-41ac335";
 const CURSOR_GET_USABLE_MODELS_PATH = "/agent.v1.AgentService/GetUsableModels";
+const CURSOR_GET_DEFAULT_MODEL_PATH = "/agent.v1.AgentService/GetDefaultModelForCli";
 
 const DEFAULT_CONTEXT_WINDOW = 200_000;
 const DEFAULT_MAX_TOKENS = 64_000;
@@ -29,9 +37,24 @@ const CURSOR_MAX_MODE_1M_ID_PATTERN = /claude|gemini/;
 const CURSOR_KIMI_K3_BARE_ID_PATTERN = /(^|\/)k3$/i;
 
 /**
+ * Versioned Cursor Grok ids (`cursor-grok-4.5`, `cursor-grok-4.6-high`) are
+ * reasoning models whose effort is carried in the per-tier sibling id.
+ * `GetUsableModels` ships no `thinkingDetails` and the bundled references read
+ * `reasoning: false`, so classification falls back to the id. The non-reasoning
+ * `grok-code-fast-*` family deliberately stays out.
+ */
+const CURSOR_GROK_REASONING_ID_PATTERN = /^cursor-grok-\d/i;
+
+/**
+ * Cursor-only families verified to accept `selectedImages` even though
+ * `GetUsableModels` does not advertise input modalities.
+ */
+const CURSOR_GROK_4_MULTIMODAL_ID_PATTERN = /^cursor-grok-4(?:[.:_-]|$)/i;
+const CURSOR_COMPOSER_25_MULTIMODAL_ID_PATTERN = /^composer-2\.5(?:[.:_-]|$)/i;
+
+/**
  * Model-id families whose native catalogs (anthropic, openai/openai-codex,
- * google) are multimodal. Cursor-only or text-only families (`composer-*`,
- * `grok-code-*`) intentionally stay outside this pattern.
+ * google) are multimodal. Cursor-only verified families are handled separately.
  */
 const CURSOR_MULTIMODAL_ID_PATTERN = /claude|gemini|gpt-|codex/;
 
@@ -66,6 +89,14 @@ const CursorDecodedResponseSchema = type({
 type CursorModelDetailsValue = typeof CursorModelDetailsSchema.infer;
 
 /**
+ * Default model info returned by the `GetDefaultModelForCli` RPC.
+ */
+export interface CursorDefaultModel {
+	modelId: string;
+	displayName?: string;
+}
+
+/**
  * Options for fetching dynamic Cursor models from `GetUsableModels`.
  */
 export interface CursorModelDiscoveryOptions {
@@ -86,6 +117,10 @@ export interface CursorModelDiscoveryOptions {
  *
  * Returns `null` on request/decode failures.
  * Returns `[]` only when the endpoint responds successfully with no usable models.
+ *
+ * The `GetDefaultModelForCli` RPC is queried alongside `GetUsableModels`; when it
+ * reports a default model that isn't already part of the usable list, it is appended
+ * so callers always see the CLI-recommended default.
  */
 export async function fetchCursorUsableModels(
 	options: CursorModelDiscoveryOptions,
@@ -98,7 +133,7 @@ export async function fetchCursorUsableModels(
 		const body = toBinary(GetUsableModelsRequestSchema, requestPayload);
 		const baseUrl = (options.baseUrl ?? CURSOR_DEFAULT_BASE_URL).replace(/\/+$/, "");
 
-		const responseBuffer = await fetchViaHttp2(baseUrl, body, options, timeoutMs);
+		const responseBuffer = await fetchViaHttp2(baseUrl, CURSOR_GET_USABLE_MODELS_PATH, body, options, timeoutMs);
 
 		if (!responseBuffer) {
 			return null;
@@ -110,10 +145,29 @@ export async function fetchCursorUsableModels(
 		}
 
 		const references = createCursorReferenceMap();
-		return normalizeCursorModels(parsedDecoded.models, options.baseUrl, references);
+		const models = normalizeCursorModels(parsedDecoded.models, options.baseUrl, references);
+
+		const defaultModel = await fetchCursorDefaultModelInfo(baseUrl, options, timeoutMs);
+		if (defaultModel) {
+			return mergeDefaultCursorModel(models, defaultModel, options.baseUrl, references);
+		}
+		return models;
 	} catch {
 		return null;
 	}
+}
+
+/**
+ * Fetches the Cursor CLI default model through the `GetDefaultModelForCli` RPC.
+ *
+ * Returns `null` on request/decode failures or when no default model is reported.
+ */
+export async function fetchCursorDefaultModel(
+	options: CursorModelDiscoveryOptions,
+): Promise<CursorDefaultModel | null> {
+	const timeoutMs = options.timeoutMs ?? 5_000;
+	const baseUrl = (options.baseUrl ?? CURSOR_DEFAULT_BASE_URL).replace(/\/+$/, "");
+	return fetchCursorDefaultModelInfo(baseUrl, options, timeoutMs);
 }
 
 function buildRequestHeaders(options: CursorModelDiscoveryOptions): Record<string, string> {
@@ -122,7 +176,7 @@ function buildRequestHeaders(options: CursorModelDiscoveryOptions): Record<strin
 		te: "trailers",
 		authorization: `Bearer ${options.apiKey}`,
 		"x-ghost-mode": "true",
-		"x-cursor-client-version": options.clientVersion ?? CURSOR_DEFAULT_CLIENT_VERSION,
+		"x-cursor-client-version": options.clientVersion ?? $env.CURSOR_CLIENT_VERSION ?? CURSOR_DEFAULT_CLIENT_VERSION,
 		"x-cursor-client-type": "cli",
 	};
 }
@@ -130,6 +184,7 @@ function buildRequestHeaders(options: CursorModelDiscoveryOptions): Record<strin
 /** HTTP/2 transport required by Cursor API (HTTP/1.1 is rejected with 464). */
 async function fetchViaHttp2(
 	baseUrl: string,
+	path: string,
 	body: Uint8Array,
 	options: CursorModelDiscoveryOptions,
 	timeoutMs: number,
@@ -148,7 +203,7 @@ async function fetchViaHttp2(
 
 	const req = client.request({
 		":method": "POST",
-		":path": CURSOR_GET_USABLE_MODELS_PATH,
+		":path": path,
 		...buildRequestHeaders(options),
 	});
 
@@ -229,6 +284,85 @@ function decodeGetUsableModelsResponse(payload: Uint8Array) {
 	}
 }
 
+function decodeGetDefaultModelForCliResponse(payload: Uint8Array): GetDefaultModelForCliResponse | null {
+	if (payload.length === 0) {
+		return null;
+	}
+
+	const framedBody = decodeConnectUnaryBody(payload);
+	if (framedBody) {
+		try {
+			return fromBinary(GetDefaultModelForCliResponseSchema, framedBody);
+		} catch {
+			return null;
+		}
+	}
+
+	try {
+		return fromBinary(GetDefaultModelForCliResponseSchema, payload);
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Fetches the CLI default model via `GetDefaultModelForCli`.
+ *
+ * Errors are swallowed (returning `null`) so a failure here never nulls out the
+ * `GetUsableModels` list it is queried alongside.
+ */
+async function fetchCursorDefaultModelInfo(
+	baseUrl: string,
+	options: CursorModelDiscoveryOptions,
+	timeoutMs: number,
+): Promise<CursorDefaultModel | null> {
+	try {
+		const requestPayload = create(GetDefaultModelForCliRequestSchema, {});
+		const body = toBinary(GetDefaultModelForCliRequestSchema, requestPayload);
+
+		const responseBuffer = await fetchViaHttp2(baseUrl, CURSOR_GET_DEFAULT_MODEL_PATH, body, options, timeoutMs);
+		if (!responseBuffer) {
+			return null;
+		}
+
+		const decoded = decodeGetDefaultModelForCliResponse(responseBuffer);
+		if (!decoded?.modelId) {
+			return null;
+		}
+		return { modelId: decoded.modelId, displayName: decoded.displayName };
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Appends the CLI default model to the usable list when it isn't already present.
+ *
+ * The default model is normalized through the same `normalizeCursorModel` path so
+ * bundled references, context-window, and reasoning inference stay consistent.
+ */
+function mergeDefaultCursorModel(
+	models: ModelSpec<"cursor-agent">[],
+	defaultModel: CursorDefaultModel,
+	baseUrlOverride: string | undefined,
+	references: Map<string, ModelSpec<"cursor-agent">>,
+): ModelSpec<"cursor-agent">[] {
+	const id = defaultModel.modelId.trim();
+	if (!id || models.some(model => model.id === id)) {
+		return models;
+	}
+
+	const normalized = normalizeCursorModel(
+		{ modelId: id, displayName: defaultModel.displayName },
+		baseUrlOverride,
+		references,
+	);
+	if (!normalized) {
+		return models;
+	}
+	return [...models, normalized].sort((a, b) => a.id.localeCompare(b.id));
+}
+
 function decodeConnectUnaryBody(payload: Uint8Array): Uint8Array | null {
 	if (payload.length < 5) {
 		return null;
@@ -297,7 +431,11 @@ function normalizeCursorModel(
 
 	const name = pickModelDisplayName(details, id);
 	const reference = references.get(id);
-	const reasoning = isKimiK3ModelId(id) || Boolean(details.thinkingDetails) || reference?.reasoning === true;
+	const reasoning =
+		isKimiK3ModelId(id) ||
+		CURSOR_GROK_REASONING_ID_PATTERN.test(id) ||
+		Boolean(details.thinkingDetails) ||
+		reference?.reasoning === true;
 
 	if (reference) {
 		return {
@@ -306,6 +444,7 @@ function normalizeCursorModel(
 			name,
 			baseUrl: baseUrlOverride ?? reference.baseUrl,
 			reasoning,
+			input: resolveCursorInput(id, reference.input),
 			contextWindow: resolveCursorContextWindow(details, id, reference.contextWindow),
 			cursorMaxMode: details.maxMode,
 		};
@@ -317,7 +456,7 @@ function normalizeCursorModel(
 		provider: "cursor",
 		baseUrl: baseUrlOverride ?? CURSOR_DEFAULT_BASE_URL,
 		reasoning,
-		input: inferInputFromCursorId(id),
+		input: resolveCursorInput(id),
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: resolveCursorContextWindow(details, id, DEFAULT_CONTEXT_WINDOW),
 		maxTokens: DEFAULT_MAX_TOKENS,
@@ -381,14 +520,22 @@ function pickModelDisplayName(model: CursorModelDetailsValue, fallbackId: string
 }
 
 /**
- * Infers input modalities for Cursor models without a bundled reference.
- *
- * `GetUsableModels` carries no per-model modality metadata, so classification
- * falls back to the model family: families that are multimodal in OMP's own
- * native catalogs accept images, everything else stays text-only. Mirrors
- * `inferInputFromGeminiId` in ./gemini.ts.
+ * Resolves input modalities from a bundled reference when available, except
+ * for Cursor-only families whose image support is known independently. Without
+ * a reference, native multimodal families fall back to id classification.
  */
-function inferInputFromCursorId(id: string): ("text" | "image")[] {
+export function resolveCursorInput(id: string, referenceInput?: ("text" | "image")[]): ("text" | "image")[] {
+	if (
+		isKimiK3ModelId(id) ||
+		CURSOR_KIMI_K3_BARE_ID_PATTERN.test(id) ||
+		CURSOR_GROK_4_MULTIMODAL_ID_PATTERN.test(id) ||
+		CURSOR_COMPOSER_25_MULTIMODAL_ID_PATTERN.test(id)
+	) {
+		return ["text", "image"];
+	}
+	if (referenceInput) {
+		return referenceInput;
+	}
 	if (CURSOR_MULTIMODAL_ID_PATTERN.test(id.toLowerCase())) {
 		return ["text", "image"];
 	}

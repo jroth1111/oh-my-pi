@@ -1,9 +1,12 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import http2 from "node:http2";
-import { create, fromBinary, fromJson, type JsonValue, toBinary, toJson } from "@bufbuild/protobuf";
-import { ValueSchema } from "@bufbuild/protobuf/wkt";
-import type { ConversationStep, McpToolDefinition } from "@oh-my-pi/pi-catalog/discovery/cursor-gen/agent_pb";
+import type {
+	ConversationStep,
+	CursorRule,
+	McpToolDefinition,
+	RequestedModel_ModelParameterbytes,
+} from "@oh-my-pi/pi-catalog/discovery/cursor-proto";
 import {
 	AgentClientMessageSchema,
 	AgentConversationTurnStructureSchema,
@@ -26,6 +29,10 @@ import {
 	ConversationStateStructureSchema,
 	ConversationStepSchema,
 	ConversationTurnStructureSchema,
+	CursorRuleSchema,
+	CursorRuleSource,
+	CursorRuleTypeGlobalSchema,
+	CursorRuleTypeSchema,
 	DeleteErrorSchema,
 	DeleteRejectedSchema,
 	DeleteResultSchema,
@@ -65,6 +72,7 @@ import {
 	type ListMcpResourcesExecResult,
 	ListMcpResourcesExecResult_McpResourceSchema,
 	ListMcpResourcesExecResultSchema,
+	ListMcpResourcesRejectedSchema,
 	ListMcpResourcesSuccessSchema,
 	type LsDirectoryTreeNode,
 	type LsDirectoryTreeNode_File,
@@ -95,6 +103,7 @@ import {
 	type ReadMcpResourceExecResult,
 	ReadMcpResourceExecResultSchema,
 	ReadMcpResourceNotFoundSchema,
+	ReadMcpResourceRejectedSchema,
 	ReadMcpResourceSuccessSchema,
 	ReadRejectedSchema,
 	ReadResultSchema,
@@ -104,6 +113,7 @@ import {
 	RequestContextResultSchema,
 	RequestContextSchema,
 	RequestContextSuccessSchema,
+	RequestedModel_ModelParameterbytesSchema,
 	RequestedModelSchema,
 	ResumeActionSchema,
 	SelectedContextSchema,
@@ -139,11 +149,22 @@ import {
 	WriteShellStdinErrorSchema,
 	WriteShellStdinResultSchema,
 	WriteSuccessSchema,
-} from "@oh-my-pi/pi-catalog/discovery/cursor-gen/agent_pb";
-import { isKimiK3ModelId } from "@oh-my-pi/pi-catalog/identity";
+} from "@oh-my-pi/pi-catalog/discovery/cursor-proto";
+import {
+	create,
+	decodeJsonValue,
+	encodeJsonValue,
+	fromBinary,
+	type JsonValue,
+	toBinary,
+	toJson,
+} from "@oh-my-pi/pi-catalog/discovery/protobuf";
+import { THINKING_EFFORTS } from "@oh-my-pi/pi-catalog/effort";
+import { isKimiK3ModelId, parseOpenAIModel } from "@oh-my-pi/pi-catalog/identity";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import {
 	$env,
+	isRecord,
 	logger,
 	parseJsonWithRepair,
 	parseStreamingJson,
@@ -173,9 +194,10 @@ import type {
 	ThinkingContent,
 	Tool,
 	ToolCall,
+	ToolChoice,
 	ToolResultMessage,
 } from "../types";
-import { normalizeSystemPrompts } from "../utils";
+import { normalizeSystemPrompts, normalizeToolCallId } from "../utils";
 import {
 	type CursorExecResolvedCarrier,
 	clearStreamingPartialJson,
@@ -188,9 +210,11 @@ import {
 } from "../utils/block-symbols";
 import { deterministicUuid } from "../utils/deterministic-id";
 import { AssistantMessageEventStream } from "../utils/event-stream";
-import { connectProxiedSocket, getProxyForProvider, shouldBypassProxy } from "../utils/proxy";
+import { connectProxiedSocket, getProxyForUrl } from "../utils/proxy";
 import { createRequestDebugSession, isRequestDebugEnabled, type RequestDebugResponseLog } from "../utils/request-debug";
 import { toolWireSchema } from "../utils/schema/wire";
+import { getNamedToolChoiceName } from "../utils/tool-choice";
+import { formatConnectEndStreamError } from "./connect-error-detail";
 import {
 	buildMcpStateResult,
 	buildNeutralHookResult,
@@ -210,6 +234,7 @@ import {
 	buildPiWriteError,
 	buildPiWriteRejected,
 	buildPiWriteResult,
+	cursorEditOwnedReadPath,
 	omitUndefinedArgs,
 	piEscapeRegexLiteral,
 	piGrepSkip,
@@ -220,9 +245,20 @@ import {
 	piReadPathHasRange,
 	piTimeout,
 } from "./cursor/exec-modern";
+import { handleInteractionQuery } from "./cursor/interaction-query";
 
 export const CURSOR_API_URL = "https://api2.cursor.sh";
-export const CURSOR_CLIENT_VERSION = "cli-2026.07.23-e383d2b";
+export const CURSOR_CLIENT_VERSION = "cli-2026.08.11-e8db854";
+
+/**
+ * Resolves the Cursor client version at runtime. An explicit
+ * `CURSOR_CLIENT_VERSION` env var overrides the compile-time default so users
+ * can bump the version when Cursor version-gates old clients without waiting
+ * for a new omp release.
+ */
+function resolveCursorClientVersion(): string {
+	return $env.CURSOR_CLIENT_VERSION || CURSOR_CLIENT_VERSION;
+}
 
 /**
  * HTTP/1 connection-specific headers that HTTP/2 forbids. Node's `http2.request()`
@@ -251,6 +287,7 @@ const CURSOR_RESERVED_HEADERS = new Set([
 	"x-ghost-mode",
 	"x-cursor-client-version",
 	"x-cursor-client-type",
+	"x-cursor-agent-allowed-tools",
 	"x-request-id",
 	// Transport-owned even though this request never sets it: node's http2 client
 	// suppresses the `:authority` it derives from the URL when a plain `host`
@@ -261,6 +298,22 @@ const CURSOR_RESERVED_HEADERS = new Set([
 	// tool responses), so no caller-supplied length can describe it and an HTTP/2
 	// peer resets the stream once the body diverges.
 	"content-length",
+]);
+
+/**
+ * Native tools Cursor resolves entirely on the interaction stream (no deferrable
+ * exec frame). Passthrough must not advertise them — Cursor would finish the
+ * work server-side while an OpenAI-shaped client still receives a ToolCall to run.
+ */
+const CURSOR_PASSTHROUGH_SERVER_ONLY_TOOLS: ReadonlySet<string> = new Set([
+	"connect_scm",
+	// Native todo family — Cursor resolves these server-side with no deferrable
+	// exec frame (same class as connect_scm). Advertising `todo` lets Cursor
+	// mutate todos remotely while the gateway also surfaces a ToolCall for the
+	// OpenAI client to run again.
+	"todo",
+	"update_todos",
+	"read_todos",
 ]);
 
 /**
@@ -293,17 +346,89 @@ const CURSOR_PROXY_TUNNEL_TIMEOUT_MS = 30_000;
  * model reads it and should route around the capability, not retry the call.
  */
 const NOT_IMPLEMENTED_SUFFIX = "not implemented by this client";
+/** Bare gRPC `resource_exhausted` end-streams (also inside a Connect error message). */
+const RESOURCE_EXHAUSTED_PATTERN = /resource.?exhausted/i;
+/** Model-resolution failures that can safely retry the exact discovery id before any server output. */
+const CURSOR_MODEL_NOT_FOUND_PATTERN = /^(?:Connect error not_found:|gRPC error 5:)/i;
 const NOT_IMPLEMENTED = `Not implemented by this client`;
 
 const conversationStateCache = new Map<string, ConversationStateStructure>();
 const conversationBlobStores = new Map<string, Map<string, Uint8Array>>();
 const warnedCursorKimiK3ReplayMessages = new Set<string>();
+/**
+ * Base conversation id → rotated wire id (#8345). Cursor's backend can pin a
+ * per-conversation rejection (bare `resource_exhausted`, zero tokens) to one
+ * conversationId forever. On such a failure the id is rotated and the next
+ * attempt rebuilds a fresh conversation from `context` (no cached-state
+ * migration). A failed rotation is not repeated, so real account exhaustion
+ * is not hidden. After the rotated id completes a turn, a later poison of
+ * that id is allowed to rotate again.
+ */
+const rotatedConversationIds = new Map<string, string>();
+const successfulRotatedConversationIds = new Set<string>();
+const freshRotatedConversationIds = new Set<string>();
 
 export interface CursorOptions extends StreamOptions {
 	customSystemPrompt?: string;
 	conversationId?: string;
 	execHandlers?: CursorExecHandlers;
 	onToolResult?: CursorToolResultHandler;
+	/** Wire model id selected after thinking-effort routing (`resolveWireModelId`). */
+	wireModelId?: string;
+	/**
+	 * When true, tool calls from Cursor's backend are surfaced as `ToolCall`
+	 * blocks in the output and the stream ends with `stopReason: "toolUse"`
+	 * after the first tool call batch. No exec handler responses are sent back
+	 * to Cursor; the caller executes tools and replays results as
+	 * `role: "tool"` messages on the next request.
+	 */
+	cursorToolPassthrough?: boolean;
+	/**
+	 * Restricts `x-cursor-agent-allowed-tools` under tool passthrough
+	 * (`"none"` → `__none__`, named force → that name alone).
+	 */
+	toolChoice?: ToolChoice;
+	/** Comma-separated tool names to exclude (`x-cursor-agent-exclude-tools`). */
+	cursorExcludeTools?: string;
+	/** Signal local CLI mode (`local-cli-mode: true`). */
+	cursorLocalCliMode?: boolean;
+	/** Statsig experiment overrides (`x-dev-experiment-overrides`). */
+	cursorDevExperimentOverrides?: string;
+	/** Populates `AgentRunRequest.client_supports_inline_images`. */
+	cursorClientSupportsInlineImages?: boolean;
+	/** Populates `AgentRunRequest.client_supports_routed_model_update`. */
+	cursorClientSupportsRoutedModelUpdate?: boolean;
+	/** Populates `AgentRunRequest.client_supports_prompt_context_usage_rpc`. */
+	cursorClientSupportsPromptContextUsageRpc?: boolean;
+	/** Populates `AgentRunRequest.run_id`. */
+	cursorRunId?: string;
+	/** Populates `AgentRunRequest.agent_session_id`. */
+	cursorAgentSessionId?: string;
+}
+
+type CursorWireMode = "normalized" | "discovered";
+
+interface CursorStreamTiming {
+	startTime: number;
+	timestamp: number;
+}
+
+interface CursorRequestState {
+	conversationId: string;
+	blobStore: Map<string, Uint8Array>;
+	conversationState?: ConversationStateStructure;
+	rotatedFresh?: boolean;
+}
+
+interface CursorGrpcRequest {
+	requestBytes: Uint8Array;
+	blobStore: Map<string, Uint8Array>;
+	conversationState: ConversationStateStructure;
+}
+
+interface CursorTransportRequest extends CursorGrpcRequest {
+	/** Exact discovery id eligible for a retry because the normalized effort payload was serialized unchanged. */
+	fallbackWireModelId?: string;
 }
 
 const CONNECT_END_STREAM_FLAG = 0b00000010;
@@ -343,6 +468,15 @@ function frameConnectMessage(data: Uint8Array, flags = 0): Buffer {
 	return frame;
 }
 
+class ConnectEndStreamError extends AIError.ProviderResponseError {
+	readonly diagnosticMessage: string;
+
+	constructor(classificationMessage: string, diagnosticMessage: string) {
+		super(classificationMessage, { kind: "envelope" });
+		this.diagnosticMessage = diagnosticMessage;
+	}
+}
+
 function parseConnectEndStream(data: Uint8Array): Error | null {
 	try {
 		const payload = JSON.parse(new TextDecoder().decode(data));
@@ -350,7 +484,8 @@ function parseConnectEndStream(data: Uint8Array): Error | null {
 		if (error) {
 			const code = typeof error.code === "string" ? error.code : "unknown";
 			const message = typeof error.message === "string" ? error.message : "Unknown error";
-			return new AIError.ProviderResponseError(`Connect error ${code}: ${message}`, { kind: "envelope" });
+			const classificationMessage = `Connect error ${code}: ${message}`;
+			return new ConnectEndStreamError(classificationMessage, formatConnectEndStreamError(error));
 		}
 		return null;
 	} catch {
@@ -491,15 +626,17 @@ function omitTypeName(record: Record<string, unknown>): Record<string, unknown> 
 	return rest;
 }
 
-export const streamCursor: StreamFunction<"cursor-agent"> = (
+function streamCursorWithWireMode(
 	model: Model<"cursor-agent">,
 	context: Context,
-	options?: CursorOptions,
-): AssistantMessageEventStream => {
+	options: CursorOptions | undefined,
+	wireMode: CursorWireMode,
+	timing?: CursorStreamTiming,
+): AssistantMessageEventStream {
 	const stream = new AssistantMessageEventStream();
 
 	(async () => {
-		const startTime = performance.now();
+		const startTime = timing?.startTime ?? performance.now();
 		let firstTokenTime: number | undefined;
 
 		const output: AssistantMessage = {
@@ -517,7 +654,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 			},
 			stopReason: "stop",
-			timestamp: Date.now(),
+			timestamp: timing?.timestamp ?? Date.now(),
 		};
 
 		// Declared outside the `try` because BOTH exits must drain it: an exec
@@ -561,6 +698,11 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		let h2Settled = false;
 		let sawTurnEnded = false;
 		let endStreamError: Error | null = null;
+		// Blocks the discovered-id retry once the turn produced observable output or
+		// ran a side effect (streamed content/tool call, exec bridge, permission
+		// reply). Pure keepalive heartbeats never set it, so a `not_found` that
+		// arrives after a heartbeat but before any real work still falls back.
+		let sawProgressOrSideEffect = false;
 		// Reachable from the catch: a stream that dies mid-turn must still close
 		// and pair the blocks it left open, and `state` itself is scoped to the
 		// try below.
@@ -587,23 +729,51 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			h2Completion.resolve();
 		};
 
+		// Hoisted out of the try block: the #8345 rotation in the catch path
+		// needs both ids, and the catch block cannot see try-scoped consts.
+		let baseConversationId: string | undefined;
+		let conversationId: string | undefined;
+		let usageState: UsageState | undefined;
+		let serializedFallbackWireModelId: string | undefined;
 		try {
 			const apiKey = options?.apiKey;
 			if (!apiKey) {
 				throw new AIError.MissingApiKeyError(undefined, "Cursor API key (access token) is required");
 			}
 
-			const conversationId = options?.conversationId ?? options?.sessionId ?? crypto.randomUUID();
+			baseConversationId = options?.conversationId ?? options?.sessionId ?? crypto.randomUUID();
+			conversationId = rotatedConversationIds.get(baseConversationId) ?? baseConversationId;
+			const rotatedFresh = freshRotatedConversationIds.has(conversationId);
 			const blobStore = conversationBlobStores.get(conversationId) ?? new Map<string, Uint8Array>();
 			conversationBlobStores.set(conversationId, blobStore);
-			const cachedState = conversationStateCache.get(conversationId);
-			const { requestBytes, conversationState } = buildGrpcRequest(model, context, options, {
-				conversationId,
-				blobStore,
-				conversationState: cachedState,
-			});
+			const cachedState = rotatedFresh ? undefined : conversationStateCache.get(conversationId);
+			const builtRequest = await buildGrpcRequestForWireMode(
+				model,
+				context,
+				options,
+				{
+					conversationId,
+					blobStore,
+					conversationState: cachedState,
+					rotatedFresh,
+				},
+				wireMode,
+			);
+			const { requestBytes, conversationState } = builtRequest;
+			serializedFallbackWireModelId = builtRequest.fallbackWireModelId;
 			conversationStateCache.set(conversationId, conversationState);
 			const requestContextTools = buildMcpToolDefinitions(context.tools);
+			const requestContextRules = buildCursorRequestContextRules(context.systemPrompt);
+			// Auto mode may request wire id "default" while output.model stays the
+			// selected catalog id (or "auto"). Track the request intent so routed
+			// model extraction is not gated on output.model === "auto"/"default".
+			const requestedWireModelId = model.requestModelId ?? model.id;
+			const autoModeActive =
+				options?.wireModelId === "default" ||
+				requestedWireModelId === "auto" ||
+				requestedWireModelId === "default" ||
+				model.id === "auto" ||
+				model.id === "default";
 
 			const baseUrl = model.baseUrl || CURSOR_API_URL;
 			const requestPath = "/agent.v1.AgentService/Run";
@@ -621,7 +791,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			// HTTP/2 allows it only as `trailers`, which is exactly what the fixed
 			// set below re-applies over anything a caller sent.
 			const callerHeaders = sanitizeCursorCallerHeaders(options?.headers);
-			const requestHeaders = {
+			const requestHeaders: Record<string, string> = {
 				...callerHeaders,
 				":method": "POST",
 				":path": requestPath,
@@ -630,10 +800,55 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				te: "trailers",
 				authorization: `Bearer ${apiKey}`,
 				"x-ghost-mode": "true",
-				"x-cursor-client-version": CURSOR_CLIENT_VERSION,
+				"x-cursor-client-version": resolveCursorClientVersion(),
 				"x-cursor-client-type": "cli",
 				"x-request-id": crypto.randomUUID(),
 			};
+			// Typed Cursor control options (also set as headers by the auth-gateway)
+			// win over any same-name caller header so streamSimple/pi-native paths
+			// that never went through the gateway still populate the wire.
+			if (options?.cursorExcludeTools !== undefined) {
+				requestHeaders["x-cursor-agent-exclude-tools"] = options.cursorExcludeTools;
+			}
+			if (options?.cursorLocalCliMode) {
+				requestHeaders["local-cli-mode"] = "true";
+			}
+			if (options?.cursorDevExperimentOverrides !== undefined) {
+				requestHeaders["x-dev-experiment-overrides"] = options.cursorDevExperimentOverrides;
+			}
+			// In passthrough mode, restrict the model's tool view to exactly the
+			// caller-declared tools (including native names like bash/read/write).
+			// Always send the header: omitting it leaves Cursor's unrestricted native
+			// set enabled (including when tools is empty / text-only passthrough).
+			// toolChoice "none" disables tools; a named forced choice advertises that
+			// name alone (even when absent from context.tools — Cursor decides).
+			// Cursor has no required-call signal, so `toolChoice: "required"` would
+			// silently weaken to auto — reject it instead of advertising the full list.
+			if (options?.cursorToolPassthrough) {
+				if (options.toolChoice === "required" || options.toolChoice === "any") {
+					throw new AIError.ValidationError(
+						`Cursor passthrough does not support toolChoice "${options.toolChoice}"; use a named tool choice or omit toolChoice`,
+					);
+				}
+				const forcedName = getNamedToolChoiceName(options.toolChoice);
+				// Interaction-only tools (e.g. connect_scm / native todos) are resolved
+				// entirely server-side with no deferrable exec frame — advertising them
+				// lets Cursor finish the work while an OpenAI client would still try to
+				// re-run the surfaced call. Exclude them from the allowlist, and reject
+				// a forced choice that names one rather than weakening to the remaining
+				// declared tools / `__none__`.
+				if (forcedName && CURSOR_PASSTHROUGH_SERVER_ONLY_TOOLS.has(forcedName)) {
+					throw new AIError.ValidationError(
+						`Cursor passthrough does not support forcing server-only tool "${forcedName}"`,
+					);
+				}
+				const declared = (context.tools ?? [])
+					.map(tool => tool.name)
+					.filter(name => name.length > 0 && !CURSOR_PASSTHROUGH_SERVER_ONLY_TOOLS.has(name));
+				const allowedTools =
+					options.toolChoice === "none" ? "" : forcedName ? forcedName : declared.join(",");
+				requestHeaders["x-cursor-agent-allowed-tools"] = allowedTools || "__none__";
+			}
 			const debugSession = isRequestDebugEnabled()
 				? await createRequestDebugSession({
 						protocol: "http2",
@@ -644,7 +859,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					})
 				: undefined;
 
-			const proxyUrl = shouldBypassProxy(new URL(baseUrl)) ? undefined : getProxyForProvider(model.provider);
+			const proxyUrl = getProxyForUrl(model.provider, new URL(baseUrl));
 			if (proxyUrl) {
 				const tlsSocket = await connectProxiedSocket(proxyUrl, baseUrl, {
 					signal: options?.signal,
@@ -667,7 +882,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			let currentThinkingBlock: (ThinkingContent & { [kStreamingBlockIndex]: number }) | null = null;
 			let currentToolCall: ToolCallState | null = null;
 			const resolvedMcpToolCallIds = new Set<string>();
-			const usageState: UsageState = { sawTokenDelta: false };
+			usageState = { sawTokenDelta: false };
 
 			const state: BlockState = {
 				get currentTextBlock() {
@@ -702,7 +917,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			openBlockState = state;
 
 			const onConversationCheckpoint = (checkpoint: ConversationStateStructure) => {
-				conversationStateCache.set(conversationId, checkpoint);
+				conversationStateCache.set(conversationId!, checkpoint);
 			};
 
 			h2Request.on("response", headers => {
@@ -741,9 +956,14 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 
 					try {
 						const serverMessage = fromBinary(AgentServerMessageSchema, messageBytes);
-						const isTurnEnded =
-							serverMessage.message.case === "interactionUpdate" &&
-							serverMessage.message.value.message?.case === "turnEnded";
+						const interaction =
+							serverMessage.message.case === "interactionUpdate" ? serverMessage.message.value : undefined;
+						const interactionCase = interaction?.message?.case;
+						// A heartbeat is a pure keepalive `processInteractionUpdate` ignores;
+						// every other frame is progress or a side effect that must block the
+						// discovered-id retry.
+						if (interactionCase !== "heartbeat") sawProgressOrSideEffect = true;
+						const isTurnEnded = interactionCase === "turnEnded";
 						// Dispatch is fire-and-forget so the socket keeps draining while a
 						// handler runs, but the promise is tracked: `done` must not be
 						// pushed while an exec handler is still resolving, or the Agent
@@ -759,14 +979,26 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 							h2Request!,
 							options?.execHandlers,
 							options?.onToolResult,
-							usageState,
+							usageState!,
 							requestContextTools,
+							requestContextRules,
 							onConversationCheckpoint,
+							options?.cursorToolPassthrough,
+							autoModeActive,
 						).catch(error => {
 							log("error", "handleServerMessage", { error: String(error) });
 						});
 						inFlightDispatches.add(dispatch);
-						void dispatch.finally(() => inFlightDispatches.delete(dispatch));
+						void dispatch.finally(() => {
+							inFlightDispatches.delete(dispatch);
+							// Passthrough sets stopReason only after the async exec dispatch
+							// finishes; check here so we don't close the stream before the
+							// ToolCall block exists / stopReason is assigned.
+							if (output.stopReason === "toolUse") {
+								sawTurnEnded = true;
+								h2Request?.close();
+							}
+						});
 
 						// Application completion is not protocol success; wait for a clean HTTP/2 end.
 						if (isTurnEnded) {
@@ -828,6 +1060,10 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			h2Request.write(frameConnectMessage(requestBytes));
 			heartbeatTimer = setInterval(sendHeartbeat, 5000);
 			await h2Completion.promise;
+			if (conversationId && baseConversationId && conversationId !== baseConversationId) {
+				successfulRotatedConversationIds.add(conversationId);
+				freshRotatedConversationIds.delete(conversationId);
+			}
 			// The transport is done, but a handler decoded from the last chunk may
 			// still be running: exec handlers and `onToolResult` transformers are
 			// async. Pushing `done` now would let the Agent drain its Cursor result
@@ -851,6 +1087,43 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			});
 			stream.end();
 		} catch (error) {
+			const fallbackWireModelId =
+				wireMode === "normalized" &&
+				!sawProgressOrSideEffect &&
+				!options?.signal?.aborted &&
+				error instanceof Error &&
+				CURSOR_MODEL_NOT_FOUND_PATTERN.test(error.message)
+					? serializedFallbackWireModelId
+					: undefined;
+			if (fallbackWireModelId !== undefined) {
+				if (heartbeatTimer) {
+					clearInterval(heartbeatTimer);
+					heartbeatTimer = null;
+				}
+				h2Request?.close();
+				h2Client?.close();
+
+				const fallbackStream = streamCursorWithWireMode(model, context, options, "discovered", {
+					startTime,
+					timestamp: output.timestamp,
+				});
+				// The lazy watchdog observes THIS outer stream; the fallback's exec
+				// bridge marks the inner stream busy via `trackLocalWork`. Forward
+				// that busy state so a local tool on the retry turn is not aborted as
+				// a stalled provider stream (#4593 protection must survive the retry).
+				stream.forwardLocalWorkFrom(fallbackStream);
+				try {
+					for await (const event of fallbackStream) {
+						if (event.type === "start") continue;
+						stream.push(event);
+					}
+					const fallbackResult = await fallbackStream.result();
+					if (!stream.resultSettled) stream.end(fallbackResult);
+				} finally {
+					stream.forwardLocalWorkFrom(undefined);
+				}
+				return;
+			}
 			// Same reason as the success path: the Agent finalizes the synthesized
 			// call from this terminal error and clears its Cursor result buffer, so
 			// a handler still running would land its real result after `agent_end`
@@ -873,10 +1146,43 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				flushOpenToolCalls(output, stream, openBlockState);
 			}
 			const result = await AIError.finalize(error, { api: model.api, signal: options?.signal });
+			// #8345: a server-side per-conversation rejection surfaces as a bare
+			// resource_exhausted with zero tokens — the conversation is poisoned,
+			// not the account. Rotate the wire id and rebuild from `context` on
+			// the next attempt (the caller's retry loop). Do not migrate cached
+			// side-state: pendingToolCalls from a mid-turn checkpoint re-poison
+			// the new id. One rotation per failure streak; a new rotation is
+			// allowed only after the current rotated id completed a turn.
+			const currentRotated =
+				baseConversationId === undefined ? undefined : rotatedConversationIds.get(baseConversationId);
+			const canRotate = currentRotated === undefined || successfulRotatedConversationIds.has(currentRotated);
+			if (
+				conversationId !== undefined &&
+				baseConversationId !== undefined &&
+				usageState !== undefined &&
+				!usageState.sawTokenDelta &&
+				RESOURCE_EXHAUSTED_PATTERN.test(result.message) &&
+				canRotate
+			) {
+				const rotated = crypto.randomUUID();
+				if (currentRotated) successfulRotatedConversationIds.delete(currentRotated);
+				rotatedConversationIds.set(baseConversationId, rotated);
+				freshRotatedConversationIds.add(rotated);
+				logger.debug("cursor conversation rotated", {
+					base: baseConversationId,
+					from: conversationId,
+					to: rotated,
+				});
+			}
 			output.stopReason = result.stopReason;
 			output.errorStatus = result.status;
 			output.errorId = result.id;
-			output.errorMessage = result.message;
+			if (error instanceof ConnectEndStreamError) {
+				output.errorClassificationMessage = result.message;
+				output.errorMessage = error.diagnosticMessage;
+			} else {
+				output.errorMessage = result.message;
+			}
 			output.duration = performance.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
 			stream.push({ type: "error", reason: output.stopReason, error: output });
@@ -894,13 +1200,17 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 	})();
 
 	return stream;
-};
+}
+
+/** Streams a Cursor Agent turn, retrying a discovered effort id when its normalized wire id is unavailable. */
+export const streamCursor: StreamFunction<"cursor-agent"> = (model, context, options) =>
+	streamCursorWithWireMode(model, context, options, "normalized");
 
 export type ToolCallState = ToolCall & {
 	[kStreamingBlockIndex]: number;
 	[kStreamingPartialJson]?: string;
 	[kStreamingLastParseLen]?: number;
-	[kStreamingBlockKind]: "mcp" | "todo" | "cursor-exec" | "connect-scm";
+	[kStreamingBlockKind]: "mcp" | "todo" | "cursor-exec" | "cursor-edit" | "connect-scm" | "web-fetch";
 	[kStreamingEnvelopeId]?: string;
 	[kCursorExecResolved]?: true;
 };
@@ -922,6 +1232,17 @@ export interface BlockState {
 	openToolCalls: Map<string, ToolCallState>;
 	/** MCP call IDs synthesized from exec frames before their redundant streamed block arrives. */
 	resolvedMcpToolCallIds: Set<string>;
+	/**
+	 * Native `editToolCall` (StrReplace) ids whose materialization `readArgs` /
+	 * `writeArgs` must stay raw and must not synthesize extra transcript blocks.
+	 *
+	 * Optional so existing test harnesses stay valid. Both the interaction
+	 * envelope `call_id` and the inner `toolCallId` are recorded — exec frames
+	 * pair on the inner id.
+	 */
+	editOwnedToolCallIds?: Set<string>;
+	/** Edit blocks whose write already persisted a `toolResult`. */
+	pairedEditToolCallIds?: Set<string>;
 	firstTokenTime: number | undefined;
 	setTextBlock: (b: (TextContent & { [kStreamingBlockIndex]: number }) | null) => void;
 	setThinkingBlock: (b: (ThinkingContent & { [kStreamingBlockIndex]: number }) | null) => void;
@@ -957,14 +1278,17 @@ export async function handleServerMessage(
 	onToolResult: CursorToolResultHandler | undefined,
 	usageState: UsageState,
 	requestContextTools: McpToolDefinition[],
+	requestContextRules: CursorRule[] = [],
 	onConversationCheckpoint?: (checkpoint: ConversationStateStructure) => void,
+	cursorToolPassthrough?: boolean,
+	autoModeActive?: boolean,
 ): Promise<void> {
 	const msgCase = msg.message.case;
 
 	log("serverMessage", msgCase, msg.message.value);
 
 	if (msgCase === "interactionUpdate") {
-		processInteractionUpdate(msg.message.value, output, stream, state, usageState);
+		processInteractionUpdate(msg.message.value, output, stream, state, usageState, cursorToolPassthrough);
 	} else if (msgCase === "kvServerMessage") {
 		handleKvServerMessage(msg.message.value as KvServerMessage, blobStore, h2Request);
 	} else if (msgCase === "execServerMessage") {
@@ -972,21 +1296,92 @@ export async function handleServerMessage(
 		// AssistantMessageEvent flows until the handler finishes. Mark the wait
 		// as local work so the lazy stream idle watchdog attributes the silence
 		// to the tool run instead of aborting a healthy stream (issue #4593).
-		await stream.trackLocalWork(
+		const deferredToCaller = await stream.trackLocalWork(
 			handleExecServerMessage(
 				msg.message.value as ExecServerMessage,
 				h2Request,
 				execHandlers,
 				onToolResult,
 				requestContextTools,
+				requestContextRules,
 				output,
 				stream,
 				state,
+				cursorToolPassthrough,
 			),
 		);
+		// End passthrough only when this exec actually synthesized/deferred a
+		// caller-facing tool — not when an approval-only mcpArgs probe ran while
+		// a prior toolCallStarted announcement already sits in output.content.
+		if (cursorToolPassthrough && deferredToCaller) {
+			output.stopReason = "toolUse";
+		}
+	} else if (msgCase === "interactionQuery") {
+		// Cursor asks the client to approve native web search / Exa fetch / etc.
+		// before it will continue the turn. Dropping the frame leaves the server
+		// waiting on a reply that never comes; the lazy idle watchdog then
+		// aborts a live stream with "Provider stream stalled while waiting for
+		// the next event" (cursor-grok-4.6-xhigh after a WebFetch/WebSearch
+		// permission prompt).
+		handleInteractionQuery(msg.message.value, h2Request);
 	} else if (msgCase === "conversationCheckpointUpdate") {
-		handleConversationCheckpointUpdate(msg.message.value, output, usageState, onConversationCheckpoint);
+		handleConversationCheckpointUpdate(
+			msg.message.value,
+			output,
+			usageState,
+			onConversationCheckpoint,
+			autoModeActive,
+			stream,
+		);
 	}
+}
+
+type ProtoUnknownField = { no: number; wireType: number; data: Uint8Array };
+
+type HostedFetchCall = {
+	args?: { url?: string; toolCallId?: string };
+	result?: { result?: { case?: string; value?: { content?: string; error?: string; url?: string } } };
+};
+
+function selectHostedFetchCall(
+	toolCall: { tool?: { case?: string; value?: HostedFetchCall } } | undefined,
+): HostedFetchCall | undefined {
+	const oneof = toolCall?.tool;
+	if (oneof?.case === "fetchToolCall" || oneof?.case === "webFetchToolCall") return oneof.value;
+	return undefined;
+}
+
+function hostedFetchUnknown(toolCall: object | undefined): boolean {
+	if (!toolCall) return false;
+	return (
+		protoUnknownFields(toolCall).some(field => field.no === 37) ||
+		protoUnknownFields((toolCall as { tool?: object }).tool ?? {}).some(field => field.no === 37)
+	);
+}
+
+function extractHttpUrlFromUnknown(message: object): string | undefined {
+	for (const field of protoUnknownFields(message)) {
+		const match = new TextDecoder().decode(field.data).match(/https?:\/\/[^\x00-\x1f]+/);
+		if (match) return match[0];
+	}
+	const nested = (message as { tool?: object }).tool;
+	return nested ? extractHttpUrlFromUnknown(nested) : undefined;
+}
+
+function describeHostedFetchResult(call: HostedFetchCall | undefined): { text: string; isError: boolean } {
+	const result = call?.result?.result;
+	if (result?.case === "success") {
+		return { text: result.value?.content || result.value?.url || "Fetched", isError: false };
+	}
+	if (result?.case === "error") {
+		return { text: result.value?.error || "Fetch failed", isError: true };
+	}
+	return { text: "Fetch completed", isError: false };
+}
+
+function protoUnknownFields(message: object): ProtoUnknownField[] {
+	const raw = (message as { $unknown?: ProtoUnknownField[] }).$unknown;
+	return Array.isArray(raw) ? raw : [];
 }
 
 function handleKvServerMessage(
@@ -1081,7 +1476,17 @@ async function handleShellStreamArgs(
 	h2Request: http2.ClientHttp2Stream,
 	execHandlers: CursorExecHandlers | undefined,
 	onToolResult: CursorToolResultHandler | undefined,
+	cursorToolPassthrough?: boolean,
 ): Promise<void> {
+	if (cursorToolPassthrough) {
+		const rejected = buildShellRejectedResult(
+			(args as { command?: string }).command ?? "",
+			args.workingDirectory || process.cwd(),
+			"Tool deferred to caller (tool passthrough)",
+		);
+		sendExecClientMessage(h2Request, execMsg, "shellResult", rejected);
+		return;
+	}
 	const normalizedWorkingDirectory = args.workingDirectory || process.cwd();
 	const normalizedArgs: ShellArgs = { ...args, workingDirectory: normalizedWorkingDirectory };
 	const startTs = performance.now();
@@ -1340,15 +1745,39 @@ async function handleExecServerMessage(
 	execHandlers: CursorExecHandlers | undefined,
 	onToolResult: CursorToolResultHandler | undefined,
 	requestContextTools: McpToolDefinition[],
+	requestContextRules: CursorRule[],
 	output: AssistantMessage,
 	stream: AssistantMessageEventStream,
 	state: BlockState,
-): Promise<void> {
+	cursorToolPassthrough?: boolean,
+): Promise<boolean> {
 	const execCase = execMsg.message.case;
 	log("exec", "dispatch", { execCase, execId: execMsg.execId, hasHandlers: !!execHandlers });
+	/** Set when this frame synthesized a ToolCall for the external passthrough caller. */
+	let deferredToCaller = false;
+	const markDeferredToCaller = (): void => {
+		if (cursorToolPassthrough) deferredToCaller = true;
+	};
+	// In passthrough mode, synthesize the ToolCall (call sites below) then reject
+	// the exec back to Cursor without running local handlers — the caller executes
+	// the surfaced tool and replays the result on the next request.
+	const resolveExec = cursorToolPassthrough
+		? async <TArgs, TResult>(
+				_args: TArgs,
+				_handler: ((args: TArgs) => Promise<CursorExecHandlerResult<TResult>>) | undefined,
+				_onToolResult: CursorToolResultHandler | undefined,
+				_buildFromToolResult: (toolResult: ToolResultMessage) => TResult,
+				buildRejected: (reason: string) => TResult,
+				_buildError: (error: string) => TResult,
+				_pairing: CursorExecPairing | null,
+			): Promise<{ execResult: TResult; toolResult?: ToolResultMessage }> => ({
+				execResult: buildRejected("Tool deferred to caller (tool passthrough)"),
+				toolResult: undefined,
+			})
+		: resolveExecHandler;
 	if (execCase === "requestContextArgs") {
 		const requestContext = create(RequestContextSchema, {
-			rules: [],
+			rules: requestContextRules,
 			repositoryInfo: [],
 			tools: requestContextTools,
 			gitRepos: [],
@@ -1367,7 +1796,7 @@ async function handleExecServerMessage(
 
 		sendExecClientMessage(h2Request, execMsg, "requestContextResult", requestContextResult);
 		log("execClient", "requestContextResult");
-		return;
+		return false;
 	}
 
 	if (!execCase) {
@@ -1379,23 +1808,38 @@ async function handleExecServerMessage(
 		// names a frame it recognises but cannot serve.
 		log("warn", "unknownExecVariant", { id: execMsg.id, execId: execMsg.execId });
 		sendExecClientThrow(h2Request, execMsg, "Unknown exec message variant", "unknown_exec_variant");
-		return;
+		return false;
 	}
 
 	switch (execCase) {
 		case "readArgs": {
 			const args = execMsg.message.value;
 			if (!args.toolCallId) args.toolCallId = crypto.randomUUID();
-			// The same composed selector the bridge executes: showing a bare path
-			// for a ranged read makes the returned slice look like the whole
-			// file in every rebuilt transcript.
-			synthesizeCursorExecToolCall(output, stream, state, args.toolCallId, "read", {
-				path: piReadDisplayPath(args.path, args.offset, args.limit),
-			});
-			const { execResult } = await resolveExecHandler(
-				args,
+			const editOwned = isEditOwnedToolCallId(state, output, args.toolCallId);
+			// Native StrReplace materializes by reading then writing the same
+			// toolCallId. The server treats the read result as file bytes, so a
+			// hashline-formatted native read would be written back as markup.
+			// Force `:raw` and skip the extra transcript block — the edit card
+			// already owns this id.
+			const composed = editOwned ? cursorEditOwnedReadPath(args.path, args.offset, args.limit) : args.path;
+			const handlerArgs = editOwned
+				? composed === null
+					? args
+					: { ...args, path: composed, offset: undefined, limit: undefined }
+				: args;
+			if (!editOwned) {
+				// The same composed selector the bridge executes: showing a bare path
+				// for a ranged read makes the returned slice look like the whole
+				// file in every rebuilt transcript.
+				synthesizeCursorExecToolCall(output, stream, state, args.toolCallId, "read", {
+					path: piReadDisplayPath(args.path, args.offset, args.limit),
+				});
+				markDeferredToCaller();
+			}
+			const { execResult } = await resolveExec(
+				handlerArgs,
 				execHandlers?.read?.bind(execHandlers),
-				onToolResult,
+				editOwned ? undefined : onToolResult,
 				toolResult =>
 					buildReadResultFromToolResult(
 						args.path,
@@ -1404,10 +1848,10 @@ async function handleExecServerMessage(
 					),
 				reason => buildReadRejectedResult(args.path, reason),
 				error => buildReadErrorResult(args.path, error),
-				{ toolCallId: args.toolCallId, toolName: "read" },
+				editOwned ? null : { toolCallId: args.toolCallId, toolName: "read" },
 			);
 			sendExecClientMessage(h2Request, execMsg, "readResult", execResult);
-			return;
+			return deferredToCaller;
 		}
 		case "lsArgs": {
 			const args = execMsg.message.value;
@@ -1416,7 +1860,8 @@ async function handleExecServerMessage(
 			// `CursorExecHandlers.ls` in `pi-coding-agent/src/cursor.ts`); mirror
 			// that here so the synthesized block matches the toolResult's `toolName`.
 			synthesizeCursorExecToolCall(output, stream, state, args.toolCallId, "read", { path: args.path });
-			const { execResult } = await resolveExecHandler(
+			markDeferredToCaller();
+			const { execResult } = await resolveExec(
 				args,
 				execHandlers?.ls?.bind(execHandlers),
 				onToolResult,
@@ -1426,7 +1871,7 @@ async function handleExecServerMessage(
 				{ toolCallId: args.toolCallId, toolName: "read" },
 			);
 			sendExecClientMessage(h2Request, execMsg, "lsResult", execResult);
-			return;
+			return deferredToCaller;
 		}
 		case "grepArgs": {
 			const args = execMsg.message.value;
@@ -1437,10 +1882,12 @@ async function handleExecServerMessage(
 			// regex or switches to `ls`/`read`, instead of the local grep tool
 			// surfacing a bare "Pattern must not be empty" (issue #4574) after the
 			// synthesized block has already been persisted with a placeholder pattern.
-			const emptyPatternError = emptyGrepPatternRejection(args.pattern, args.glob);
+			// Passthrough must still surface the declared call to the external caller
+			// before local-executor validation — they decide how to handle it.
+			const emptyPatternError = cursorToolPassthrough ? null : emptyGrepPatternRejection(args.pattern, args.glob);
 			if (emptyPatternError !== null) {
 				sendExecClientMessage(h2Request, execMsg, "grepResult", buildGrepErrorResult(emptyPatternError));
-				return;
+				return deferredToCaller;
 			}
 			// Mirror the coding-agent bridge's arg mapping so live UI (from
 			// `tool_execution_start`) and rebuilt transcript (from this block)
@@ -1452,7 +1899,8 @@ async function handleExecServerMessage(
 				case: args.caseInsensitive === true ? false : undefined,
 				skip: piGrepSkip(args.offset),
 			});
-			const { execResult } = await resolveExecHandler(
+			markDeferredToCaller();
+			const { execResult } = await resolveExec(
 				args,
 				execHandlers?.grep?.bind(execHandlers),
 				onToolResult,
@@ -1462,20 +1910,31 @@ async function handleExecServerMessage(
 				{ toolCallId: args.toolCallId, toolName: "grep" },
 			);
 			sendExecClientMessage(h2Request, execMsg, "grepResult", execResult);
-			return;
+			return deferredToCaller;
 		}
 		case "writeArgs": {
 			const args = execMsg.message.value;
 			if (!args.toolCallId) args.toolCallId = crypto.randomUUID();
+			const editOwned = isEditOwnedToolCallId(state, output, args.toolCallId);
 			// Match the bridge: prefer `fileText`, fall back to decoded `fileBytes`.
 			const content = args.fileText ?? new TextDecoder().decode(args.fileBytes ?? new Uint8Array());
-			synthesizeCursorExecToolCall(output, stream, state, args.toolCallId, "write", {
-				path: args.path,
-				content,
-			});
-			const { execResult } = await resolveExecHandler(
+			if (!editOwned) {
+				synthesizeCursorExecToolCall(output, stream, state, args.toolCallId, "write", {
+					path: args.path,
+					content,
+				});
+				markDeferredToCaller();
+			}
+			const write = execHandlers?.write?.bind(execHandlers);
+			const writeHandler = write
+				? async (writeArgs: typeof args) => {
+						const result = await write(writeArgs);
+						return editOwned ? remapExecHandlerToolName(result, "edit") : result;
+					}
+				: undefined;
+			const { execResult } = await resolveExec(
 				args,
-				execHandlers?.write?.bind(execHandlers),
+				writeHandler,
 				onToolResult,
 				toolResult =>
 					buildWriteResultFromToolResult(
@@ -1489,16 +1948,18 @@ async function handleExecServerMessage(
 					),
 				reason => buildWriteRejectedResult(args.path, reason),
 				error => buildWriteErrorResult(args.path, error),
-				{ toolCallId: args.toolCallId, toolName: "write" },
+				{ toolCallId: args.toolCallId, toolName: editOwned ? "edit" : "write" },
 			);
+			if (editOwned) markEditToolCallPaired(state, args.toolCallId);
 			sendExecClientMessage(h2Request, execMsg, "writeResult", execResult);
-			return;
+			return deferredToCaller;
 		}
 		case "deleteArgs": {
 			const args = execMsg.message.value;
 			if (!args.toolCallId) args.toolCallId = crypto.randomUUID();
 			synthesizeCursorExecToolCall(output, stream, state, args.toolCallId, "delete", { path: args.path });
-			const { execResult } = await resolveExecHandler(
+			markDeferredToCaller();
+			const { execResult } = await resolveExec(
 				args,
 				execHandlers?.delete?.bind(execHandlers),
 				onToolResult,
@@ -1508,7 +1969,7 @@ async function handleExecServerMessage(
 				{ toolCallId: args.toolCallId, toolName: "delete" },
 			);
 			sendExecClientMessage(h2Request, execMsg, "deleteResult", execResult);
-			return;
+			return deferredToCaller;
 		}
 		case "shellArgs": {
 			const args = execMsg.message.value;
@@ -1522,7 +1983,8 @@ async function handleExecServerMessage(
 				cwd: args.workingDirectory || undefined,
 				timeout: shellTimeout,
 			});
-			const { execResult } = await resolveExecHandler(
+			markDeferredToCaller();
+			const { execResult } = await resolveExec(
 				args,
 				execHandlers?.shell?.bind(execHandlers),
 				onToolResult,
@@ -1533,7 +1995,7 @@ async function handleExecServerMessage(
 			);
 			const sanitizedExecResult = sanitizeShellExecResult(execResult);
 			sendExecClientMessage(h2Request, execMsg, "shellResult", sanitizedExecResult);
-			return;
+			return deferredToCaller;
 		}
 		case "shellStreamArgs": {
 			const args = execMsg.message.value;
@@ -1544,11 +2006,47 @@ async function handleExecServerMessage(
 				cwd: args.workingDirectory || undefined,
 				timeout: shellStreamTimeout,
 			});
-			await handleShellStreamArgs(args, execMsg, h2Request, execHandlers, onToolResult);
-			return;
+			markDeferredToCaller();
+			await handleShellStreamArgs(args, execMsg, h2Request, execHandlers, onToolResult, cursorToolPassthrough);
+			return deferredToCaller;
 		}
 		case "backgroundShellSpawnArgs": {
 			const args = execMsg.message.value;
+			if (cursorToolPassthrough) {
+				// Same bash surface as shellArgs / shellStreamArgs — synthesize for the
+				// external caller and reject the exec so Cursor does not wait on us.
+				if (!args.toolCallId) args.toolCallId = crypto.randomUUID();
+				synthesizeCursorExecToolCall(output, stream, state, args.toolCallId, "bash", {
+					command: args.command,
+					cwd: args.workingDirectory || undefined,
+				});
+				markDeferredToCaller();
+				await pairSynthesizedExecResult(
+					state,
+					onToolResult,
+					args.toolCallId,
+					"bash",
+					"Tool deferred to caller (tool passthrough)",
+					true,
+				);
+				sendExecClientMessage(
+					h2Request,
+					execMsg,
+					"backgroundShellSpawnResult",
+					create(BackgroundShellSpawnResultSchema, {
+						result: {
+							case: "rejected",
+							value: create(ShellRejectedSchema, {
+								command: args.command,
+								workingDirectory: args.workingDirectory,
+								reason: "Tool deferred to caller (tool passthrough)",
+								isReadonly: false,
+							}),
+						},
+					}),
+				);
+				return deferredToCaller;
+			}
 			const execResult = create(BackgroundShellSpawnResultSchema, {
 				result: {
 					case: "rejected",
@@ -1561,9 +2059,41 @@ async function handleExecServerMessage(
 				},
 			});
 			sendExecClientMessage(h2Request, execMsg, "backgroundShellSpawnResult", execResult);
-			return;
+			return deferredToCaller;
 		}
 		case "writeShellStdinArgs": {
+			const args = execMsg.message.value;
+			if (cursorToolPassthrough) {
+				// No dedicated OpenAI tool for stdin-to-background-shell; surface as
+				// bash with the written chars so the caller still gets toolUse.
+				const toolCallId = crypto.randomUUID();
+				synthesizeCursorExecToolCall(output, stream, state, toolCallId, "bash", {
+					command: `# writeShellStdin shell_id=${args.shellId}\n${args.chars}`,
+				});
+				markDeferredToCaller();
+				await pairSynthesizedExecResult(
+					state,
+					onToolResult,
+					toolCallId,
+					"bash",
+					"Tool deferred to caller (tool passthrough)",
+					true,
+				);
+				sendExecClientMessage(
+					h2Request,
+					execMsg,
+					"writeShellStdinResult",
+					create(WriteShellStdinResultSchema, {
+						result: {
+							case: "error",
+							value: create(WriteShellStdinErrorSchema, {
+								error: "Tool deferred to caller (tool passthrough)",
+							}),
+						},
+					}),
+				);
+				return deferredToCaller;
+			}
 			const execResult = create(WriteShellStdinResultSchema, {
 				result: {
 					case: "error",
@@ -1573,10 +2103,40 @@ async function handleExecServerMessage(
 				},
 			});
 			sendExecClientMessage(h2Request, execMsg, "writeShellStdinResult", execResult);
-			return;
+			return deferredToCaller;
 		}
 		case "fetchArgs": {
 			const args = execMsg.message.value;
+			if (cursorToolPassthrough) {
+				// FetchResult has no rejected variant — synthesize + error-defer so the
+				// caller still receives a ToolCall and stopReason becomes toolUse.
+				const toolCallId = crypto.randomUUID();
+				synthesizeCursorExecToolCall(output, stream, state, toolCallId, "web_fetch", { url: args.url });
+				markDeferredToCaller();
+				await pairSynthesizedExecResult(
+					state,
+					onToolResult,
+					toolCallId,
+					"web_fetch",
+					"Tool deferred to caller (tool passthrough)",
+					true,
+				);
+				sendExecClientMessage(
+					h2Request,
+					execMsg,
+					"fetchResult",
+					create(FetchResultSchema, {
+						result: {
+							case: "error",
+							value: create(FetchErrorSchema, {
+								url: args.url,
+								error: "Tool deferred to caller (tool passthrough)",
+							}),
+						},
+					}),
+				);
+				return deferredToCaller;
+			}
 			const execResult = create(FetchResultSchema, {
 				result: {
 					case: "error",
@@ -1587,7 +2147,7 @@ async function handleExecServerMessage(
 				},
 			});
 			sendExecClientMessage(h2Request, execMsg, "fetchResult", execResult);
-			return;
+			return deferredToCaller;
 		}
 		case "diagnosticsArgs": {
 			const args = execMsg.message.value;
@@ -1598,7 +2158,8 @@ async function handleExecServerMessage(
 				action: "diagnostics",
 				file: args.path,
 			});
-			const { execResult } = await resolveExecHandler(
+			markDeferredToCaller();
+			const { execResult } = await resolveExec(
 				args,
 				execHandlers?.diagnostics?.bind(execHandlers),
 				onToolResult,
@@ -1608,7 +2169,7 @@ async function handleExecServerMessage(
 				{ toolCallId: args.toolCallId, toolName: "lsp" },
 			);
 			sendExecClientMessage(h2Request, execMsg, "diagnosticsResult", execResult);
-			return;
+			return deferredToCaller;
 		}
 		case "mcpArgs": {
 			const args = execMsg.message.value;
@@ -1625,7 +2186,16 @@ async function handleExecServerMessage(
 			// there is nothing to decide with, so it is refused. Either way no
 			// block is synthesized — nothing ran.
 			if (mcpCall.approvalOnly) {
-				const approved = (await execHandlers?.mcpApprovalPreflight?.(mcpCall)) === true;
+				let approved = (await execHandlers?.mcpApprovalPreflight?.(mcpCall)) === true;
+				// Gateway passthrough has no exec handlers: approve probes for tools the
+				// caller already declared so Cursor proceeds to the real invocation and
+				// the external caller can authorize/execute it.
+				if (!approved && cursorToolPassthrough) {
+					const declaredName = mcpCall.toolName || mcpCall.name;
+					approved = requestContextTools.some(
+						tool => tool.name === declaredName || tool.toolName === declaredName,
+					);
+				}
 				sendExecClientMessage(
 					h2Request,
 					execMsg,
@@ -1641,14 +2211,28 @@ async function handleExecServerMessage(
 								},
 					}),
 				);
-				return;
+				// Probe only — do not end passthrough; the real mcpArgs follows.
+				return false;
 			}
-			if (execHandlers?.mcp) {
+			// Synthesize whenever a local MCP handler exists OR passthrough is on.
+			// Passthrough (e.g. auth-gateway) has no execHandlers: mcpArgs can still
+			// arrive before toolCallStarted, and without a ToolCall the caller never
+			// receives the custom tool invocation. Without either path, leave the
+			// streamed announcement unpaired so agent-loop executes it locally.
+			const synthesizeMcp = !!execHandlers?.mcp || !!cursorToolPassthrough;
+			if (synthesizeMcp) {
 				const existingBlock = output.content.find(
-					block => block.type === "toolCall" && block.id === mcpCall.toolCallId,
+					(block): block is ToolCallState => block.type === "toolCall" && block.id === mcpCall.toolCallId,
 				);
 				if (existingBlock) {
+					// toolCallStarted may announce the call before mcpArgs; merge the
+					// authoritative exec args into that block so deferred callers see them.
+					existingBlock.arguments = omitUndefinedArgs(mcpCall.args ?? {});
+					if (mcpCall.toolName || mcpCall.name) {
+						existingBlock.name = mcpCall.toolName || mcpCall.name;
+					}
 					markCursorExecResolved(existingBlock);
+					markDeferredToCaller();
 				} else {
 					synthesizeCursorExecToolCall(
 						output,
@@ -1658,26 +2242,56 @@ async function handleExecServerMessage(
 						mcpCall.toolName || mcpCall.name,
 						mcpCall.args,
 					);
+					markDeferredToCaller();
 					state.resolvedMcpToolCallIds.add(mcpCall.toolCallId);
 				}
 			}
-			const { execResult } = await resolveExecHandler(
+			const { execResult } = await resolveExec(
 				mcpCall,
 				execHandlers?.mcp?.bind(execHandlers),
 				onToolResult,
 				toolResult => buildMcpResultFromToolResult(mcpCall, toolResult),
 				_reason => buildMcpToolNotFoundResult(mcpCall),
 				error => buildMcpErrorResult(error),
-				execHandlers?.mcp ? { toolCallId: mcpCall.toolCallId, toolName: mcpCall.toolName } : null,
+				synthesizeMcp ? { toolCallId: mcpCall.toolCallId, toolName: mcpCall.toolName } : null,
 			);
 			sendExecClientMessage(h2Request, execMsg, "mcpResult", execResult);
-			return;
+			return deferredToCaller;
 		}
 		case "listMcpResourcesExecArgs": {
 			// A host holding live MCP connections answers from them; without a
 			// handler the honest answer is an explicit empty success. An
 			// unset-oneof result would read as "the call produced nothing".
 			const args = execMsg.message.value;
+			if (cursorToolPassthrough) {
+				const toolCallId = crypto.randomUUID();
+				synthesizeCursorExecToolCall(output, stream, state, toolCallId, "list_mcp_resources", {
+					server: args.server,
+				});
+				markDeferredToCaller();
+				await pairSynthesizedExecResult(
+					state,
+					onToolResult,
+					toolCallId,
+					"list_mcp_resources",
+					"Tool deferred to caller (tool passthrough)",
+					true,
+				);
+				sendExecClientMessage(
+					h2Request,
+					execMsg,
+					"listMcpResourcesExecResult",
+					create(ListMcpResourcesExecResultSchema, {
+						result: {
+							case: "rejected",
+							value: create(ListMcpResourcesRejectedSchema, {
+								reason: "Tool deferred to caller (tool passthrough)",
+							}),
+						},
+					}),
+				);
+				return deferredToCaller;
+			}
 			let execResult: ListMcpResourcesExecResult;
 			// The model consumes this catalog, so it needs a block and a paired
 			// result or the listing is invisible in the UI and gone from every
@@ -1688,6 +2302,7 @@ async function handleExecServerMessage(
 				synthesizeCursorExecToolCall(output, stream, state, toolCallId, "list_mcp_resources", {
 					server: args.server,
 				});
+				markDeferredToCaller();
 			}
 			try {
 				const resources = (await execHandlers?.listMcpResources?.({ server: args.server })) ?? [];
@@ -1737,10 +2352,42 @@ async function handleExecServerMessage(
 				);
 			}
 			sendExecClientMessage(h2Request, execMsg, "listMcpResourcesExecResult", execResult);
-			return;
+			return deferredToCaller;
 		}
 		case "readMcpResourceExecArgs": {
 			const args = execMsg.message.value;
+			if (cursorToolPassthrough) {
+				const toolCallId = crypto.randomUUID();
+				synthesizeCursorExecToolCall(output, stream, state, toolCallId, "read_mcp_resource", {
+					server: args.server,
+					uri: args.uri,
+					download_path: args.downloadPath,
+				});
+				markDeferredToCaller();
+				await pairSynthesizedExecResult(
+					state,
+					onToolResult,
+					toolCallId,
+					"read_mcp_resource",
+					"Tool deferred to caller (tool passthrough)",
+					true,
+				);
+				sendExecClientMessage(
+					h2Request,
+					execMsg,
+					"readMcpResourceExecResult",
+					create(ReadMcpResourceExecResultSchema, {
+						result: {
+							case: "rejected",
+							value: create(ReadMcpResourceRejectedSchema, {
+								uri: args.uri,
+								reason: "Tool deferred to caller (tool passthrough)",
+							}),
+						},
+					}),
+				);
+				return deferredToCaller;
+			}
 			let execResult: ReadMcpResourceExecResult;
 			// The read runs locally, and in download mode it writes a workspace
 			// file — an operation with no transcript block is invisible in the UI
@@ -1754,6 +2401,7 @@ async function handleExecServerMessage(
 					uri: args.uri,
 					download_path: args.downloadPath,
 				});
+				markDeferredToCaller();
 			}
 			try {
 				// `null` is the handler's "no such server or uri", which is exactly
@@ -1838,21 +2486,21 @@ async function handleExecServerMessage(
 				);
 			}
 			sendExecClientMessage(h2Request, execMsg, "readMcpResourceExecResult", execResult);
-			return;
+			return deferredToCaller;
 		}
 		case "recordScreenArgs": {
 			const execResult = create(RecordScreenResultSchema, {
 				result: { case: "failure", value: create(RecordScreenFailureSchema, { error: NOT_IMPLEMENTED }) },
 			});
 			sendExecClientMessage(h2Request, execMsg, "recordScreenResult", execResult);
-			return;
+			return deferredToCaller;
 		}
 		case "computerUseArgs": {
 			const execResult = create(ComputerUseResultSchema, {
 				result: { case: "error", value: create(ComputerUseErrorSchema, { error: NOT_IMPLEMENTED }) },
 			});
 			sendExecClientMessage(h2Request, execMsg, "computerUseResult", execResult);
-			return;
+			return deferredToCaller;
 		}
 		case "piReadArgs": {
 			const args = execMsg.message.value;
@@ -1862,7 +2510,8 @@ async function handleExecServerMessage(
 			synthesizeCursorExecToolCall(output, stream, state, toolCallId, "read", {
 				path: piReadDisplayPath(args.path, args.offset, args.limit),
 			});
-			const { execResult } = await resolveExecHandler(
+			markDeferredToCaller();
+			const { execResult } = await resolveExec(
 				{ args, toolCallId },
 				execHandlers?.piRead?.bind(execHandlers),
 				onToolResult,
@@ -1872,7 +2521,7 @@ async function handleExecServerMessage(
 				{ toolCallId, toolName: "read" },
 			);
 			sendExecClientMessage(h2Request, execMsg, "piReadResult", execResult);
-			return;
+			return deferredToCaller;
 		}
 		case "piBashArgs": {
 			const args = execMsg.message.value;
@@ -1881,7 +2530,8 @@ async function handleExecServerMessage(
 				command: args.command,
 				timeout: piTimeout(args.timeout),
 			});
-			const { execResult } = await resolveExecHandler(
+			markDeferredToCaller();
+			const { execResult } = await resolveExec(
 				{ args, toolCallId },
 				execHandlers?.piBash?.bind(execHandlers),
 				onToolResult,
@@ -1891,7 +2541,7 @@ async function handleExecServerMessage(
 				{ toolCallId, toolName: "bash" },
 			);
 			sendExecClientMessage(h2Request, execMsg, "piBashResult", execResult);
-			return;
+			return deferredToCaller;
 		}
 		case "piEditArgs": {
 			const args = execMsg.message.value;
@@ -1905,7 +2555,8 @@ async function handleExecServerMessage(
 				old_string: firstEdit?.oldText ?? "",
 				new_string: firstEdit?.newText ?? "",
 			});
-			const { execResult } = await resolveExecHandler(
+			markDeferredToCaller();
+			const { execResult } = await resolveExec(
 				{ args, toolCallId },
 				execHandlers?.piEdit?.bind(execHandlers),
 				onToolResult,
@@ -1915,7 +2566,7 @@ async function handleExecServerMessage(
 				{ toolCallId, toolName: "edit" },
 			);
 			sendExecClientMessage(h2Request, execMsg, "piEditResult", execResult);
-			return;
+			return deferredToCaller;
 		}
 		case "piWriteArgs": {
 			const args = execMsg.message.value;
@@ -1924,7 +2575,8 @@ async function handleExecServerMessage(
 				path: args.path,
 				content: args.content,
 			});
-			const { execResult } = await resolveExecHandler(
+			markDeferredToCaller();
+			const { execResult } = await resolveExec(
 				{ args, toolCallId },
 				execHandlers?.piWrite?.bind(execHandlers),
 				onToolResult,
@@ -1934,7 +2586,7 @@ async function handleExecServerMessage(
 				{ toolCallId, toolName: "write" },
 			);
 			sendExecClientMessage(h2Request, execMsg, "piWriteResult", execResult);
-			return;
+			return deferredToCaller;
 		}
 		case "piGrepArgs": {
 			const args = execMsg.message.value;
@@ -1951,7 +2603,8 @@ async function handleExecServerMessage(
 				context: args.context,
 				limit: piLimit(args.limit),
 			});
-			const { execResult } = await resolveExecHandler(
+			markDeferredToCaller();
+			const { execResult } = await resolveExec(
 				{ args, toolCallId },
 				execHandlers?.piGrep?.bind(execHandlers),
 				onToolResult,
@@ -1961,7 +2614,7 @@ async function handleExecServerMessage(
 				{ toolCallId, toolName: "grep" },
 			);
 			sendExecClientMessage(h2Request, execMsg, "piGrepResult", execResult);
-			return;
+			return deferredToCaller;
 		}
 		case "piFindArgs": {
 			const args = execMsg.message.value;
@@ -1970,7 +2623,8 @@ async function handleExecServerMessage(
 				path: piJoinPath(args.path, args.pattern),
 				limit: piLimit(args.limit),
 			});
-			const { execResult } = await resolveExecHandler(
+			markDeferredToCaller();
+			const { execResult } = await resolveExec(
 				{ args, toolCallId },
 				execHandlers?.piFind?.bind(execHandlers),
 				onToolResult,
@@ -1980,7 +2634,7 @@ async function handleExecServerMessage(
 				{ toolCallId, toolName: "glob" },
 			);
 			sendExecClientMessage(h2Request, execMsg, "piFindResult", execResult);
-			return;
+			return deferredToCaller;
 		}
 		case "piLsArgs": {
 			const args = execMsg.message.value;
@@ -1989,7 +2643,8 @@ async function handleExecServerMessage(
 			// directories, so the synthesized block must name `read` to match the
 			// bridge's own `toolResult`.
 			synthesizeCursorExecToolCall(output, stream, state, toolCallId, "read", { path: piLsPath(args.path) });
-			const { execResult } = await resolveExecHandler(
+			markDeferredToCaller();
+			const { execResult } = await resolveExec(
 				{ args, toolCallId },
 				execHandlers?.piLs?.bind(execHandlers),
 				onToolResult,
@@ -1999,7 +2654,7 @@ async function handleExecServerMessage(
 				{ toolCallId, toolName: "read" },
 			);
 			sendExecClientMessage(h2Request, execMsg, "piLsResult", execResult);
-			return;
+			return deferredToCaller;
 		}
 		case "miniSweAgentBashArgs": {
 			// Same `ShellArgs`/`ShellResult` pair as `shellArgs`, under its own frame
@@ -2012,7 +2667,8 @@ async function handleExecServerMessage(
 				cwd: args.workingDirectory || undefined,
 				timeout: args.timeout && args.timeout > 0 ? args.timeout : undefined,
 			});
-			const { execResult } = await resolveExecHandler(
+			markDeferredToCaller();
+			const { execResult } = await resolveExec(
 				normalizedArgs,
 				execHandlers?.shell?.bind(execHandlers),
 				onToolResult,
@@ -2022,7 +2678,7 @@ async function handleExecServerMessage(
 				{ toolCallId: args.toolCallId, toolName: "bash" },
 			);
 			sendExecClientMessage(h2Request, execMsg, "miniSweAgentBashResult", sanitizeShellExecResult(execResult));
-			return;
+			return deferredToCaller;
 		}
 		case "redactedReadArgs": {
 			// Same `ReadArgs`/`ReadResult` pair as `readArgs`, but the server expects
@@ -2030,13 +2686,35 @@ async function handleExecServerMessage(
 			// implemented here, and serving a plain read would hand back exactly the
 			// unredacted bytes the frame exists to withhold.
 			const args = execMsg.message.value;
+			if (cursorToolPassthrough) {
+				if (!args.toolCallId) args.toolCallId = crypto.randomUUID();
+				synthesizeCursorExecToolCall(output, stream, state, args.toolCallId, "read", {
+					path: piReadDisplayPath(args.path, args.offset, args.limit),
+				});
+				markDeferredToCaller();
+				await pairSynthesizedExecResult(
+					state,
+					onToolResult,
+					args.toolCallId,
+					"read",
+					"Tool deferred to caller (tool passthrough)",
+					true,
+				);
+				sendExecClientMessage(
+					h2Request,
+					execMsg,
+					"redactedReadResult",
+					buildReadErrorResult(args.path, "Tool deferred to caller (tool passthrough)"),
+				);
+				return deferredToCaller;
+			}
 			sendExecClientMessage(
 				h2Request,
 				execMsg,
 				"redactedReadResult",
 				buildReadErrorResult(args.path, "Secret redaction is not implemented by this client"),
 			);
-			return;
+			return deferredToCaller;
 		}
 		case "mcpStateExecArgs": {
 			const args = execMsg.message.value;
@@ -2046,7 +2724,7 @@ async function handleExecServerMessage(
 				"mcpStateExecResult",
 				buildMcpStateResult(requestContextTools, args.serverIdentifiers),
 			);
-			return;
+			return deferredToCaller;
 		}
 		case "executeHookArgs": {
 			const args = execMsg.message.value;
@@ -2058,10 +2736,10 @@ async function handleExecServerMessage(
 					`Unsupported hook request: ${args.request?.request.case ?? "unset"}`,
 					"unknown_hook_request",
 				);
-				return;
+				return deferredToCaller;
 			}
 			sendExecClientMessage(h2Request, execMsg, "executeHookResult", execResult);
-			return;
+			return deferredToCaller;
 		}
 		case "subagentArgs": {
 			const args = execMsg.message.value;
@@ -2073,7 +2751,7 @@ async function handleExecServerMessage(
 			});
 			log("exec", "subagentRejected", { subagentType: args.subagentType });
 			sendExecClientMessage(h2Request, execMsg, "subagentResult", execResult);
-			return;
+			return deferredToCaller;
 		}
 		case "subagentAwaitArgs": {
 			// No subagent was ever spawned, so every awaited id is genuinely unknown.
@@ -2085,7 +2763,7 @@ async function handleExecServerMessage(
 				},
 			});
 			sendExecClientMessage(h2Request, execMsg, "subagentAwaitResult", execResult);
-			return;
+			return deferredToCaller;
 		}
 		case "forceBackgroundShellArgs": {
 			// Backgrounding targets a running tool call by id. This client runs every
@@ -2094,14 +2772,14 @@ async function handleExecServerMessage(
 				status: ForceBackgroundShellStatus.NOT_FOUND,
 			});
 			sendExecClientMessage(h2Request, execMsg, "forceBackgroundShellResult", execResult);
-			return;
+			return deferredToCaller;
 		}
 		case "forceBackgroundSubagentArgs": {
 			const execResult = create(ForceBackgroundSubagentResultSchema, {
 				status: ForceBackgroundSubagentStatus.NOT_FOUND,
 			});
 			sendExecClientMessage(h2Request, execMsg, "forceBackgroundSubagentResult", execResult);
-			return;
+			return deferredToCaller;
 		}
 		case "smartModeClassifierArgs": {
 			// The classifier decides whether a risky action needs approval. Answering
@@ -2116,7 +2794,7 @@ async function handleExecServerMessage(
 				},
 			});
 			sendExecClientMessage(h2Request, execMsg, "smartModeClassifierResult", execResult);
-			return;
+			return deferredToCaller;
 		}
 		case "canvasDiagnosticsArgs": {
 			const args = execMsg.message.value;
@@ -2130,7 +2808,7 @@ async function handleExecServerMessage(
 				},
 			});
 			sendExecClientMessage(h2Request, execMsg, "canvasDiagnosticsResult", execResult);
-			return;
+			return deferredToCaller;
 		}
 		case "shellAllowlistPrecheckArgs": {
 			// The prechecks ask "is this pre-approved, so may it skip the approval
@@ -2143,7 +2821,7 @@ async function handleExecServerMessage(
 				"shellAllowlistPrecheckResult",
 				create(ShellAllowlistPrecheckResultSchema, { allowlisted: false }),
 			);
-			return;
+			return deferredToCaller;
 		}
 		case "mcpAllowlistPrecheckArgs": {
 			sendExecClientMessage(
@@ -2152,7 +2830,7 @@ async function handleExecServerMessage(
 				"mcpAllowlistPrecheckResult",
 				create(McpAllowlistPrecheckResultSchema, { allowlisted: false }),
 			);
-			return;
+			return deferredToCaller;
 		}
 		case "webFetchAllowlistPrecheckArgs": {
 			sendExecClientMessage(
@@ -2161,7 +2839,7 @@ async function handleExecServerMessage(
 				"webFetchAllowlistPrecheckResult",
 				create(WebFetchAllowlistPrecheckResultSchema, { allowlisted: false }),
 			);
-			return;
+			return deferredToCaller;
 		}
 		case "conversationSearchArgs": {
 			// Cursor conversation history lives server-side; this client keeps no
@@ -2180,12 +2858,13 @@ async function handleExecServerMessage(
 				query: args.query,
 				limit: args.limit,
 			});
+			markDeferredToCaller();
 			await pairSynthesizedExecResult(state, onToolResult, toolCallId, "search_conversations", error);
 			const execResult = create(ConversationSearchResultSchema, {
 				result: { case: "error", value: create(ConversationSearchErrorSchema, { error }) },
 			});
 			sendExecClientMessage(h2Request, execMsg, "conversationSearchResult", execResult);
-			return;
+			return deferredToCaller;
 		}
 		case "agentStoreConflictArgs": {
 			// The agent store is Cursor's own on-disk journal; this client never
@@ -2199,7 +2878,7 @@ async function handleExecServerMessage(
 				},
 			});
 			sendExecClientMessage(h2Request, execMsg, "agentStoreConflictResult", execResult);
-			return;
+			return deferredToCaller;
 		}
 		case "gitDiffRequest": {
 			// `GetDiffResponse` has no error variant: it models five output formats
@@ -2207,7 +2886,7 @@ async function handleExecServerMessage(
 			// therefore a claim that a diff was computed, so a `throw` is the only
 			// truthful reply.
 			sendExecClientThrow(h2Request, execMsg, `Git diff is ${NOT_IMPLEMENTED_SUFFIX}`, "exec_variant_unsupported");
-			return;
+			return deferredToCaller;
 		}
 		default: {
 			// A frame number this build recognises structurally but has no answer
@@ -2222,6 +2901,7 @@ async function handleExecServerMessage(
 			);
 		}
 	}
+	return deferredToCaller;
 }
 
 /**
@@ -3002,10 +3682,10 @@ function parseToolArgsJson(text: string): unknown {
 
 function decodeMcpArgValue(value: Uint8Array): unknown {
 	try {
-		const parsedValue = fromBinary(ValueSchema, value);
-		const jsonValue = toJson(ValueSchema, parsedValue) as JsonValue;
+		const jsonValue = decodeJsonValue(value);
 		if (typeof jsonValue === "string") {
-			return parseToolArgsJson(jsonValue);
+			const first = jsonValue.trimStart()[0];
+			return first === "{" || first === "[" || first === '"' ? parseToolArgsJson(jsonValue) : jsonValue;
 		}
 		return jsonValue;
 	} catch {}
@@ -3152,6 +3832,174 @@ function selectMcpCall(toolCall: CursorMcpToolCallCarrier | undefined): CursorMc
 	return toolCall?.mcpToolCall;
 }
 
+interface CursorEditToolCall {
+	args?: {
+		path?: string;
+		streamContent?: string;
+	};
+	result?: {
+		result?: {
+			case?: string;
+			value?: {
+				error?: string;
+				reason?: string;
+				message?: string;
+				path?: string;
+				modelVisibleError?: string;
+			};
+		};
+	};
+}
+
+interface CursorEditToolCallCarrier {
+	tool?: { case?: string; value?: unknown };
+	toolCallId?: string;
+	editToolCall?: CursorEditToolCall;
+}
+
+/**
+ * Same oneof-first selector as MCP: a wire-decoded `ToolCall` exposes
+ * `editToolCall` only as `{ case: "editToolCall", value }`.
+ */
+function selectEditCall(toolCall: CursorEditToolCallCarrier | undefined): CursorEditToolCall | undefined {
+	const oneof = toolCall?.tool;
+	if (oneof?.case === "editToolCall") return oneof.value as CursorEditToolCall;
+	return toolCall?.editToolCall;
+}
+
+function selectEditStreamDelta(update: {
+	toolCallDelta?: {
+		delta?: { case?: string; value?: { streamContentDelta?: string } };
+		editToolCallDelta?: { streamContentDelta?: string };
+	};
+}): string | undefined {
+	const oneof = update.toolCallDelta?.delta;
+	if (oneof?.case === "editToolCallDelta") return oneof.value?.streamContentDelta;
+	return update.toolCallDelta?.editToolCallDelta?.streamContentDelta;
+}
+
+function rememberEditOwnedToolCall(
+	state: BlockState,
+	toolCall: CursorEditToolCallCarrier | undefined,
+	envelopeId?: string,
+): void {
+	if (!state.editOwnedToolCallIds) state.editOwnedToolCallIds = new Set();
+	const ids = state.editOwnedToolCallIds;
+	if (envelopeId) ids.add(envelopeId);
+	if (toolCall?.toolCallId) ids.add(toolCall.toolCallId);
+}
+
+function isEditOwnedToolCallId(state: BlockState, output: AssistantMessage, toolCallId: string): boolean {
+	if (state.editOwnedToolCallIds?.has(toolCallId)) return true;
+	return output.content.some(block => block.type === "toolCall" && block.id === toolCallId && block.name === "edit");
+}
+
+function stringToolArg(args: Record<string, unknown> | undefined, key: string): string | undefined {
+	const value = args?.[key];
+	return typeof value === "string" ? value : undefined;
+}
+
+function markEditToolCallPaired(state: BlockState, toolCallId: string): void {
+	if (!state.pairedEditToolCallIds) state.pairedEditToolCallIds = new Set();
+	state.pairedEditToolCallIds.add(toolCallId);
+}
+
+/**
+ * `EditToolCall.result` is an `EditResult` message whose own oneof is also
+ * named `result`. The discriminator is `result.result.case`, same nesting as
+ * `describeConnectScmResult` / the todo extractors.
+ */
+function describeEditResult(toolCall: CursorEditToolCallCarrier | undefined): { text: string; isError: boolean } {
+	const oneof = selectEditCall(toolCall)?.result?.result;
+	const variant = oneof?.case;
+	const value = oneof?.value;
+	if (variant === "success") {
+		return { text: value?.message || value?.path || "Edited", isError: false };
+	}
+	if (variant === "error") {
+		return { text: value?.modelVisibleError || value?.error || "Edit failed", isError: true };
+	}
+	if (variant === "rejected") {
+		return { text: value?.reason || "Edit rejected", isError: true };
+	}
+	if (variant === "fileNotFound") {
+		return { text: value?.path ? `File not found: ${value.path}` : "File not found", isError: true };
+	}
+	if (variant === "readPermissionDenied") {
+		return { text: value?.path ? `Read permission denied: ${value.path}` : "Read permission denied", isError: true };
+	}
+	if (variant === "writePermissionDenied") {
+		return {
+			text: value?.error || (value?.path ? `Write permission denied: ${value.path}` : "Write permission denied"),
+			isError: true,
+		};
+	}
+	return { text: "Edit reported no result", isError: true };
+}
+
+function remapExecHandlerToolName<TResult>(
+	result: CursorExecHandlerResult<TResult>,
+	toolName: string,
+): CursorExecHandlerResult<TResult> {
+	if (isToolResultMessage(result)) return { ...result, toolName };
+	if (result && typeof result === "object" && "toolResult" in result) {
+		const record = result as { result?: TResult; toolResult?: ToolResultMessage };
+		if (record.toolResult && record.result !== undefined) {
+			return { result: record.result, toolResult: { ...record.toolResult, toolName } };
+		}
+		if (record.toolResult) return { ...record.toolResult, toolName };
+	}
+	return result;
+}
+
+/**
+ * Open (or refresh) the single `edit` transcript block for a native StrReplace
+ * `editToolCall`. Materialization reads/writes reuse this id and must not
+ * synthesize their own blocks.
+ */
+function openOrUpdateEditBlock(
+	output: AssistantMessage,
+	stream: AssistantMessageEventStream,
+	state: BlockState,
+	toolCall: CursorEditToolCallCarrier | undefined,
+	envelopeId?: string,
+): ToolCallState | undefined {
+	const edit = selectEditCall(toolCall);
+	if (!edit && toolCall?.tool?.case !== "editToolCall") return undefined;
+	rememberEditOwnedToolCall(state, toolCall, envelopeId);
+	const id = toolCall?.toolCallId || envelopeId;
+	if (!id) return undefined;
+
+	const nextArgs = omitUndefinedArgs({
+		path: edit?.args?.path,
+		stream_content: edit?.args?.streamContent,
+	});
+	const existing = output.content.find(
+		(block): block is ToolCallState => block.type === "toolCall" && block.id === id,
+	);
+	if (existing) {
+		existing.arguments = { ...existing.arguments, ...nextArgs };
+		return existing;
+	}
+
+	endCurrentTextBlock(output, stream, state);
+	endCurrentThinkingBlock(output, stream, state);
+	const block: ToolCallState = {
+		type: "toolCall",
+		id,
+		name: "edit",
+		arguments: nextArgs,
+		[kStreamingBlockIndex]: output.content.length,
+		[kStreamingBlockKind]: "cursor-edit",
+		[kStreamingEnvelopeId]: envelopeId || undefined,
+		[kCursorExecResolved]: true,
+	};
+	output.content.push(block);
+	retainStreamedCall(state, block, envelopeId);
+	stream.push({ type: "toolcall_start", contentIndex: output.content.length - 1, partial: output });
+	return block;
+}
+
 /**
  * The streamed `ToolCall` variants whose block the exec channel owns.
  *
@@ -3236,15 +4084,17 @@ export function flushOpenToolCalls(
 			clearStreamingPartialJson(block);
 		}
 		const kind = block[kStreamingBlockKind];
-		if (kind === "connect-scm" || kind === "todo") {
-			state.onToolResult?.({
-				role: "toolResult",
-				toolCallId: block.id,
-				toolName: block.name,
-				content: [{ type: "text", text: "The connection to Cursor closed before this call completed." }],
-				isError: true,
-				timestamp: Date.now(),
-			});
+		if (kind === "connect-scm" || kind === "todo" || kind === "cursor-edit") {
+			if (!(kind === "cursor-edit" && state.pairedEditToolCallIds?.has(block.id))) {
+				state.onToolResult?.({
+					role: "toolResult",
+					toolCallId: block.id,
+					toolName: block.name,
+					content: [{ type: "text", text: "The connection to Cursor closed before this call completed." }],
+					isError: true,
+					timestamp: Date.now(),
+				});
+			}
 		}
 		stream.push({ type: "toolcall_end", contentIndex: idx, toolCall: block, partial: output });
 	}
@@ -3730,6 +4580,7 @@ export function processInteractionUpdate(
 	stream: AssistantMessageEventStream,
 	state: BlockState,
 	usageState: UsageState,
+	cursorToolPassthrough?: boolean,
 ): void {
 	const updateCase = update.message?.case;
 
@@ -3779,6 +4630,14 @@ export function processInteractionUpdate(
 		//
 		// Stamped resolved so `agent-loop.ts` runs no local tool for it: there is
 		// no local `connect_scm`, and the completion pairs the result itself.
+		//
+		// Passthrough: already excluded from the allowlist; if Cursor still emits
+		// one, ignore it so we neither re-surface a server-finished call nor end
+		// the turn with a ToolCall the OpenAI client cannot execute.
+		if (cursorToolPassthrough) {
+			log("passthrough", "ignoredServerOnlyConnectScm");
+			return;
+		}
 		endCurrentTextBlock(output, stream, state);
 		endCurrentThinkingBlock(output, stream, state);
 		const scmCall = selectConnectScmCall(update.message.value.toolCall);
@@ -3826,9 +4685,8 @@ export function processInteractionUpdate(
 					// what the exec channel pairs its result under. Diverging here would
 					// name the block one thing and its result another.
 					name: args.toolName || args.name || "",
-					arguments: {},
+					arguments: decodeMcpArgsMap(args.args) ?? {},
 					[kStreamingBlockIndex]: output.content.length,
-					[kStreamingPartialJson]: "",
 					[kStreamingBlockKind]: "mcp",
 					[kStreamingEnvelopeId]: update.message.value.callId || undefined,
 				};
@@ -3847,8 +4705,16 @@ export function processInteractionUpdate(
 			// them, and executing one would emit a spurious toolResult and drive an
 			// extra continuation turn. Local state is mirrored on completion, from
 			// the server's success snapshot only.
+			//
+			// Passthrough: excluded from the allowlist; if Cursor still emits one,
+			// ignore it so we neither re-surface a server-finished call nor end the
+			// turn with a ToolCall the OpenAI client cannot execute.
 			const todoCalls = selectTodoCalls(toolCall);
 			if (todoCalls.update || todoCalls.read) {
+				if (cursorToolPassthrough) {
+					log("passthrough", "ignoredServerOnlyTodo");
+					return;
+				}
 				const callId = update.message.value.callId || crypto.randomUUID();
 				const block: ToolCallState = {
 					type: "toolCall",
@@ -3865,13 +4731,60 @@ export function processInteractionUpdate(
 				output.content.push(block);
 				retainStreamedCall(state, block, update.message.value.callId);
 				stream.push({ type: "toolcall_start", contentIndex: output.content.length - 1, partial: output });
+				return;
 			}
+
+			const fetchCall = selectHostedFetchCall(toolCall);
+			if (fetchCall || hostedFetchUnknown(toolCall)) {
+				// Hosted WebFetch / Fetch is permission-gated via InteractionQuery, then
+				// run server-side. Stamp resolved so agent-loop does not try a local tool.
+				// Passthrough: exclude from the allowlist; if Cursor still emits one,
+				// ignore it so we neither re-surface a server-finished call nor end the
+				// turn with a ToolCall the OpenAI client would execute again.
+				if (cursorToolPassthrough) {
+					log("passthrough", "ignoredServerOnlyHostedFetch");
+					return;
+				}
+				const url = fetchCall?.args?.url || extractHttpUrlFromUnknown(toolCall);
+				const callId = fetchCall?.args?.toolCallId || update.message.value.callId || crypto.randomUUID();
+				const block: ToolCallState = {
+					type: "toolCall",
+					id: callId,
+					name: "web_fetch",
+					arguments: url ? { url } : {},
+					[kStreamingBlockIndex]: output.content.length,
+					[kStreamingBlockKind]: "web-fetch",
+					[kStreamingEnvelopeId]: update.message.value.callId || undefined,
+					[kCursorExecResolved]: true,
+				};
+				output.content.push(block);
+				retainStreamedCall(state, block, update.message.value.callId);
+				stream.push({ type: "toolcall_start", contentIndex: output.content.length - 1, partial: output });
+				return;
+			}
+
+			openOrUpdateEditBlock(output, stream, state, toolCall, update.message.value.callId);
 		}
 	} else if (updateCase === "toolCallDelta" || updateCase === "partialToolCall") {
+		const value = update.message.value;
+		if (updateCase === "partialToolCall" && value.toolCall) {
+			openOrUpdateEditBlock(output, stream, state, value.toolCall, value.callId);
+		}
+		const editDelta = selectEditStreamDelta(value);
+		if (editDelta) {
+			const target = resolveStreamedCall(state, value.callId);
+			if (target?.[kStreamingBlockKind] === "cursor-edit") {
+				const current = stringToolArg(target.arguments, "stream_content") ?? "";
+				target.arguments = { ...target.arguments, stream_content: current + editDelta };
+				const idx = output.content.indexOf(target);
+				stream.push({ type: "toolcall_delta", contentIndex: idx, delta: editDelta, partial: output });
+				return;
+			}
+		}
 		// Same correlation rule as the completion path below: an argument delta
 		// belonging to a different call must not be appended to this block's
 		// buffer, which would corrupt the JSON both of them parse.
-		const target = resolveStreamedCall(state, update.message.value.callId);
+		const target = resolveStreamedCall(state, value.callId);
 		if (target?.[kStreamingBlockKind] === "mcp") {
 			// Cursor's `args_text_delta` is "aggregated args text so far" per agent.proto: each
 			// delta is a cumulative snapshot of the JSON-text args. Strip the prefix we already
@@ -3911,7 +4824,7 @@ export function processInteractionUpdate(
 				// Authoritative full parse of the accumulated argument buffer; the delta
 				// path throttles mid-stream parses, so `arguments` may lag the buffer.
 				const partial = settled[kStreamingPartialJson];
-				if (partial !== undefined) {
+				if (partial) {
 					settled.arguments = parseStreamingJson(partial);
 				}
 				const decodedArgs = decodeMcpArgsMap(selectMcpCall(toolCall)?.args?.args);
@@ -3938,6 +4851,19 @@ export function processInteractionUpdate(
 					role: "toolResult",
 					toolCallId: settled.id,
 					toolName: "connect_scm",
+					content: [{ type: "text", text }],
+					isError,
+					timestamp: Date.now(),
+				});
+			} else if (settled[kStreamingBlockKind] === "web-fetch") {
+				const fetchCall = selectHostedFetchCall(toolCall);
+				const url = fetchCall?.args?.url || extractHttpUrlFromUnknown(toolCall ?? {});
+				if (url) settled.arguments = { url };
+				const { text, isError } = describeHostedFetchResult(fetchCall);
+				state.onToolResult?.({
+					role: "toolResult",
+					toolCallId: settled.id,
+					toolName: "web_fetch",
 					content: [{ type: "text", text }],
 					isError,
 					timestamp: Date.now(),
@@ -3983,6 +4909,26 @@ export function processInteractionUpdate(
 					log("error", "onTodoSnapshot", { error: hostError });
 				}
 				state.onToolResult?.(persisted ?? buildTodoToolResult(settled.id, snapshot, hostError ?? error));
+			} else if (settled[kStreamingBlockKind] === "cursor-edit") {
+				const edit = selectEditCall(toolCall);
+				if (edit?.args) {
+					settled.arguments = omitUndefinedArgs({
+						...settled.arguments,
+						path: edit.args.path ?? stringToolArg(settled.arguments, "path"),
+						stream_content: edit.args.streamContent ?? stringToolArg(settled.arguments, "stream_content"),
+					});
+				}
+				if (!state.pairedEditToolCallIds?.has(settled.id)) {
+					const { text, isError } = describeEditResult(toolCall);
+					state.onToolResult?.({
+						role: "toolResult",
+						toolCallId: settled.id,
+						toolName: "edit",
+						content: [{ type: "text", text }],
+						isError,
+						timestamp: Date.now(),
+					});
+				}
 			}
 			const idx = output.content.indexOf(settled);
 			clearStreamingPartialJson(settled);
@@ -4000,6 +4946,18 @@ export function processInteractionUpdate(
 				{ model: output.model, messageTimestamp: output.timestamp },
 			);
 		}
+	} else if (updateCase === "routedModel") {
+		// Consume InteractionUpdate.routedModel when the backend sends it
+		// (capability advertised via cursorClientSupportsRoutedModelUpdate).
+		// Checkpoint JSON extraction remains the fallback for older servers.
+		const routed = update.message.value;
+		const modelId = typeof routed?.modelId === "string" ? routed.modelId.trim() : "";
+		if (modelId) {
+			output.model = modelId;
+			// Explicit signal for auth-gateway SSE: do not treat repeated
+			// `partial.model` observations as proof routing completed.
+			stream.push({ type: "routed_model", model: modelId, partial: output });
+		}
 	} else if (updateCase === "tokenDelta") {
 		const tokenDelta = update.message.value;
 		usageState.sawTokenDelta = true;
@@ -4013,8 +4971,37 @@ function handleConversationCheckpointUpdate(
 	output: AssistantMessage,
 	usageState: UsageState,
 	onConversationCheckpoint?: (checkpoint: ConversationStateStructure) => void,
+	autoModeActive?: boolean,
+	stream?: AssistantMessageEventStream,
 ): void {
 	onConversationCheckpoint?.(checkpoint);
+	// Extract the routed model from the assistant message JSON in pendingToolCalls.
+	// In auto mode, Cursor's backend routes to a specific model per-turn and
+	// surfaces the actual model name via providerOptions.cursor.modelName in the
+	// assistant message JSON. Prefer InteractionUpdate.routedModel when present
+	// (see processInteractionUpdate); this checkpoint path remains the fallback
+	// for servers that only embed the model in pendingToolCalls JSON.
+	// Gate on the request's auto intent, not output.model: when cursorAutoMode
+	// is enabled on a concrete catalog model, output.model stays that id.
+	for (const entry of checkpoint.pendingToolCalls) {
+		if (!entry || !autoModeActive) continue;
+		try {
+			const parsed = JSON.parse(entry) as {
+				role?: string;
+				content?: Array<{ providerOptions?: { cursor?: { modelName?: string } } }>;
+			};
+			if (parsed.role !== "assistant") continue;
+			const modelName = parsed.content?.find(c => c.providerOptions?.cursor?.modelName)?.providerOptions?.cursor
+				?.modelName;
+			if (modelName) {
+				output.model = modelName;
+				stream?.push({ type: "routed_model", model: modelName, partial: output });
+				break;
+			}
+		} catch {
+			// Not JSON or unexpected shape — skip
+		}
+	}
 	if (usageState.sawTokenDelta) {
 		return;
 	}
@@ -4046,6 +5033,28 @@ function readCursorBlob(blobStore: Map<string, Uint8Array>, blobId: Uint8Array):
 }
 
 /**
+ * Cursor AgentService reconstructs the model prompt from `requestContext.rules`,
+ * not from the client-supplied `rootPromptMessagesJson` system blobs. Map each
+ * OMP system-prompt entry to a global CursorRule so always-apply rules survive
+ * that reconstruction.
+ */
+export function buildCursorRequestContextRules(systemPrompt: readonly string[] | undefined): CursorRule[] {
+	return normalizeSystemPrompts(systemPrompt).map((content, index) =>
+		create(CursorRuleSchema, {
+			fullPath: `/omp/system-prompt/${index}.mdc`,
+			content,
+			source: CursorRuleSource.USER,
+			type: create(CursorRuleTypeSchema, {
+				type: {
+					case: "global",
+					value: create(CursorRuleTypeGlobalSchema, {}),
+				},
+			}),
+		}),
+	);
+}
+
+/**
  * Local tools Cursor already drives natively over the exec channel, so
  * advertising them again as MCP tools would give the model two ways to call the
  * same thing.
@@ -4057,6 +5066,17 @@ function readCursorBlob(blobStore: Map<string, Uint8Array>, blobId: Uint8Array):
  * all, so filtering the whole tool out hid every one of them from the model.
  */
 const CURSOR_NATIVE_TOOL_NAMES = new Set(["bash", "read", "write", "delete", "ls", "grep", "todo"]);
+
+function isJsonValue(value: unknown): value is JsonValue {
+	if (value === null || typeof value === "string" || typeof value === "boolean") return true;
+	if (typeof value === "number") return Number.isFinite(value);
+	if (Array.isArray(value)) return value.every(isJsonValue);
+	if (!isRecord(value)) return false;
+	for (const key in value) {
+		if (!isJsonValue(value[key])) return false;
+	}
+	return true;
+}
 
 export function buildMcpToolDefinitions(tools: Tool[] | undefined): McpToolDefinition[] {
 	if (!tools || tools.length === 0) {
@@ -4080,10 +5100,10 @@ export function buildMcpToolDefinitions(tools: Tool[] | undefined): McpToolDefin
 	return forwarded.map(tool => {
 		const jsonSchema = toolWireSchema(tool);
 		const schemaValue: JsonValue =
-			jsonSchema && typeof jsonSchema === "object"
-				? (jsonSchema as JsonValue)
+			jsonSchema !== null && !Array.isArray(jsonSchema) && isJsonValue(jsonSchema)
+				? jsonSchema
 				: { type: "object", properties: {}, required: [] };
-		const inputSchema = toBinary(ValueSchema, fromJson(ValueSchema, schemaValue));
+		const inputSchema = encodeJsonValue(schemaValue);
 		return create(McpToolDefinitionSchema, {
 			name: tool.name,
 			description: tool.description || "",
@@ -4193,11 +5213,17 @@ function buildCursorAssistantContent(
 				});
 			}
 		} else if (item.type === "toolCall") {
+			// Foreign responses-family history carries composite `"{callId}|{itemId}"`
+			// tool-call ids (encodeResponsesToolCallId). The `|` violates Cursor's
+			// tool-call-id charset (`^[a-zA-Z0-9_-]+$`), so replaying it verbatim
+			// gets the whole Run rejected as opaque resource_exhausted. Sanitize the
+			// id everywhere it reaches the wire; the tool-result side normalizes the
+			// same id identically, so the call/result pairing stays intact.
 			content.push({
 				type: "tool-call",
-				toolCallId: item.id,
+				toolCallId: normalizeToolCallId(item.id),
 				toolName: item.name,
-				args: item.arguments,
+				args: normalizeCursorMcpArguments(item.arguments),
 			});
 		}
 	}
@@ -4284,6 +5310,27 @@ export function buildCursorSystemPromptJsons(systemPrompt: readonly string[] | u
 	return systemPrompts.map(content => JSON.stringify({ role: "system", content }));
 }
 
+function collectCursorToolHistory(messages: Message[], historyEnd: number) {
+	const toolResults = new Map<string, ToolResultMessage>();
+	const pairedToolCallIds = new Set<string>();
+	for (let index = 0; index < historyEnd; index++) {
+		const message = messages[index];
+		if (message.role === "toolResult") {
+			toolResults.set(message.toolCallId, message);
+		} else if (message.role === "assistant") {
+			for (const item of message.content) {
+				if (item.type === "toolCall") pairedToolCallIds.add(item.id);
+			}
+		}
+	}
+	return { toolResults, pairedToolCallIds };
+}
+
+function cursorOrphanToolResultText(result: ToolResultMessage): string {
+	const prefix = result.isError ? "[Tool Error]" : "[Tool Result]";
+	return `${prefix}\n${toolResultToText(result) || "(empty result)"}`;
+}
+
 function buildRootPromptMessagesJson(
 	messages: Message[],
 	systemPromptIds: Uint8Array[],
@@ -4292,6 +5339,8 @@ function buildRootPromptMessagesJson(
 	targetModelId?: string,
 ): Uint8Array[] {
 	assertCursorKimiK3HistoryReplayable(messages, activeUserMessageIndex, targetModelId);
+	const historyEnd = activeUserMessageIndex >= 0 ? activeUserMessageIndex : messages.length;
+	const { pairedToolCallIds } = collectCursorToolHistory(messages, historyEnd);
 	const entries: Uint8Array[] = [...systemPromptIds];
 	const pushJson = (obj: unknown) => {
 		const bytes = new TextEncoder().encode(JSON.stringify(obj));
@@ -4310,16 +5359,24 @@ function buildRootPromptMessagesJson(
 			if (content.length === 0) continue;
 			pushJson({ role: "assistant", content });
 		} else if (msg.role === "toolResult") {
+			if (!pairedToolCallIds.has(msg.toolCallId)) {
+				pushJson({
+					role: "assistant",
+					content: [{ type: "text", text: cursorOrphanToolResultText(msg) }],
+				});
+				continue;
+			}
 			// Emit even when the result text is empty: the assistant `tool-call` is
 			// already in history, so dropping the pair would replay an orphaned call.
+			const toolCallId = normalizeToolCallId(msg.toolCallId);
 			pushJson({
 				role: "tool",
-				id: msg.toolCallId,
+				id: toolCallId,
 				content: [
 					{
 						type: "tool-result",
 						toolName: msg.toolName,
-						toolCallId: msg.toolCallId,
+						toolCallId,
 						result: toolResultToText(msg),
 						...(msg.isError ? { isError: true } : {}),
 					},
@@ -4331,32 +5388,46 @@ function buildRootPromptMessagesJson(
 	return entries;
 }
 
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-	if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
-	const prototype = Object.getPrototypeOf(value);
-	return prototype === Object.prototype || prototype === null;
+function normalizeCursorMcpArgument(value: unknown, seen: Set<object>): JsonValue | undefined {
+	if (value === null || typeof value === "string" || typeof value === "boolean") return value;
+	if (typeof value === "number") return Number.isFinite(value) ? value : null;
+	if (typeof value !== "object") return undefined;
+	if (seen.has(value)) return undefined;
+
+	seen.add(value);
+	try {
+		if (Array.isArray(value)) {
+			return value.map(item => normalizeCursorMcpArgument(item, seen) ?? null);
+		}
+		if (!isRecord(value)) return undefined;
+		const normalized: Record<string, JsonValue> = Object.create(null);
+		for (const key in value) {
+			if (!Object.hasOwn(value, key)) continue;
+			const normalizedItem = normalizeCursorMcpArgument(value[key], seen);
+			if (normalizedItem !== undefined) normalized[key] = normalizedItem;
+		}
+		return normalized;
+	} finally {
+		seen.delete(value);
+	}
 }
 
-function isJsonValue(value: unknown): value is JsonValue {
-	if (value === null || typeof value === "string" || typeof value === "boolean") return true;
-	if (typeof value === "number") return Number.isFinite(value);
-	if (Array.isArray(value)) return value.every(isJsonValue);
-	if (!isPlainRecord(value)) return false;
-	for (const key in value) {
-		if (!isJsonValue(value[key])) return false;
+function normalizeCursorMcpArguments(args: Record<string, unknown>): Record<string, JsonValue> {
+	const normalized: Record<string, JsonValue> = Object.create(null);
+	const seen = new Set<object>();
+	for (const name in args) {
+		if (!Object.hasOwn(args, name)) continue;
+		const normalizedValue = normalizeCursorMcpArgument(args[name], seen);
+		if (normalizedValue !== undefined) normalized[name] = normalizedValue;
 	}
-	return true;
+	return normalized;
 }
 
 function encodeCursorMcpArguments(toolCall: ToolCall): Record<string, Uint8Array> {
-	const encoded: Record<string, Uint8Array> = {};
-	for (const name in toolCall.arguments) {
-		const value = toolCall.arguments[name];
-		if (value === undefined) continue;
-		if (!isJsonValue(value)) {
-			throw new AIError.ValidationError(`Cursor tool argument ${toolCall.name}.${name} is not JSON-serializable`);
-		}
-		encoded[name] = toBinary(ValueSchema, fromJson(ValueSchema, value));
+	const encoded: Record<string, Uint8Array> = Object.create(null);
+	const normalized = normalizeCursorMcpArguments(toolCall.arguments);
+	for (const name in normalized) {
+		encoded[name] = encodeJsonValue(normalized[name]);
 	}
 	return encoded;
 }
@@ -4395,11 +5466,12 @@ function createCursorMcpResult(result: ToolResultMessage) {
 }
 
 function createCursorToolCallStep(toolCall: ToolCall, result: ToolResultMessage | undefined) {
+	const toolCallId = normalizeToolCallId(toolCall.id);
 	const mcpCall = create(McpToolCallSchema, {
 		args: create(McpArgsSchema, {
 			name: toolCall.name,
 			args: encodeCursorMcpArguments(toolCall),
-			toolCallId: toolCall.id,
+			toolCallId,
 			providerIdentifier: "pi-agent",
 			toolName: toolCall.name,
 		}),
@@ -4410,7 +5482,7 @@ function createCursorToolCallStep(toolCall: ToolCall, result: ToolResultMessage 
 			case: "toolCall",
 			value: create(ToolCallSchema, {
 				tool: { case: "mcpToolCall", value: mcpCall },
-				toolCallId: toolCall.id,
+				toolCallId,
 			}),
 		},
 	});
@@ -4432,18 +5504,7 @@ function buildConversationTurns(
 ): Uint8Array[] {
 	const turns: Uint8Array[] = [];
 	const historyEnd = activeUserMessageIndex >= 0 ? activeUserMessageIndex : messages.length;
-	const toolResults = new Map<string, ToolResultMessage>();
-	const pairedToolCallIds = new Set<string>();
-	for (let index = 0; index < historyEnd; index++) {
-		const message = messages[index];
-		if (message.role === "toolResult") {
-			toolResults.set(message.toolCallId, message);
-		} else if (message.role === "assistant") {
-			for (const item of message.content) {
-				if (item.type === "toolCall") pairedToolCallIds.add(item.id);
-			}
-		}
-	}
+	const { toolResults, pairedToolCallIds } = collectCursorToolHistory(messages, historyEnd);
 
 	let i = 0;
 	while (i < messages.length) {
@@ -4501,17 +5562,13 @@ function buildConversationTurns(
 					stepBlobIds.push(storeCursorBlob(blobStore, toBinary(ConversationStepSchema, step)));
 				}
 			} else if (stepMsg.role === "toolResult" && !pairedToolCallIds.has(stepMsg.toolCallId)) {
-				const text = toolResultToText(stepMsg);
-				if (text) {
-					const prefix = stepMsg.isError ? "[Tool Error]" : "[Tool Result]";
-					const step = create(ConversationStepSchema, {
-						message: {
-							case: "assistantMessage",
-							value: create(AssistantMessageSchema, { text: `${prefix}\n${text}` }),
-						},
-					});
-					stepBlobIds.push(storeCursorBlob(blobStore, toBinary(ConversationStepSchema, step)));
-				}
+				const step = create(ConversationStepSchema, {
+					message: {
+						case: "assistantMessage",
+						value: create(AssistantMessageSchema, { text: cursorOrphanToolResultText(stepMsg) }),
+					},
+				});
+				stepBlobIds.push(storeCursorBlob(blobStore, toBinary(ConversationStepSchema, step)));
 			}
 			i++;
 		}
@@ -4602,30 +5659,84 @@ function extractImages(content: (TextContent | ImageContent)[]) {
 		);
 }
 
-function buildGrpcRequest(
+/**
+ * Resolve the Cursor Run wire model id and its parameter list.
+ *
+ * Cursor's `GetUsableModels` lists reasoning models as per-effort sibling
+ * slugs (`gpt-5.4-mini-low`, `gpt-5.6-sol-high`), and OMP copies those ids 1:1.
+ * The Run endpoint rejects a sibling slug as the wire `model_id` with
+ * `resource_exhausted` (errorId 528384); the official `cursor-agent` splits the
+ * slug into its base model id plus a `reasoning` effort parameter. Mirror that
+ * for OpenAI-family ids: strip a trailing effort tier and emit
+ * `{ id: "reasoning", value: <effort> }`.
+ *
+ * Non-OpenAI ids pass through unchanged — Cursor-native ids (`composer-*`,
+ * `cursor-grok-*`, `default`) carry no effort suffix, and Claude/other siblings
+ * need additional parameters (`thinking`, `context`) whose per-model values are
+ * not exposed by the decoded `GetUsableModels` schema, so guessing them would
+ * re-trigger 528384.
+ */
+function resolveCursorWireModel(
+	model: Model<"cursor-agent">,
+	requestModelId: string | undefined,
+	wireMode: CursorWireMode = "normalized",
+): {
+	modelId: string;
+	parameters: RequestedModel_ModelParameterbytes[];
+} {
+	const rawWireModelId = requestModelId ?? model.requestModelId ?? model.id;
+	// Synthetic catalog id `auto` is the Cursor router sentinel; the wire contract
+	// expects `default` (and gateway SSE already treats both as auto intent).
+	const wireModelId = rawWireModelId === "auto" ? "default" : rawWireModelId;
+	if (wireMode === "discovered") return { modelId: wireModelId, parameters: [] };
+	// Cursor's fast lane follows the effort token (`-high-fast`), while the
+	// standard lane ends at it (`-high`). Preserve the lane in the base id.
+	const match = /^(.*)-(minimal|low|medium|high|xhigh|max)(-fast)?$/.exec(wireModelId);
+	const base = match?.[1];
+	const effort = match?.[2];
+	if (base && effort && (THINKING_EFFORTS as readonly string[]).includes(effort) && parseOpenAIModel(base) !== null) {
+		return {
+			modelId: `${base}${match[3] ?? ""}`,
+			parameters: [create(RequestedModel_ModelParameterbytesSchema, { id: "reasoning", value: effort })],
+		};
+	}
+	// A bare `composer-2.5` id resolves to the Fast variant server-side
+	// (can1357/oh-my-pi#9012). Pin the Standard tier explicitly; `-fast`
+	// selections keep the Fast lane by omitting the parameter.
+	if (wireModelId === "composer-2.5") {
+		return {
+			modelId: wireModelId,
+			parameters: [create(RequestedModel_ModelParameterbytesSchema, { id: "fast", value: "false" })],
+		};
+	}
+	return { modelId: wireModelId, parameters: [] };
+}
+
+async function buildGrpcRequestForWireMode(
 	model: Model<"cursor-agent">,
 	context: Context,
 	options: CursorOptions | undefined,
-	state: {
-		conversationId: string;
-		blobStore: Map<string, Uint8Array>;
-		conversationState?: ConversationStateStructure;
-	},
-): {
-	requestBytes: Uint8Array;
-	blobStore: Map<string, Uint8Array>;
-	conversationState: ConversationStateStructure;
-} {
+	state: CursorRequestState,
+	wireMode: CursorWireMode,
+): Promise<CursorTransportRequest> {
 	const blobStore = state.blobStore;
 
 	const systemPromptIds = buildCursorSystemPromptJsons(context.systemPrompt).map(json =>
 		storeCursorBlob(blobStore, new TextEncoder().encode(json)),
 	);
 
-	const activeUserMessageIndex = context.messages.length - 1;
+	const lastUserMessageIndex = findLastUserMessageIndex(context.messages);
+	let activeUserMessageIndex = context.messages.length - 1;
 	const activeMessage = context.messages[activeUserMessageIndex];
-	const activeUserMessage =
+	let activeUserMessage =
 		activeMessage?.role === "user" || activeMessage?.role === "developer" ? activeMessage : undefined;
+	if (state.rotatedFresh && !activeUserMessage && lastUserMessageIndex >= 0) {
+		activeUserMessageIndex = lastUserMessageIndex;
+		const lastUser = context.messages[lastUserMessageIndex];
+		if (lastUser.role === "user" || lastUser.role === "developer") {
+			activeUserMessage = lastUser;
+		}
+	}
 	let userContent: string | (TextContent | ImageContent)[] | undefined;
 	let userText = "";
 	let hasUserImages = false;
@@ -4708,7 +5819,11 @@ function buildGrpcRequest(
 		turns,
 	});
 
-	const wireModelId = model.requestModelId ?? model.id;
+	const { modelId: wireModelId, parameters: wireParameters } = resolveCursorWireModel(
+		model,
+		options?.wireModelId,
+		wireMode,
+	);
 	const cursorMaxMode = model.cursorMaxMode === true;
 	const modelDetails = create(ModelDetailsSchema, {
 		modelId: wireModelId,
@@ -4719,23 +5834,48 @@ function buildGrpcRequest(
 	const requestedModel = create(RequestedModelSchema, {
 		modelId: wireModelId,
 		maxMode: cursorMaxMode,
+		parameters: wireParameters,
 	});
 
-	const runRequest = create(AgentRunRequestSchema, {
+	let runRequest = create(AgentRunRequestSchema, {
 		conversationState,
 		action,
 		modelDetails,
 		requestedModel,
 		conversationId: state.conversationId,
+		clientSupportsInlineImages: options?.cursorClientSupportsInlineImages === true,
+		clientSupportsRoutedModelUpdate: options?.cursorClientSupportsRoutedModelUpdate === true,
+		clientSupportsPromptContextUsageRpc: options?.cursorClientSupportsPromptContextUsageRpc === true,
+		runId: options?.cursorRunId ?? "",
+		agentSessionId: options?.cursorAgentSessionId ?? "",
 	});
 
-	options?.onPayload?.(runRequest, model);
-
-	// Tools are sent later via requestContext (exec handshake)
-
+	// Apply customSystemPrompt BEFORE the hook so the onPayload replacement is the
+	// final word on the wire body — same contract as anthropic, where the hook runs
+	// right before serialization. An extension may inspect or drop it via the
+	// replacement it returns.
 	if (options?.customSystemPrompt) {
 		runRequest.customSystemPrompt = options.customSystemPrompt;
 	}
+
+	// Tools are sent later via requestContext (exec handshake)
+	const replacementRequest = await options?.onPayload?.(runRequest, model);
+	if (replacementRequest !== undefined) runRequest = replacementRequest as typeof runRequest;
+
+	const discoveredWireModelId = options?.wireModelId ?? model.requestModelId ?? model.id;
+	const serializedParameters = runRequest.requestedModel?.parameters;
+	const normalizedEffortPayloadSerialized =
+		wireMode === "normalized" &&
+		wireParameters.length > 0 &&
+		wireModelId !== discoveredWireModelId &&
+		runRequest.requestedModel?.modelId === wireModelId &&
+		runRequest.modelDetails?.modelId === wireModelId &&
+		serializedParameters?.length === wireParameters.length &&
+		serializedParameters.every((parameter, index) => {
+			const expected = wireParameters[index];
+			return expected !== undefined && parameter.id === expected.id && parameter.value === expected.value;
+		});
+	const fallbackWireModelId = normalizedEffortPayloadSerialized ? discoveredWireModelId : undefined;
 
 	const clientMessage = create(AgentClientMessageSchema, {
 		message: { case: "runRequest", value: runRequest },
@@ -4755,7 +5895,17 @@ function buildGrpcRequest(
 		detail: detail || undefined,
 	});
 
-	return { requestBytes, blobStore, conversationState };
+	return { requestBytes, blobStore, conversationState, fallbackWireModelId };
+}
+
+/** Builds the normalized Cursor Run request used by transport callers and request inspection hooks. */
+export async function buildGrpcRequest(
+	model: Model<"cursor-agent">,
+	context: Context,
+	options: CursorOptions | undefined,
+	state: CursorRequestState,
+): Promise<CursorGrpcRequest> {
+	return buildGrpcRequestForWireMode(model, context, options, state, "normalized");
 }
 
 function hasImages(content: (TextContent | ImageContent)[]): boolean {

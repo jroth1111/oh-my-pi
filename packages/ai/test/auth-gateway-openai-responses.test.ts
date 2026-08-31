@@ -8,7 +8,7 @@ import { AuthStorage } from "@oh-my-pi/pi-ai/auth-storage";
 import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
 import { encodeResponse, encodeStream, parseRequest } from "@oh-my-pi/pi-ai/providers/openai-responses-server";
 import { buildResponsesInput } from "@oh-my-pi/pi-ai/providers/openai-shared";
-import type { AssistantMessage, ModelSpec } from "@oh-my-pi/pi-ai/types";
+import type { AssistantMessage, Context, ModelSpec } from "@oh-my-pi/pi-ai/types";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
@@ -175,6 +175,268 @@ describe("openai-responses parseRequest", () => {
 		// `store` and `previous_response_id` are accepted by the schema but not
 		// plumbed through pi-ai — they no longer leak into options.extra.
 		expect(parsed.options.extra).toBeUndefined();
+	});
+
+	it("preserves canonical multimodal order and nullable fallback sources", () => {
+		const imageData = Buffer.from("tool image").toString("base64");
+		const parsed = parseRequest({
+			model: "gpt-5.6-sol",
+			input: [
+				{
+					type: "function_call",
+					id: "fc_read",
+					call_id: "call_read",
+					name: "read",
+					arguments: '{"path":"image.png"}',
+				},
+				{
+					type: "function_call_output",
+					call_id: "call_read",
+					output: [
+						{
+							type: "input_image",
+							image_url: `data:image/png;base64,${imageData}`,
+							file_id: null,
+							detail: "original",
+						},
+						{ type: "input_text", text: "Read image file [image/png]" },
+						{ type: "input_image", image_url: "", file_id: "file_image_123", detail: null },
+						{ type: "input_text", text: "done" },
+					],
+				},
+			],
+		});
+
+		const result = parsed.context.messages[1];
+		if (result?.role !== "toolResult") throw new Error("expected tool result");
+		expect(result.content).toEqual([
+			{ type: "image", data: imageData, mimeType: "image/png", detail: "original" },
+			{ type: "text", text: "Read image file [image/png]" },
+			{
+				type: "image",
+				data: "",
+				mimeType: "application/octet-stream",
+				providerFile: { provider: "openai", id: "file_image_123" },
+			},
+			{ type: "text", text: "done" },
+		]);
+	});
+
+	it("rejects function output images with an empty source", () => {
+		expect(() =>
+			parseRequest({
+				model: "gpt-5.6-sol",
+				input: [
+					{
+						type: "function_call_output",
+						call_id: "call_read",
+						output: [{ type: "input_image", image_url: "", file_id: null, detail: null }],
+					},
+				],
+			}),
+		).toThrow(/at least one of `image_url` or `file_id`/);
+	});
+
+	it("rejects file blocks in tool outputs instead of flattening their content", () => {
+		expect(() =>
+			parseRequest({
+				model: "gpt-5.6-sol",
+				input: [
+					{
+						type: "function_call_output",
+						call_id: "call_read",
+						output: [{ type: "input_file", filename: "report.pdf", file_data: "opaque" }],
+					},
+				],
+			}),
+		).toThrow(/input_file/);
+	});
+
+	it("concatenates legacy function output text while retaining inline images", () => {
+		const imageData = Buffer.from("legacy image").toString("base64");
+		const parsed = parseRequest({
+			model: "gpt-5.6-sol",
+			input: [
+				{
+					type: "function_call_output",
+					call_id: "call_legacy",
+					output: [
+						{ type: "output_text", text: "foo" },
+						{ type: "text", text: "bar" },
+						{ type: "refusal", refusal: "no" },
+						{ type: "input_image", image_url: `data:image/png;base64,${imageData}` },
+					],
+				},
+			],
+		});
+
+		const result = parsed.context.messages[0];
+		if (result?.role !== "toolResult") throw new Error("expected tool result");
+		expect(result.content).toEqual([
+			{ type: "text", text: "foobar[refusal: no]" },
+			{ type: "image", data: imageData, mimeType: "image/png" },
+		]);
+	});
+
+	it("round-trips Pi image-read image forms as native function output blocks", () => {
+		const imageData = Buffer.from("read tool image").toString("base64");
+		const imageUrl = "https://blob.example.invalid/read-image.png";
+		const providerFileId = "file_read_image_123";
+		const model = buildModel({
+			id: "gpt-5.6-sol",
+			name: "GPT-5.6 Sol",
+			api: "openai-responses",
+			provider: "openai",
+			baseUrl: "https://api.openai.com/v1",
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 1_000_000,
+			maxTokens: 128_000,
+		} satisfies ModelSpec<"openai-responses">);
+		const context: Context = {
+			messages: [
+				{
+					role: "assistant",
+					content: [{ type: "toolCall", id: "call_read", name: "read", arguments: { path: "image.png" } }],
+					api: "openai-responses",
+					provider: "openai",
+					model: model.id,
+					usage: zeroUsage(),
+					stopReason: "toolUse",
+					timestamp: 1,
+				},
+				{
+					role: "toolResult",
+					toolCallId: "call_read",
+					toolName: "read",
+					content: [
+						{ type: "text", text: "Read image file [image/png]" },
+						{ type: "image", data: imageData, mimeType: "image/png", detail: "original" },
+						{ type: "image", data: imageData, mimeType: "image/png", detail: "high", url: imageUrl },
+						{
+							type: "image",
+							data: imageData,
+							mimeType: "image/png",
+							detail: "low",
+							providerFile: { provider: "openai", id: providerFileId },
+						},
+					],
+					isError: false,
+					timestamp: 2,
+				},
+			],
+		};
+
+		const wireInput = buildResponsesInput({
+			model,
+			context,
+			strictResponsesPairing: true,
+			supportsImageDetailOriginal: true,
+		});
+		const wireOutput = wireInput.find(item => item.type === "function_call_output");
+		if (wireOutput?.type !== "function_call_output") throw new Error("expected function output");
+		expect(wireOutput.output).toEqual([
+			{ type: "input_text", text: "Read image file [image/png]" },
+			{
+				type: "input_image",
+				detail: "original",
+				image_url: `data:image/png;base64,${imageData}`,
+			},
+			{ type: "input_image", detail: "high", image_url: imageUrl },
+			{ type: "input_image", detail: "low", file_id: providerFileId },
+		]);
+		expect(wireInput.some(item => "role" in item && item.role === "user")).toBe(false);
+
+		const parsed = parseRequest({ model: model.id, input: wireInput });
+		const result = parsed.context.messages.find(message => message.role === "toolResult");
+		if (result?.role !== "toolResult") throw new Error("expected tool result");
+		expect(result.content).toEqual([
+			{ type: "text", text: "Read image file [image/png]" },
+			{ type: "image", data: imageData, mimeType: "image/png", detail: "original" },
+			{
+				type: "image",
+				data: "",
+				mimeType: "application/octet-stream",
+				detail: "high",
+				url: imageUrl,
+			},
+			{
+				type: "image",
+				data: "",
+				mimeType: "application/octet-stream",
+				detail: "low",
+				providerFile: { provider: "openai", id: providerFileId },
+			},
+		]);
+
+		const replayInput = buildResponsesInput({
+			model,
+			context: parsed.context,
+			strictResponsesPairing: true,
+			supportsImageDetailOriginal: true,
+		});
+		const replayOutput = replayInput.find(item => item.type === "function_call_output");
+		if (replayOutput?.type !== "function_call_output") throw new Error("expected replayed function output");
+		expect(replayOutput.output).toEqual(wireOutput.output);
+	});
+
+	it("round-trips array-valued custom tool outputs without demoting them", () => {
+		const imageData = Buffer.from("custom tool image").toString("base64");
+		const model = buildModel({
+			id: "gpt-5.6-sol",
+			name: "GPT-5.6 Sol",
+			api: "openai-responses",
+			provider: "openai",
+			baseUrl: "https://api.openai.com/v1",
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 1_000_000,
+			maxTokens: 128_000,
+			applyPatchToolType: "freeform",
+		} satisfies ModelSpec<"openai-responses">);
+		const parsed = parseRequest({
+			model: model.id,
+			input: [
+				{
+					type: "custom_tool_call",
+					call_id: "call_patch",
+					name: "apply_patch",
+					input: "*** Begin Patch",
+				},
+				{
+					type: "custom_tool_call_output",
+					call_id: "call_patch",
+					output: [
+						{ type: "input_text", text: "Rendered patch preview" },
+						{ type: "input_image", image_url: `data:image/png;base64,${imageData}`, detail: "high" },
+					],
+				},
+			],
+		});
+
+		const result = parsed.context.messages[1];
+		if (result?.role !== "toolResult") throw new Error("expected custom tool result");
+		expect(result.toolName).toBe("apply_patch");
+		expect(result.content).toEqual([
+			{ type: "text", text: "Rendered patch preview" },
+			{ type: "image", data: imageData, mimeType: "image/png", detail: "high" },
+		]);
+
+		const replay = buildResponsesInput({
+			model,
+			context: parsed.context,
+			strictResponsesPairing: true,
+			supportsImageDetailOriginal: true,
+		});
+		const replayOutput = replay.find(item => item.type === "custom_tool_call_output");
+		if (replayOutput?.type !== "custom_tool_call_output") throw new Error("expected custom tool output");
+		expect(replayOutput.output).toEqual([
+			{ type: "input_text", text: "Rendered patch preview" },
+			{ type: "input_image", detail: "high", image_url: `data:image/png;base64,${imageData}` },
+		]);
+		expect(replay.some(item => item.type === "function_call_output")).toBe(false);
 	});
 
 	it("rejects raw explicit prompt-cache controls instead of silently dropping them", () => {
@@ -480,7 +742,7 @@ describe("openai-responses encodeResponse", () => {
 			role: "assistant",
 			api: "openai-responses",
 			provider: "openai",
-			model: "gpt-5",
+			model: "gpt-5-requested",
 			content: [
 				{
 					type: "thinking",
@@ -659,6 +921,22 @@ describe("openai-responses encodeResponse", () => {
 		expect(body.status).toBe("incomplete");
 		expect(body.incomplete_details).toEqual({ reason: "max_output_tokens" });
 	});
+
+	it("keeps provider-qualified request model ids unless Cursor auto routing is active", () => {
+		const message: AssistantMessage = {
+			role: "assistant",
+			api: "openai-responses",
+			provider: "cursor",
+			model: "gpt-5",
+			content: [{ type: "text", text: "ok" }],
+			usage: zeroUsage(),
+			stopReason: "stop",
+			timestamp: 1_700_000_000_000,
+		};
+		expect(encodeResponse(message, "cursor/gpt-5").model).toBe("cursor/gpt-5");
+		expect(encodeResponse(message, "cursor/gpt-5", { cursorAutoMode: true }).model).toBe("gpt-5");
+		expect(encodeResponse(message, "auto", { cursorAutoMode: true }).model).toBe("gpt-5");
+	});
 });
 
 describe("openai-responses encodeStream", () => {
@@ -669,7 +947,7 @@ describe("openai-responses encodeStream", () => {
 			role: "assistant",
 			api: "openai-responses",
 			provider: "openai",
-			model: "gpt-5",
+			model: "gpt-5-requested",
 			content: [],
 			usage: zeroUsage(),
 			stopReason: "stop",
@@ -680,7 +958,7 @@ describe("openai-responses encodeStream", () => {
 			role: "assistant",
 			api: "openai-responses",
 			provider: "openai",
-			model: "gpt-5",
+			model: "gpt-5-requested",
 			content: [
 				{ type: "thinking", thinking: "step 1", thinkingSignature: "rs_s1", itemId: "rs_s1" },
 				{ type: "text", text: "Hi!" },
@@ -829,6 +1107,84 @@ describe("openai-responses encodeStream", () => {
 		});
 		// Critical gotcha: id and call_id are distinct.
 		expect(output[2]!.id).not.toBe(output[2]!.call_id);
+	});
+
+	it("buffers content until Cursor auto routing resolves after early text", async () => {
+		const stream = new AssistantMessageEventStream();
+		const initial: AssistantMessage = {
+			role: "assistant",
+			api: "openai-responses",
+			provider: "cursor",
+			model: "auto",
+			content: [],
+			usage: zeroUsage(),
+			stopReason: "stop",
+			timestamp: 1_700_000_000_000,
+		};
+		const earlyText: AssistantMessage = {
+			...initial,
+			content: [{ type: "text", text: "h" }],
+		};
+		const routed: AssistantMessage = {
+			...earlyText,
+			model: "claude-opus-4-7",
+			content: [{ type: "text", text: "hi" }],
+		};
+
+		queueMicrotask(() => {
+			stream.push({ type: "start", partial: initial });
+			stream.push({ type: "text_start", contentIndex: 0, partial: earlyText });
+			stream.push({ type: "text_delta", contentIndex: 0, delta: "h", partial: earlyText });
+			stream.push({ type: "routed_model", model: "claude-opus-4-7", partial: routed });
+			stream.push({ type: "text_delta", contentIndex: 0, delta: "i", partial: routed });
+			stream.push({ type: "text_end", contentIndex: 0, content: "hi", partial: routed });
+			stream.push({ type: "done", reason: "stop", message: routed });
+			stream.end(routed);
+		});
+
+		const frames = parseSse(await collectStream(encodeStream(stream, "auto", { cursorAutoMode: true })));
+		const created = frames.find(f => f.event === "response.created");
+		expect(created).toBeDefined();
+		const response = (created!.data as { response: { model: string } }).response;
+		expect(response.model).toBe("claude-opus-4-7");
+		const types = frames.map(f => f.event);
+		expect(types.indexOf("response.created")).toBeLessThan(types.indexOf("response.output_item.added"));
+		expect(types.indexOf("response.created")).toBeGreaterThanOrEqual(0);
+	});
+
+	it("streams response.created immediately for literal model id auto without cursorAutoMode", async () => {
+		const stream = new AssistantMessageEventStream();
+		const initial: AssistantMessage = {
+			role: "assistant",
+			api: "openai-responses",
+			provider: "openrouter",
+			model: "auto",
+			content: [],
+			usage: zeroUsage(),
+			stopReason: "stop",
+			timestamp: 1_700_000_000_000,
+		};
+		const withText: AssistantMessage = {
+			...initial,
+			content: [{ type: "text", text: "ok" }],
+		};
+
+		queueMicrotask(() => {
+			stream.push({ type: "start", partial: initial });
+			stream.push({ type: "text_start", contentIndex: 0, partial: withText });
+			stream.push({ type: "text_delta", contentIndex: 0, delta: "ok", partial: withText });
+			stream.push({ type: "text_end", contentIndex: 0, content: "ok", partial: withText });
+			stream.push({ type: "done", reason: "stop", message: withText });
+			stream.end(withText);
+		});
+
+		const frames = parseSse(await collectStream(encodeStream(stream, "auto")));
+		const created = frames.find(f => f.event === "response.created");
+		expect(created).toBeDefined();
+		const response = (created!.data as { response: { model: string } }).response;
+		expect(response.model).toBe("auto");
+		const types = frames.map(f => f.event);
+		expect(types.indexOf("response.created")).toBeLessThan(types.indexOf("response.output_item.added"));
 	});
 
 	it("streams a GA computer_call with provider item id, actions, and safety checks", async () => {
@@ -1102,6 +1458,49 @@ describe("openai-responses encodeStream", () => {
 	});
 });
 
+describe("auth-gateway OpenAI Responses multimodal tool outputs", () => {
+	it("rejects OpenAI image file IDs before dispatching to a non-Responses upstream", async () => {
+		registerMockApi();
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gw-responses-file-id-"));
+		const storage = await AuthStorage.create(path.join(dir, "auth.db"));
+		storage.setRuntimeApiKey("openai", "test-key");
+		const mock = createMockModel({ provider: "openai", id: "mock/file-id" });
+		mock.push({ content: ["unexpected provider call"] });
+		const gateway = startAuthGateway({
+			bind: "127.0.0.1:0",
+			bearerTokens: ["test-token"],
+			storage,
+			resolveModel: () => mock.model,
+			version: "test",
+		});
+
+		try {
+			const response = await fetch(`${gateway.url}/v1/responses`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json", Authorization: "Bearer test-token" },
+				body: JSON.stringify({
+					model: "mock/file-id",
+					input: [
+						{
+							type: "function_call_output",
+							call_id: "call_read",
+							output: [{ type: "input_image", file_id: "file_image_123" }],
+						},
+					],
+				}),
+			});
+			expect(response.status).toBe(400);
+			const body = (await response.json()) as { error: { message: string } };
+			expect(body.error.message).toContain("require a Responses-compatible upstream model");
+			expect(mock.calls).toHaveLength(0);
+		} finally {
+			await gateway.close();
+			storage.close();
+			await fs.rm(dir, { recursive: true, force: true });
+			clearCustomApis();
+		}
+	});
+});
 describe("auth-gateway OpenAI Responses computer option bridge", () => {
 	it("preserves the native tool, forced choice, and include in stream options", async () => {
 		registerMockApi();
