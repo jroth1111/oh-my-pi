@@ -1,19 +1,34 @@
 # Changelog
 
 ## [Unreleased]
-### Breaking Changes
 
-- Replaced the Git-only `watchHead`/`headWatchTarget` API with backend-neutral `watch`/`VcsRepo.watchTarget`.
-
-### Added
-
-- Added `VcsRepo`, `repo()`, and `require()` for portable repository discovery and read operations across Git and Jujutsu, with explicit `stagedDiff` and `revDiff` capability checks.
-- Added the `Vcs*` API: in-process git (gitoxide) and Jujutsu (jj-lib) repository operations — discovery, HEAD/refs, status, diffs (including no-index and binary patches), staging, commits, branches, worktrees, patch application, stash, cherry-pick, and CLI-backed push/fetch/clone with AbortSignal cancellation.
+## [18.0.11] - 2026-08-29
 
 ### Fixed
 
-- Intent-to-add files (`git add -N`) now appear in `statusPorcelain` as unstaged additions (` A`), matching git — they were previously invisible to the git TUI and AI staging.
-- Staging or applying a new-file patch over an intent-to-add index entry no longer fails with "already exists", and cached patch application preserves the intent-to-add flag of unrelated index entries instead of silently staging them as empty files.
+- Fixed staging and committing files through a reused Git repository handle, ensuring newly staged changes are correctly included in commits even on filesystems with coarse timestamp resolution.
+
+## [18.0.10] - 2026-08-28
+
+### Added
+
+- Added native process replacement support for the CLI’s `/restart` command.
+- Added `VcsGitRepo.mergeBase(a, b)` to find the best common ancestor of two Git revisions, returning `null` when the histories are unrelated.
+
+## [18.0.9] - 2026-08-28
+
+### Breaking Changes
+
+- Replaced the Git-specific `watchHead` and `headWatchTarget` API with the backend-neutral `watch` and `VcsRepo.watchTarget` APIs.
+
+### Added
+
+- Added portable repository discovery and read operations through `VcsRepo`, `repo()`, and `require()`, with support for Git and Jujutsu and explicit capability checks for staged and revision diffs.
+- Added the `Vcs*` API for repository operations across Git and Jujutsu, including repository discovery, refs and status, diffs, staging, commits, branches, worktrees, patch application, stash, cherry-pick, and CLI-backed push, fetch, and clone operations with cancellation support.
+
+### Fixed
+
+- Fixed Git intent-to-add files so they appear correctly as unstaged additions in `statusPorcelain` and are handled correctly when staging or applying patches.
 
 ## [18.0.8] - 2026-08-27
 
