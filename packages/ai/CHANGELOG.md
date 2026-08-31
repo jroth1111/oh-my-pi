@@ -19,29 +19,15 @@
 - Devin auth, model assignment, and chat requests now send the native Devin CLI identity (`ideName: devin-cli`, `ideType: chisel`, `extensionName: chisel`, mapped `os`) instead of the Windsurf IDE identity; `ideType: chisel` is what the backend requires for router assignment ([#8590](https://github.com/can1357/oh-my-pi/pull/8590) by [@will-bogusz](https://github.com/will-bogusz)).
 - Devin parallel tool calls follow `compat.supportsParallelToolCalls` instead of being disabled unconditionally, so natively discovered configs that support parallelism can use it ([#8590](https://github.com/can1357/oh-my-pi/pull/8590) by [@will-bogusz](https://github.com/will-bogusz)).
 
-## [18.0.11] - 2026-08-29
-
 ### Fixed
 
-- Fixed automatic session retries for Anthropic-compatible streams that end prematurely without a completion signal.
-- Fixed Gemini 3.x tool-call continuations through OpenAI-compatible endpoints.
-- Fixed credential fallback for HTTP 402 payment-required and deactivated-workspace responses, preventing them from being misclassified as quota exhaustion.
-- Fixed Perplexity email sign-in for accounts protected by authenticator-based two-factor authentication.
-- Fixed Qianfan API-key login validation for keys that cannot access the validation model.
-- Fixed Z.AI browser sign-in to report an occupied callback port before opening the browser.
-
-## [18.0.9] - 2026-08-28
-
-### Fixed
-
-- Improved OAuth sign-in flows, including a fallback message when the browser cannot automatically close the OAuth success tab.
-- Fixed Cloudflare AI Gateway onboarding and routing so gateway account and endpoint configuration is preserved correctly while gateway credentials are not sent as upstream OpenAI authorization headers.
-- Fixed Codex OAuth quota handling so chat and Spark usage remain independent, legacy shared quota limits continue to work, and incomplete usage reports are not incorrectly treated as unlimited.
-- Gateway error classifications now carry a failure owner and retry/failover disposition (`credential_permanent`, `provider_transient`, `policy_terminal`, …); provider status codes stay authoritative over message wording, and context-overflow detection reuses the central classifier.
-- Gateway requests now forward `previous_response_id`, `parallel_tool_calls`, `logit_bias`, `user`, and `response_format` to providers instead of dropping them; Responses requests map `response_format` JSON-schema to the flat `text.format` shape and never send Chat-Completions-only `seed`.
-
-### Fixed
-
+- Fixed `mapOptionsForApi` dropping OpenAI Responses/Completions continuation fields (`previousResponseId`, `parallelToolCalls`, `seed`, `logitBias`, `user`, `responseFormat`) so gateway-parsed options reach provider `buildParams()`.
+- Fixed auth-gateway target health ignoring `owner: "model"` failures and double-counting non-streaming provider failures before fallback, so circuits open at the intended three-failure threshold.
+- Fixed auth-gateway `siblingsExhausted` sticking across `fallback_target` moves (and raised the attempt cap) so each fallback target gets its own sibling-credential retry.
+- Fixed committed SSE streams leaking turn reservations when `reader.read()` rejects.
+- Fixed gateway classification treating Codex `cyber_policy` / Trusted Access HTTP 403 denials (including structured `code: "cyber_policy"`) as retryable credential failures; they are now `policy_terminal`.
+- Fixed auth-gateway preferred-later failover so retries stay inside the disposition's compiled fallback list instead of any unused route target (e.g. no small-model retry on `context_overflow`).
+- Fixed auth gateway missing-credential handling to skip a useless same-target sibling retry and fail over immediately via compiled `credential_transient` fallbacks when other targets exist.
 - Fixed OpenAI Responses continuation pairing a caller-supplied `previous_response_id` with an internally computed delta from a different stored response, and restricted stale-baseline recovery to internally owned chain ids so a stale caller id can no longer silently drop prior context.
 - Auth gateway observes Responses SSE through a StreamCommitGate: metadata-only preludes stay failover-eligible, the first output event or 4 MiB cap commits, and post-commit terminals (`response.completed`/`response.failed`/`response.incomplete`/`response.error`) end failover eligibility instead of being misread as output.
 - Auth gateway virtual routes now fail over to a backup model when the primary is unavailable, as long as the response stream has not been committed.
@@ -62,6 +48,27 @@
 - Auth gateway skips targets whose provider health circuit is open.
 - Auth gateway remembers prompt-cache affinity after a successful non-error stream.
 - Auth gateway prefers the remembered prompt-cache model on the first dispatch of a matching request.
+
+## [18.0.11] - 2026-08-29
+
+### Fixed
+
+- Fixed automatic session retries for Anthropic-compatible streams that end prematurely without a completion signal.
+- Fixed Gemini 3.x tool-call continuations through OpenAI-compatible endpoints.
+- Fixed credential fallback for HTTP 402 payment-required and deactivated-workspace responses, preventing them from being misclassified as quota exhaustion.
+- Fixed Perplexity email sign-in for accounts protected by authenticator-based two-factor authentication.
+- Fixed Qianfan API-key login validation for keys that cannot access the validation model.
+- Fixed Z.AI browser sign-in to report an occupied callback port before opening the browser.
+
+## [18.0.9] - 2026-08-28
+
+### Fixed
+
+- Improved OAuth sign-in flows, including a fallback message when the browser cannot automatically close the OAuth success tab.
+- Fixed Cloudflare AI Gateway onboarding and routing so gateway account and endpoint configuration is preserved correctly while gateway credentials are not sent as upstream OpenAI authorization headers.
+- Fixed Codex OAuth quota handling so chat and Spark usage remain independent, legacy shared quota limits continue to work, and incomplete usage reports are not incorrectly treated as unlimited.
+- Gateway error classifications now carry a failure owner and retry/failover disposition (`credential_permanent`, `provider_transient`, `policy_terminal`, …); provider status codes stay authoritative over message wording, and context-overflow detection reuses the central classifier.
+- Gateway requests now forward `previous_response_id`, `parallel_tool_calls`, `logit_bias`, `user`, and `response_format` to providers instead of dropping them; Responses requests map `response_format` JSON-schema to the flat `text.format` shape and never send Chat-Completions-only `seed`.
 
 ## [18.0.8] - 2026-08-27
 
