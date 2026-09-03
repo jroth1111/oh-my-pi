@@ -233,7 +233,7 @@ export function resolvePromptCacheKey(body: unknown, headers?: Headers): string 
 
 const CORS_HEADERS: Record<string, string> = {
 	"Access-Control-Allow-Origin": "*",
-	"Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+	"Access-Control-Allow-Methods": "GET, PUT, DELETE, POST, OPTIONS",
 	"Access-Control-Allow-Headers":
 		"authorization, content-type, anthropic-version, anthropic-beta, openai-organization, openai-project, x-stainless-*, x-api-key, x-cursor-auto-mode, x-cursor-tool-passthrough, x-cursor-agent-exclude-tools, local-cli-mode, x-dev-experiment-overrides",
 	"Access-Control-Expose-Headers":
