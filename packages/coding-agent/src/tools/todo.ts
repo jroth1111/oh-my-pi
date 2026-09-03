@@ -52,7 +52,8 @@ export function isTodoPhase(value: unknown): value is TodoPhase {
 				task.status === "in_progress" ||
 				task.status === "completed" ||
 				task.status === "abandoned" ||
-				task.status === "blocked"),
+				task.status === "blocked") &&
+			(task.droppedBy === undefined || task.droppedBy === "user"),
 	);
 }
 
@@ -544,12 +545,12 @@ function applyEntry(
 	phases: TodoPhase[],
 	entry: TodoOpEntryValue,
 	errors: string[],
-	options?: { userAuthored?: boolean },
+	options?: { userAuthored?: boolean; userDrop?: boolean },
 ): TodoPhase[] {
 	switch (entry.op) {
 		case "init": {
 			const next = initPhases(entry, errors);
-			if (options?.userAuthored) return next;
+			if (options?.userAuthored || options?.userDrop) return next;
 			// Model init must not erase unresolved model drops the settle gate protects.
 			const retained: TodoPhase[] = [];
 			for (const phase of phases) {
@@ -594,7 +595,7 @@ function applyEntry(
 		}
 		case "drop": {
 			for (const task of getTaskTargets(phases, entry, errors)) {
-				if (!options?.userAuthored) {
+				if (!(options?.userAuthored || options?.userDrop)) {
 					// Phase-wide/untargeted model drops must not reopen finished or
 					// blocked work — same settle-gate contract as model `rm`. A
 					// targeted `drop` (explicit `task`) honors the tool contract and
@@ -605,7 +606,9 @@ function applyEntry(
 				}
 				task.status = "abandoned";
 				delete task.blocker;
-				if (options?.userAuthored) task.droppedBy = "user";
+				// Slash-command `/todo drop` stamps user provenance so settle treats
+				// the cancel as complete; model `todo` drop ops clear any stale stamp.
+				if (options?.userAuthored || options?.userDrop) task.droppedBy = "user";
 				else delete task.droppedBy;
 			}
 			return phases;
@@ -648,7 +651,7 @@ function applyEntry(
 			return phases;
 		}
 		case "rm":
-			if (options?.userAuthored) return removeTasks(phases, entry, errors);
+			if (options?.userAuthored || options?.userDrop) return removeTasks(phases, entry, errors);
 			// Model `rm` is a settle cheat: abandon in place like `drop`.
 			// Leave completed/blocked alone, and keep existing abandoned (incl. user
 			// droppedBy) so rm cannot rewrite terminals into unprovenanced drops.
@@ -716,7 +719,7 @@ function applyParams(phases: TodoPhase[], params: TodoOpEntryValue): { phases: T
 export function applyOpsToPhases(
 	currentPhases: TodoPhase[],
 	ops: TodoOpEntryValue[],
-	options?: { userAuthored?: boolean },
+	options?: { userAuthored?: boolean; userDrop?: boolean },
 ): { phases: TodoPhase[]; errors: string[] } {
 	const errors: string[] = [];
 	let next = clonePhases(currentPhases);

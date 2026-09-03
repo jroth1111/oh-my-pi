@@ -48,5 +48,4 @@ export function compiledBinariesWork(): boolean {
 	if (inContinuousIntegration()) return true;
 	return probeCompiledBinaries();
 }
-
 export const COMPILED_BINARIES_WORK = compiledBinariesWork();
