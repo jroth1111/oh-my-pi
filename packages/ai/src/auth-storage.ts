@@ -6059,6 +6059,9 @@ export class AuthStorage {
 			options?.requestId,
 		);
 		if (blockedNow) {
+		// Stable credential id for anonymous probe cleanup — retain the id used when
+		// the lease was acquired (and refreshed after prepare), never re-read by index.
+		let credentialId: number | undefined;
 		if (
 			this.#isCredentialBlocked(
 			)
@@ -6164,6 +6167,7 @@ export class AuthStorage {
 			this.#inflightProbes.set(probeRequestKey, {
 			// Exclusive turn reservation only for cooldown probes — normal OAuth
 			// selections must remain concurrently usable across request ids.
+			credentialId = blockedId;
 				const acquired = this.tryAcquireTurnReservation({
 					credentialId: blockedId,
 					incarnation: this.getCredentialIncarnation(blockedId),
@@ -6183,7 +6187,7 @@ export class AuthStorage {
 			if (!(await this.#prepareOAuthCredentialForRequest(provider, selection, options))) {
 				return undefined;
 			}
-			// Capture the row id once, immediately after #prepareOAuthCredentialForRequest
+			// Capture / refresh the row id once, immediately after #prepareOAuthCredentialForRequest
 			// resynced selection.index from the store. A concurrent disable during the
 			// usage/refresh awaits below can shift positional indices, so every later
 			// refresh / persist / CAS-disable addresses the row by this stable id.
@@ -6204,6 +6208,7 @@ export class AuthStorage {
 					}
 				}
 			}
+			credentialId = this.#getStoredCredentials(provider)[selection.index]?.id;
 
 			const planRequirement =
 				providedPlanRequirement ?? resolveOpenAICodexPlanRequirement(provider, options?.modelId);
@@ -6378,6 +6383,7 @@ export class AuthStorage {
 			return undefined;
 		} finally {
 			const finishId = this.#getStoredCredentials(provider)[selection.index]?.id;
+			const finishId = credentialId;
 			const finishScope = blockScope ?? "";
 			if (!keepReservation) {
 				if (options?.requestId) {

@@ -86,6 +86,8 @@ const GATEWAY_INVARIANT_PATTERN = /\bgateway_terminal\b|\binternal invariant\b/i
 export function classifyGatewayError(err: unknown): GatewayErrorClassification {
 	const message = err instanceof Error ? err.message : String(err);
 
+	// Structural AbortError stays first. Free-text "aborted" must not beat an
+	// authoritative provider status (e.g. "HTTP 503: upstream request aborted").
 	if (err instanceof Error && err.name === "AbortError") {
 		return withOwnerDisposition(err, { status: 499, type: "request_aborted", message });
 	}
@@ -182,6 +184,11 @@ function classifyOwnerDisposition(
 	if (status === 499 || (err instanceof Error && err.name === "AbortError")) {
 		return { owner: "cancelled", disposition: "cancelled" };
 	}
+	// Free-text "aborted" only cancels when there is no authoritative provider
+	// status. A 503 body that mentions "aborted" must stay provider-failoverable.
+	if (status <= 0 && /\baborted\b|\babort signal\b/i.test(message)) {
+		return { owner: "cancelled", disposition: "cancelled" };
+	}
 
 	// Internal invariant — never a retryable provider failure. Require structural
 	// evidence (`owner` / error name): provider 5xx bodies that happen to contain
@@ -258,6 +265,11 @@ function classifyOwnerDisposition(
 
 	// Policy denials must win over the generic 401/403 → credential_transient
 	// auth bucket (including structured `{ code: "cyber_policy" }`).
+	if (hasPolicySignal(err, message) && (status === 0 || status < 500)) {
+		return { owner: "policy", disposition: "policy_terminal" };
+	}
+
+	// Policy denials must win over the generic 401/403 auth bucket.
 	if (hasPolicySignal(err, message) && (status === 0 || status < 500)) {
 		return { owner: "policy", disposition: "policy_terminal" };
 	}

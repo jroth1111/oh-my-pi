@@ -16,6 +16,7 @@
  *   GET  /v1/routes                        → list registered virtual routes
  *   GET  /v1/routes/:id                    → one registered virtual route
  *   PUT  /v1/routes/:id                    → register or replace a virtual route
+ *   DELETE /v1/routes/:id                    → unregister a virtual route
  *   POST /v1/chat/completions              → OpenAI chat-completions in/out
  *   POST /v1/messages                      → Anthropic messages in/out
  *   POST /v1/responses                     → OpenAI Responses in/out
@@ -710,6 +711,50 @@ export function releaseProbeOnStreamEnd(
 	});
 }
 
+
+function payloadContainsOpenAIFileId(value: unknown): boolean {
+	if (value === null || value === undefined) return false;
+	if (typeof value === "string") return false;
+	if (Array.isArray(value)) return value.some(payloadContainsOpenAIFileId);
+	if (typeof value === "object") {
+		const record = value as Record<string, unknown>;
+		if (typeof record.file_id === "string" && record.file_id.length > 0) return true;
+		return Object.values(record).some(payloadContainsOpenAIFileId);
+	}
+	return false;
+}
+
+function targetRejectsOpenAIImageFileReferences(
+	routeLabel: string,
+	model: Model<Api>,
+	messages: Context["messages"],
+	options?: { providerPayload?: unknown },
+): boolean {
+	if (routeLabel !== "openai-responses") return false;
+	const supports =
+		model.api === "openai-responses" ||
+		model.api === "azure-openai-responses" ||
+		model.api === "openai-codex-responses";
+	if (supports) return false;
+	if (options?.providerPayload !== undefined && payloadContainsOpenAIFileId(options.providerPayload)) {
+		return true;
+	}
+	return messages.some(message => {
+		if (
+			message.role === "toolResult" &&
+			message.content.some(
+				block => block.type === "image" && block.providerFile?.provider === "openai" && block.providerFile.id,
+			)
+		) {
+			return true;
+		}
+		if ("providerPayload" in message && payloadContainsOpenAIFileId(message.providerPayload)) {
+			return true;
+		}
+		return false;
+	});
+}
+
 async function handleFormatEndpoint(
 	route: { module: FormatModule; label: string },
 	bootOpts: AuthGatewayBootOptions,
@@ -845,10 +890,11 @@ function targetRejectsOpenAIImageFileReferences(
 				),
 		)
 	) {
+	if (targetRejectsOpenAIImageFileReferences(route.label, model, parsed.context.messages, parsed.options)) {
 		return route.module.formatError(
 			400,
 			"invalid_request_error",
-			"OpenAI image file IDs in tool outputs require a Responses-compatible upstream model",
+			"OpenAI image file IDs require a Responses-compatible upstream model",
 		);
 	}
 
@@ -1235,6 +1281,7 @@ function targetRejectsOpenAIImageFileReferences(
 			sseStream = observeSseCommit(sseStream, commitGate);
 		}
 		const held = await holdSseUntilCommit(sseStream, commitGate, settled, route.label !== "openai-responses");
+		const held = await holdSseUntilCommit(sseStream, commitGate, settled, false);
 		if (held.type === "failed") {
 			if (held.message && messageHasBillableUsage(held.message)) {
 				const errorMessage =
@@ -1768,6 +1815,8 @@ async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, pe
 		},
 	});
 		const held = await holdSseUntilCommit(sseStream, commitGate, settled, true);
+		sseStream = observeSseCommit(sseStream, commitGate);
+		const held = await holdSseUntilCommit(sseStream, commitGate, settled, false);
 		if (held.type === "failed") {
 			if (held.message && messageHasBillableUsage(held.message)) {
 				const errorMessage =
@@ -1926,6 +1975,13 @@ async function handleRoutePut(registry: RouteRegistry, id: string, req: Request)
 	return handleRouteGet(registry, id);
 }
 
+function handleRouteDelete(registry: RouteRegistry, id: string): Response {
+	if (!registry.unregister(id)) {
+		return json(404, { error: `Unknown route: ${id}` });
+	}
+	return new Response(null, { status: 204 });
+}
+
 export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServerHandle {
 	const registry = opts.routeRegistry ?? new RouteRegistry(opts.resolveModel);
 	for (const def of opts.routes ?? []) registry.register(def);
@@ -2008,6 +2064,13 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 						return withCors(json(404, { error: `No route: PUT ${pathname}` }), req);
 					}
 					return withCors(await handleRoutePut(registry, id, req), req);
+				}
+				if (req.method === "DELETE" && pathname.startsWith("/v1/routes/")) {
+					const id = pathname.slice("/v1/routes/".length);
+					if (id.length === 0) {
+						return withCors(json(404, { error: `No route: DELETE ${pathname}` }), req);
+					}
+					return withCors(handleRouteDelete(registry, id), req);
 				}
 
 				// Route-table miss: no format module to defer to, so we emit a
