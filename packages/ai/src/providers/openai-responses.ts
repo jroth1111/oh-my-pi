@@ -1233,13 +1233,14 @@ export function buildParams(
 		const format = responseFormat as {
 			type?: string;
 			json_schema?: { name?: string; description?: string; schema?: unknown; strict?: boolean };
+			json_schema?: { name?: string; schema?: unknown; strict?: boolean; description?: string };
 		};
 		if (
 			format.type === "json_schema" &&
 			format.json_schema &&
 			(format.json_schema.name !== undefined || format.json_schema.schema !== undefined)
 		) {
-			// Chat Completions nests `{ name, schema, strict }` under `json_schema`;
+			// Chat Completions nests `{ name, schema, strict, description }` under `json_schema`;
 			// Responses `text.format` requires those fields flat at the top level.
 			params.text = {
 				...params.text,
@@ -1251,6 +1252,9 @@ export function buildParams(
 						? { description: format.json_schema.description }
 						: {}),
 					...(format.json_schema.strict !== undefined ? { strict: format.json_schema.strict } : {}),
+					...(format.json_schema.description !== undefined
+						? { description: format.json_schema.description }
+						: {}),
 				} as never,
 			};
 		} else {

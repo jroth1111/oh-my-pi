@@ -458,6 +458,7 @@ export function releaseProbeOnStreamEnd(
 		// Settle only on positive completion evidence (committed output or a
 		// successful terminal). Never settle a still-probing gate after pre-SSE
 		// failure — format encoders turn errors into frames + normal close.
+		// successful terminal). Never settle failed terminals as probe successes.
 		if (
 			settleProbe &&
 			commitGate !== undefined &&
@@ -531,6 +532,7 @@ async function handleFormatEndpoint(
 	}
 	const firstTarget = compiled.targets[0];
 	if (!firstTarget) {
+	if (firstTarget === undefined) {
 		return route.module.formatError(404, "invalid_request_error", `Unknown model: ${modelId}`);
 	}
 	const model = bootOpts.resolveModel(firstTarget);
@@ -579,6 +581,14 @@ async function handleFormatEndpoint(
 		}
 	}
 	if (controller.signal.aborted) return clientClosedResponse(route);
+
+	if (model.api === "openai-codex-responses" && parsed.options.previousResponseId !== undefined) {
+		return route.module.formatError(
+			400,
+			"invalid_request_error",
+			"previous_response_id is not supported for openai-codex-responses over the gateway",
+		);
+	}
 
 	const supportsOpenAIImageFileReferences =
 		model.api === "openai-responses" ||
@@ -780,6 +790,8 @@ async function handleFormatEndpoint(
 	void settled.then(message => recordGatewayUsage(bootOpts.storage, model, client, message)).catch(() => {});
 	// Non-Responses formats may never feed onSseEvent; mirror pi-native and mark the
 	// commit gate from the canonical assistant result before EOF can settle a probe.
+	// Non-Responses formats may never feed onSseEvent; mark the commit gate from the
+	// canonical assistant result before EOF can settle a probe.
 	void settled
 		.then(message => {
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
@@ -866,6 +878,7 @@ async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, pe
 	}
 	const firstTarget = compiled.targets[0];
 	if (!firstTarget) {
+	if (firstTarget === undefined) {
 		return piNative.formatError(404, "invalid_request_error", `Unknown model: ${parsed.modelId}`);
 	}
 	const model = bootOpts.resolveModel(firstTarget);

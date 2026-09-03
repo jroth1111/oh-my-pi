@@ -13,6 +13,7 @@ afterEach(() => {
 
 describe("auth-gateway RouteRegistry wiring", () => {
 	it("dispatches a registered virtual route to its compiled entry target", async () => {
+	it("dispatches a registered virtual route to its compiled target", async () => {
 		registerMockApi();
 		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gw-route-wire-"));
 		const storage = await AuthStorage.create(path.join(dir, "auth.db"));
@@ -26,12 +27,18 @@ describe("auth-gateway RouteRegistry wiring", () => {
 		registry.register({
 			id: "virtual/route-wire",
 			root: { type: "target", model: "mock/route-wire-target" },
+		const concrete = createMockModel({ provider: "openrouter", id: "concrete/route-wire" });
+		concrete.push({ content: ["ok"] });
+		const resolveModel = (id: string) => (id === "concrete/route-wire" ? concrete.model : undefined);
+		const registry = new RouteRegistry(resolveModel);
+			root: { type: "target", model: "concrete/route-wire" },
 		});
 		const handle = startAuthGateway({
 			bind: "127.0.0.1:0",
 			bearerTokens: ["t"],
 			storage,
 			resolveModel: id => (id === "mock/route-wire-target" ? mock.model : undefined),
+			resolveModel,
 			routeRegistry: registry,
 			version: "test",
 		});
@@ -51,6 +58,9 @@ describe("auth-gateway RouteRegistry wiring", () => {
 			};
 			expect(body.choices?.[0]?.message?.content).toContain("from-virtual-route");
 			expect(mock.calls.length).toBe(1);
+			expect(concrete.calls.length).toBe(1);
+			const body = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
+			expect(body.choices?.[0]?.message?.content).toBe("ok");
 		} finally {
 			await handle.close();
 			storage.close();
@@ -58,15 +68,18 @@ describe("auth-gateway RouteRegistry wiring", () => {
 		}
 	});
 
-	it("does not resolve when the model field is missing (negative)", async () => {
+	it("404s when the virtual route id is not registered (negative)", async () => {
 		registerMockApi();
 		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gw-route-wire-miss-"));
 		const storage = await AuthStorage.create(path.join(dir, "auth.db"));
+		const resolveModel = () => undefined;
+		const registry = new RouteRegistry(resolveModel);
 		const handle = startAuthGateway({
 			bind: "127.0.0.1:0",
 			bearerTokens: ["t"],
 			storage,
-			resolveModel: () => undefined,
+			resolveModel,
+			routeRegistry: registry,
 			version: "test",
 		});
 		try {
@@ -74,10 +87,12 @@ describe("auth-gateway RouteRegistry wiring", () => {
 				method: "POST",
 				headers: { "Content-Type": "application/json", Authorization: "Bearer t" },
 				body: JSON.stringify({
+					model: "virtual/missing",
 					messages: [{ role: "user", content: "hi" }],
 				}),
 			});
 			expect(res.status).toBe(400);
+			expect(res.status).toBe(404);
 		} finally {
 			await handle.close();
 			storage.close();
