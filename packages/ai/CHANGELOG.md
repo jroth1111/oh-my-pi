@@ -63,6 +63,17 @@
 - Fixed releasing turn reservations on post-getApiKey aborts, settling foreign-format probing successes, and gating pi-native probe settlement on stream stopReason.
 - Fixed quota-probe settlement ignoring failed terminals, and reacquiring turn reservations after prepare/broker identity bumps.
 - Fixed OpenAI Responses strict-tool retries reapplying explicit `store` / continuation requirements, and forwarded successful terminal-only Responses SSE preambles.
+### Fixed
+
+- Release failed/cancelled streams without awaiting pending settlement so turn and probe locks cannot stall.
+- Parse Responses text.format and store into gateway options, and reapply store on strict-tool retries.
+- Settle quota probes only after canonical success evidence, and release API-key turn reservations when credential helpers fail.
+- Reserve stored API-key selections for turn exclusivity, run no-status message heuristics before default provider failure, and assert virtual-route dispatch behavior.
+- Fixed virtual route dispatch resolving `compiled.targets[0]`, and reacquiring turn reservations after broker prepare/incarnation bump.
+
+- Fixed suffix fallback edges, rejected ambiguous cross-branch target reuse, distinguished failed terminals for probe settlement, and released reservations on abort.
+- Fixed nested route-graph fallback edges retaining their entry target via `fallbackByTarget` so unentered branches cannot steal failover.
+- Fixed caller-owned Responses continuations forcing `store: true`, and settled successful pi-native streaming probes without a commit gate.
 
 ### Added
 

@@ -217,6 +217,9 @@ export function holdSseUntilCommit(
 							committed = true;
 							for (const held of gate.takePrelude() ?? []) controller.enqueue(held);
 							if (!buffered) controller.enqueue(chunk);
+						const kind = classifyCommitEvent(eventType);
+						if (kind === "terminal-success") {
+							// Empty/metadata-only successful completions still need held frames flushed.
 							return;
 						}
 						// Dead attempt: its held frames belong to it and are never

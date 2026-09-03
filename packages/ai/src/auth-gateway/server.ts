@@ -452,6 +452,9 @@ export function releaseProbeOnStreamEnd(
 		// Wait for the canonical assistant result so probing/committed gates reflect
 		// error/abort outcomes before EOF can settle a quota probe.
 		if (settled) await settled.catch(() => {});
+		// Only successful EOF settlement needs the canonical result. Failed/cancelled
+		// releases must not await a pending events.result() or turn/probe locks stall.
+		if (settleProbe && settled) await settled.catch(() => {});
 		// Settle only on positive completion evidence (committed output or a
 		// successful terminal). Never settle a still-probing gate after pre-SSE
 		// failure — format encoders turn errors into frames + normal close.
@@ -485,6 +488,7 @@ export function releaseProbeOnStreamEnd(
 			// Cancel upstream first so the encoder's onCancel can settle events.result()
 			// before we await settlement — otherwise release holds the turn reservation
 			// while the model finishes after the client already disconnected.
+			// before we await settlement.
 			await reader.cancel(reason).catch(() => {});
 			await release(false);
 		},
@@ -525,9 +529,13 @@ async function handleFormatEndpoint(
 	if (!compiled) {
 		return route.module.formatError(404, "invalid_request_error", `Unknown model: ${modelId}`);
 	}
-	const model = bootOpts.resolveModel(modelId);
-	if (!model) {
+	const firstTarget = compiled.targets[0];
+	if (!firstTarget) {
 		return route.module.formatError(404, "invalid_request_error", `Unknown model: ${modelId}`);
+	}
+	const model = bootOpts.resolveModel(firstTarget);
+	if (!model) {
+		return route.module.formatError(404, "invalid_request_error", `Unknown model: ${firstTarget}`);
 	}
 	const client = resolveClientIdentity(req.headers);
 
@@ -636,12 +644,13 @@ async function handleFormatEndpoint(
 		bootOpts.storage.releaseTurnReservation(requestId);
 		return clientClosedResponse(route);
 	}
+	const traces = bootOpts.decisionTraces ?? new RouteDecisionTraceLog();
 	if (!apiKey) {
 		const skipped = traces.record({
 			requestId,
 			routeId: compiled.id,
 			generation: compiled.generation,
-			selectedTarget: compiled.root.model,
+			selectedTarget: compiled.targets[0] ?? compiled.id,
 			disposition: "skipped",
 			reason: "credential_unavailable",
 		});
@@ -660,7 +669,7 @@ async function handleFormatEndpoint(
 		requestId,
 		routeId: compiled.id,
 		generation: compiled.generation,
-		selectedTarget: compiled.root.model,
+		selectedTarget: compiled.targets[0] ?? compiled.id,
 		disposition: "dispatched",
 	});
 	logger.debug("auth-gateway route decision", redactedDecisionSummary(dispatched));
@@ -796,6 +805,7 @@ async function handleFormatEndpoint(
 		sseStream = observeSseCommit(sseStream, commitGate);
 	}
 	sseStream = releaseProbeOnStreamEnd(sseStream, bootOpts.storage, requestId, commitGate, settled);
+	sseStream = releaseTurnOnStreamEnd(sseStream, bootOpts.storage, requestId, commitGate, settled);
 	return new Response(sseStream, {
 		status: 200,
 		headers: {
@@ -854,9 +864,13 @@ async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, pe
 	if (!compiled) {
 		return piNative.formatError(404, "invalid_request_error", `Unknown model: ${parsed.modelId}`);
 	}
-	const model = bootOpts.resolveModel(parsed.modelId);
-	if (!model) {
+	const firstTarget = compiled.targets[0];
+	if (!firstTarget) {
 		return piNative.formatError(404, "invalid_request_error", `Unknown model: ${parsed.modelId}`);
+	}
+	const model = bootOpts.resolveModel(firstTarget);
+	if (!model) {
+		return piNative.formatError(404, "invalid_request_error", `Unknown model: ${firstTarget}`);
 	}
 	const client = resolveClientIdentity(req.headers);
 	// Pi-native already parsed `streamOpts.sessionId` (when set by the
@@ -898,12 +912,13 @@ async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, pe
 		bootOpts.storage.releaseTurnReservation(requestId);
 		return aborted();
 	}
+	const traces = bootOpts.decisionTraces ?? new RouteDecisionTraceLog();
 	if (!apiKey) {
 		const skipped = traces.record({
 			requestId,
 			routeId: compiled.id,
 			generation: compiled.generation,
-			selectedTarget: compiled.root.model,
+			selectedTarget: compiled.targets[0] ?? compiled.id,
 			disposition: "skipped",
 			reason: "credential_unavailable",
 		});
@@ -922,7 +937,7 @@ async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, pe
 		requestId,
 		routeId: compiled.id,
 		generation: compiled.generation,
-		selectedTarget: compiled.root.model,
+		selectedTarget: compiled.targets[0] ?? compiled.id,
 		disposition: "dispatched",
 	});
 	logger.debug("auth-gateway route decision", redactedDecisionSummary(dispatched));
@@ -1048,6 +1063,7 @@ async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, pe
 			piCommitGate.classifyAndObserve("response.failed", 1);
 		});
 	sseStream = releaseProbeOnStreamEnd(sseStream, bootOpts.storage, requestId, piCommitGate, settled);
+	sseStream = releaseTurnOnStreamEnd(sseStream, bootOpts.storage, requestId, piCommitGate, settled);
 	return new Response(sseStream, {
 		status: 200,
 		headers: {

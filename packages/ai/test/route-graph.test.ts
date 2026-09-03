@@ -26,11 +26,12 @@ describe("RouteRegistry", () => {
 	it("wraps a known id as a single TargetNode", () => {
 		const registry = new RouteRegistry(id => (id === "gpt-5" ? fakeModel("gpt-5") : undefined));
 		const route = registry.resolve("gpt-5");
-		expect(route).toEqual({
-			generation: 1,
-			id: "gpt-5",
-			root: { type: "target", model: "gpt-5" },
-		});
+		expect(route?.generation).toBe(1);
+		expect(route?.id).toBe("gpt-5");
+		expect(route?.root).toEqual({ type: "target", model: "gpt-5" });
+		expect(route?.targets).toEqual(["gpt-5"]);
+		expect(route?.fallbacks).toEqual({});
+		expect(route?.fallbackByTarget).toEqual({});
 	});
 
 	it("keeps generation stable across resolves", () => {
@@ -40,6 +41,206 @@ describe("RouteRegistry", () => {
 		expect(first?.generation).toBe(1);
 		expect(second?.generation).toBe(1);
 		expect(first?.generation).toBe(second?.generation);
+		expect(registry.generation).toBe(1);
+	});
+
+	it("compiles suffix edges from each fallback sibling", () => {
+		const registry = new RouteRegistry(() => undefined);
+		registry.register({
+			id: "abc",
+			root: {
+				type: "fallback",
+				on: ["provider_unavailable"],
+				children: [
+					{ type: "target", model: "A" },
+					{ type: "target", model: "B" },
+					{ type: "target", model: "C" },
+				],
+			},
+		});
+		const route = registry.resolve("abc");
+		expect(route?.fallbackByTarget?.A?.provider_unavailable).toEqual(["B", "C"]);
+		expect(route?.fallbackByTarget?.B?.provider_unavailable).toEqual(["C"]);
+		expect(route?.fallbackByTarget?.C?.provider_unavailable).toBeUndefined();
+	});
+
+	it("register compiles a quota fallback list", () => {
+		const registry = new RouteRegistry(id => (id === "gpt-5" || id === "gpt-4o" ? fakeModel(id) : undefined));
+		registry.register({
+			id: "quota-route",
+			root: {
+				type: "fallback",
+				on: ["credential_quota"],
+				children: [
+					{ type: "target", model: "gpt-5" },
+					{ type: "target", model: "gpt-4o" },
+				],
+			},
+		});
+		const route = registry.resolve("quota-route");
+		expect(registry.generation).toBe(2);
+		expect(route?.generation).toBe(2);
+		expect(route?.id).toBe("quota-route");
+		expect(route?.targets).toEqual(["gpt-5", "gpt-4o"]);
+		expect(route?.fallbacks).toEqual({ credential_quota: ["gpt-4o"] });
+		expect(route?.fallbackByTarget).toEqual({ "gpt-5": { credential_quota: ["gpt-4o"] } });
+	});
+
+	it("rejects a cycle on one root-to-leaf path", () => {
+		const registry = new RouteRegistry(() => undefined);
+		expect(() =>
+			registry.register({
+				id: "cyclic",
+				root: {
+					type: "fallback",
+					on: ["provider_transient"],
+					children: [
+						{ type: "target", model: "a" },
+						{ type: "target", model: "b" },
+						{ type: "target", model: "a" },
+					],
+				},
+			}),
+		).toThrow(/cycle/i);
+		expect(registry.generation).toBe(1);
+		expect(registry.resolve("cyclic")).toBeUndefined();
+	});
+
+	it("rejects ambiguous cross-branch reuse of the same model id", () => {
+		const registry = new RouteRegistry(() => undefined);
+		expect(() =>
+			registry.register({
+				id: "sibling-reuse",
+				root: {
+					type: "fallback",
+					on: ["credential_quota"],
+					children: [
+						{ type: "target", model: "a" },
+						{
+							type: "fallback",
+							on: ["context_overflow"],
+							children: [
+								{ type: "target", model: "a" },
+								{ type: "target", model: "b" },
+							],
+						},
+					],
+				},
+			}),
+		).toThrow(/ambiguous cross-branch reuse/i);
+		expect(registry.generation).toBe(1);
+	});
+
+	it("rejects a nested path that repeats a target model id", () => {
+		const registry = new RouteRegistry(() => undefined);
+		expect(() =>
+			registry.register({
+				id: "nested-cycle",
+				root: {
+					type: "fallback",
+					on: ["provider_transient"],
+					children: [
+						{ type: "target", model: "a" },
+						{
+							type: "fallback",
+							on: ["context_overflow"],
+							children: [{ type: "target", model: "b" }],
+						},
+						{ type: "target", model: "a" },
+					],
+				},
+			}),
+		).toThrow(/cycle/i);
+		expect(registry.generation).toBe(1);
+		expect(registry.resolve("nested-cycle")).toBeUndefined();
+	});
+
+	it("rejects empty fallback children", () => {
+		const registry = new RouteRegistry(() => undefined);
+		expect(() =>
+			registry.register({
+				id: "empty-fallback",
+				root: {
+					type: "fallback",
+					on: ["credential_quota"],
+					children: [],
+				},
+			}),
+		).toThrow(/empty/i);
+		expect(registry.generation).toBe(1);
+	});
+
+	it("resolves an unregistered concrete model as a single target after register", () => {
+		const registry = new RouteRegistry(id => (id === "gpt-5" ? fakeModel("gpt-5") : undefined));
+		registry.register({
+			id: "virtual",
+			root: { type: "target", model: "other" },
+		});
+		const route = registry.resolve("gpt-5");
+		expect(route?.fallbackByTarget).toEqual({});
+		expect(route?.targets).toEqual(["gpt-5"]);
+		expect(route?.fallbacks).toEqual({});
+	});
+
+	it("does not leak quota targets into context_overflow fallbacks", () => {
+		const registry = new RouteRegistry(() => undefined);
+		registry.register({
+			id: "isolated",
+			root: {
+				type: "fallback",
+				on: ["credential_quota"],
+				children: [
+					{
+						type: "fallback",
+						on: ["context_overflow"],
+						children: [
+							{ type: "target", model: "primary" },
+							{ type: "target", model: "overflow-backup" },
+						],
+					},
+					{ type: "target", model: "quota-backup" },
+				],
+			},
+		});
+		const route = registry.resolve("isolated");
+		expect(route?.targets).toEqual(["primary", "overflow-backup", "quota-backup"]);
+		expect(route?.fallbacks.credential_quota).toEqual(["quota-backup"]);
+		expect(route?.fallbacks.context_overflow).toEqual(["overflow-backup"]);
+		expect(route?.fallbacks.context_overflow ?? []).not.toContain("quota-backup");
+	});
+
+	it("scopes nested sibling fallbacks per source target", () => {
+		const registry = new RouteRegistry(() => undefined);
+		registry.register({
+			id: "nested-siblings",
+			root: {
+				type: "fallback",
+				on: ["provider_unavailable"],
+				children: [
+					{
+						type: "fallback",
+						on: ["context_overflow"],
+						children: [
+							{ type: "target", model: "A" },
+							{ type: "target", model: "B" },
+						],
+					},
+					{
+						type: "fallback",
+						on: ["context_overflow"],
+						children: [
+							{ type: "target", model: "C" },
+							{ type: "target", model: "D" },
+						],
+					},
+				],
+			},
+		});
+		const route = registry.resolve("nested-siblings");
+		expect(route?.fallbacks.provider_unavailable).toEqual(["C"]);
+		expect(route?.fallbackByTarget?.A?.context_overflow).toEqual(["B"]);
+		expect(route?.fallbackByTarget?.C?.context_overflow).toEqual(["D"]);
+		expect(route?.fallbackByTarget?.A?.context_overflow ?? []).not.toContain("D");
 	});
 
 	it("preserves provider-qualified model ids as the compiled target", () => {

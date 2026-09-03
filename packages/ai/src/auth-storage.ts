@@ -2427,6 +2427,11 @@ export class AuthStorage {
 			});
 
 		if (credentials.length === 0) return undefined;
+		if (credentials.length === 1) {
+			const only = credentials[0]!;
+			return this.#tryReserveApiKeySelection(provider, only, options?.requestId) ? only : undefined;
+		}
+
 		const providerKey = this.#getProviderTypeKey(provider, "api_key");
 		const strategy = this.#rankingStrategyResolver?.(provider);
 		const rankingContext: CredentialRankingContext = { modelId: options?.modelId };
@@ -2473,6 +2478,11 @@ export class AuthStorage {
 				if (probed) return probed;
 			}
 			return fallback ? tryVendApiKeySelection(fallback, true) : undefined;
+		const strategy = this.#rankingStrategyResolver?.(provider);
+				const candidate = credentials[idx];
+				if (!this.#isCredentialBlocked(provider, providerKey, candidate.index, undefined, options?.requestId)) {
+					if (this.#tryReserveApiKeySelection(provider, candidate, options?.requestId)) return candidate;
+			return undefined;
 		}
 
 		const candidates = await this.#rankApiKeySelections({
@@ -2495,6 +2505,10 @@ export class AuthStorage {
 			if (probed) return probed;
 		}
 		return fallback ? tryVendApiKeySelection(fallback, true) : undefined;
+		for (const ranked of candidates) {
+			if (this.#tryReserveApiKeySelection(provider, ranked.selection, options?.requestId)) {
+				return ranked.selection;
+		return undefined;
 	}
 
 	/** Resolve a reserved API-key selection; release the turn hold if the helper yields no secret. */
@@ -5983,6 +5997,7 @@ export class AuthStorage {
 				blockScopes,
 				options?.requestId,
 			);
+			const probeScope = blockScope ?? "";
 			if (!allowBlocked) {
 				// A live block must never hijack rotation: while any same-type sibling
 				// is still usable, fall through so the caller rotates to it. Probing a
@@ -6021,6 +6036,21 @@ export class AuthStorage {
 				if (!this.#acquireOrReuseQuotaProbeLease(options.requestId, blockedId, probeScope)) {
 					return undefined;
 				}
+				const lease = this.tryAcquireQuotaProbeLease(blockedId, probeScope);
+				if (!lease) return undefined;
+				this.#inflightProbes.set(options.requestId, {
+					credentialId: blockedId,
+					blockScope: probeScope,
+					leaseId: lease,
+				});
+			} else if (this.#probeLeases.isRetryAfterSourced(blockedId, probeScope)) {
+				const lease = this.tryAcquireQuotaProbeLease(blockedId, probeScope);
+				if (!lease) return undefined;
+				this.#inflightProbes.set(options.requestId, {
+					credentialId: blockedId,
+					blockScope: probeScope,
+					leaseId: lease,
+				});
 			}
 		}
 		if (options?.requestId) {
