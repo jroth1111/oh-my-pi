@@ -149,6 +149,9 @@ export function classifyGatewayError(err: unknown): GatewayErrorClassification {
 		return withOwnerDisposition(err, { status: 400, type: "invalid_request_error", message });
 	if (MODEL_UNAVAILABLE_PATTERN.test(message)) {
 		return withOwnerDisposition(err, { status: 404, type: "invalid_request_error", message });
+	}
+	}
+	}
 	return withOwnerDisposition(err, { status: 502, type: "upstream_error", message });
 }
 
@@ -255,6 +258,11 @@ function classifyOwnerDisposition(
 
 	// Policy denials must win over the generic 401/403 → credential_transient
 	// auth bucket (including structured `{ code: "cyber_policy" }`).
+	if (hasPolicySignal(err, message) && (status === 0 || status < 500)) {
+		return { owner: "policy", disposition: "policy_terminal" };
+	}
+
+	// Policy denials must win over the generic 401/403 auth bucket.
 	if (hasPolicySignal(err, message) && (status === 0 || status < 500)) {
 		return { owner: "policy", disposition: "policy_terminal" };
 	}

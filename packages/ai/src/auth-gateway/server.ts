@@ -821,6 +821,8 @@ function targetRejectsOpenAIImageFileReferences(
 			message.content.some(
 				block => block.type === "image" && block.providerFile?.provider === "openai" && block.providerFile.id,
 			),
+	);
+}
 
 
 	const supportsOpenAIImageFileReferences =
@@ -1226,6 +1228,7 @@ function targetRejectsOpenAIImageFileReferences(
 			},
 		if (route.label === "openai-responses") {
 			sseStream = observeSseCommit(sseStream, commitGate);
+		}
 		const held = await holdSseUntilCommit(sseStream, commitGate, settled, route.label !== "openai-responses");
 		if (held.type === "failed") {
 			if (held.message && messageHasBillableUsage(held.message)) {
