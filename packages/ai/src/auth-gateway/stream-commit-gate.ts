@@ -220,6 +220,7 @@ export function holdSseUntilCommit(
 						const kind = classifyCommitEvent(eventType);
 						if (kind === "terminal-success") {
 							// Empty/metadata-only successful completions still need held frames flushed.
+							// Empty/metadata-only successful completions still need their held frames flushed.
 							return;
 						}
 						// Dead attempt: its held frames belong to it and are never

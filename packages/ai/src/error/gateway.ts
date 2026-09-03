@@ -65,6 +65,7 @@ const TIMEOUT_OR_CONNECTION_PATTERN =
 const POLICY_PATTERN = /\bcyber_policy\b|trusted access for cyber/i;
 const MODEL_UNAVAILABLE_PATTERN = /\bmodel[_ ]?(?:not[_ ]found|unavailable|not[_ ]supported)\b|\bmodel does not exist\b|\byou do not have access to (?:it|the model)\b/i;
 const MODEL_UNAVAILABLE_PATTERN = /\bmodel[_ ]?(?:not[_ ]found|unavailable|not[_ ]supported)\b|\bmodel\b[^\n]{0,80}\b(?:does not exist|do not have access)\b/i;
+const MODEL_UNAVAILABLE_PATTERN = /\bmodel[_ ]?(?:not[_ ]found|unavailable|not[_ ]supported)\b|\b(?:the\s+)?(?:requested\s+)?model\s+does\s+not\s+exist\b|\bmodel\s+is\s+not\s+supported\b/i;
 const INVALID_REQUEST_PATTERN =
 	/\b(?:unsupported|invalid_request|invalid request|bad request|malformed|GenerateContentRequest)\b/i;
 const GATEWAY_INVARIANT_PATTERN = /\bgateway_terminal\b|\binternal invariant\b/i;
@@ -140,6 +141,15 @@ export function classifyGatewayError(err: unknown): GatewayErrorClassification {
 		return { ...unclassified, status: 502 };
 	}
 	return unclassified;
+	// Status-less errors: evaluate policy / overflow / model heuristics before
+	// synthesizing the default 502 so dispositions are not stuck on provider_unavailable.
+	if (hasPolicySignal(err, message)) {
+		return withOwnerDisposition(err, { status: 403, type: "authentication_error", message });
+	if (matchesOverflowText(message)) {
+		return withOwnerDisposition(err, { status: 400, type: "invalid_request_error", message });
+	if (MODEL_UNAVAILABLE_PATTERN.test(message)) {
+		return withOwnerDisposition(err, { status: 404, type: "invalid_request_error", message });
+	return withOwnerDisposition(err, { status: 502, type: "upstream_error", message });
 }
 
 function bucketStatus(status: number, message: string): { status: number; type: string; message: string } {
@@ -249,6 +259,11 @@ function classifyOwnerDisposition(
 		return { owner: "policy", disposition: "policy_terminal" };
 	}
 
+	// Policy denials must win over the generic 401/403 auth bucket.
+	if (hasPolicySignal(err, message) && (status === 0 || status < 500)) {
+		return { owner: "policy", disposition: "policy_terminal" };
+	}
+
 	if (status === 401 || status === 403 || type === "authentication_error") {
 		if (isClinePassSurfaceGateMessage(message)) {
 			return { owner: "policy", disposition: "policy_terminal" };
@@ -278,6 +293,10 @@ function classifyOwnerDisposition(
 
 	if (status === 408) {
 		return { owner: "provider", disposition: "provider_transient" };
+	}
+
+	if ((status === 400 || type === "invalid_request_error") && MODEL_UNAVAILABLE_PATTERN.test(message)) {
+		return { owner: "model", disposition: "model_unavailable" };
 	}
 
 	if (status === 400 || type === "invalid_request_error") {
@@ -357,6 +376,16 @@ function hasPolicySignal(err: unknown, message: string): boolean {
  * Pull a status code from common error-message shapes. Returns undefined when
  * no contextual keyword is present, so we never guess at incidental numbers.
  */
+
+/** True when message text or a structured `code` property signals account policy. */
+function hasPolicySignal(err: unknown, message: string): boolean {
+	if (POLICY_PATTERN.test(message)) return true;
+	if (typeof err === "object" && err !== null && "code" in err && typeof err.code === "string") {
+		return POLICY_PATTERN.test(err.code);
+	}
+	return false;
+}
+
 function extractEmbeddedStatus(message: string): number | undefined {
 	// `Google API error (400)`, `OpenAI API error (429): …`, `(503)`
 	// `HTTP 429: too many requests`
