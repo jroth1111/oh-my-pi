@@ -264,6 +264,16 @@ export const AXES: Readonly<Record<string, AxisDef>> = {
 	"input-modalities": { key: "inputModalities", set: "catalog", shape: "array", values: ["text", "image"] },
 	"limits-patch": { key: "limitsPatch", set: "catalog", shape: "object" },
 	"long-context-cost": { key: "longContext", set: "catalog", shape: "object" },
+	/**
+	 * Generator must not clear/re-derive thinking (AvailableModels / seed-owned
+	 * ladders). Consumed by `rebakeModelThinking`.
+	 */
+	"preserve-authored-thinking": { key: "preserveAuthoredThinking", set: "catalog", shape: "scalar" },
+	/**
+	 * Credential-scoped catalogs (live discovery authoritative): generation must
+	 * not enrich limits from canonical-family or stencil.so same-id references.
+	 */
+	"credential-scoped-catalog": { key: "credentialScopedCatalog", set: "catalog", shape: "scalar" },
 	"long-usage-limit-fallback": { key: "longUsageLimitFallback", set: "catalog", shape: "scalar" },
 	"requires-cursor-tool-schema-projection": {
 		key: "requiresCursorToolSchemaProjection",
@@ -271,6 +281,17 @@ export const AXES: Readonly<Record<string, AxisDef>> = {
 		shape: "scalar",
 	},
 	priority: { key: "priority", set: "catalog", shape: "scalar" },
+	/**
+	 * Offline Sand wire-parameter allowlist (e.g. `effort`/`fast`). Applied only
+	 * when the model has not already declared `sandParameterIds` (live discovery
+	 * wins). Empty lists are unsupported — omit the property for bare routing.
+	 */
+	"sand-parameter-ids": { key: "sandParameterIds", set: "catalog", shape: "array" },
+	/**
+	 * Reviewed native tool-calling support. Applied as a correction so live
+	 * discovery can leave the field unset and KDL can force false (e.g. grok-4.5).
+	 */
+	"supports-tools": { key: "supportsTools", set: "catalog", shape: "scalar" },
 	"service-tier-cost": { key: "serviceTierCost", set: "catalog", shape: "object" },
 };
 

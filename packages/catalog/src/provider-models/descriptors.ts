@@ -67,6 +67,7 @@ import {
 	cursorModelManagerOptions,
 	devinModelManagerOptions,
 	gitLabDuoWorkflowModelManagerOptions,
+	grokbotModelManagerOptions,
 	zaiModelManagerOptions,
 } from "./special";
 
@@ -253,6 +254,17 @@ export const CATALOG_PROVIDERS = [
 		defaultModel: "gemini-3.1-pro-preview",
 		createModelManagerOptions: (config: ModelManagerConfig) => googleVertexModelManagerOptions(config),
 		allowUnauthenticated: true,
+	},
+	{
+		id: "grokbot",
+		defaultModel: "sand-default",
+		envVars: ["GROKBOT_RENEWAL_CREDENTIAL", "SAND_INFERENCE_RENEWAL_CREDENTIAL"],
+		dynamicModelsAuthoritative: true,
+		createModelManagerOptions: (config: ModelManagerConfig) => grokbotModelManagerOptions(config),
+		catalogDiscovery: {
+			label: "Grok Bot (not Cursor, not xAI)",
+			envVars: ["GROKBOT_RENEWAL_CREDENTIAL", "SAND_INFERENCE_RENEWAL_CREDENTIAL"],
+		},
 	},
 	{
 		id: "groq",

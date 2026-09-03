@@ -126,6 +126,7 @@
 		"providers/google-gemini-cli.kdl",
 		"providers/google-vertex.kdl",
 		"providers/google.kdl",
+		"providers/grokbot.kdl",
 		"providers/groq.kdl",
 		"providers/huggingface.kdl",
 		"providers/kilo.kdl",
@@ -8762,6 +8763,90 @@
 						"medium",
 						"high"
 					]
+				}
+			},
+			{
+				"source": "providers/grokbot.kdl:15",
+				"providers": [
+					"grokbot"
+				],
+				"models": [
+					{
+						"kind": "exact",
+						"value": "sand-default"
+					},
+					{
+						"kind": "exact",
+						"value": "sand-cua"
+					},
+					{
+						"kind": "exact",
+						"value": "sand-automation"
+					},
+					{
+						"kind": "exact",
+						"value": "default"
+					},
+					{
+						"kind": "exact",
+						"value": "auto"
+					}
+				],
+				"catalog": {
+					"contextWindowFloor": 200000
+				}
+			},
+			{
+				"source": "providers/grokbot.kdl:20",
+				"providers": [
+					"grokbot"
+				],
+				"models": [
+					{
+						"kind": "glob",
+						"value": "grok-4.6*"
+					}
+				],
+				"thinking": {
+					"mode": "effort",
+					"efforts": [
+						"low",
+						"medium",
+						"high",
+						"xhigh"
+					]
+				},
+				"catalog": {
+					"contextWindowFloor": 200000,
+					"sandParameterIds": [
+						"effort",
+						"fast"
+					]
+				}
+			},
+			{
+				"source": "providers/grokbot.kdl:27",
+				"providers": [
+					"grokbot"
+				],
+				"models": [
+					{
+						"kind": "glob",
+						"value": "grok-4.5*"
+					}
+				],
+				"catalog": {
+					"supportsTools": false
+				}
+			},
+			{
+				"source": "providers/grokbot.kdl:5",
+				"providers": [
+					"grokbot"
+				],
+				"catalog": {
+					"preserveAuthoredThinking": true,
+					"credentialScopedCatalog": true
 				}
 			},
 			{
