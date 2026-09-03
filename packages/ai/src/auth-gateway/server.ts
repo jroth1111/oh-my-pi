@@ -230,6 +230,7 @@ function buildStreamOptions(parsed: ParsedFormatRequest, api: Api, signal: Abort
 export function applyParsedGatewayOptions(opts: SimpleStreamOptions, options: AuthGatewayParsedRequestOptions): void {
 	if (options.parallelToolCalls !== undefined) opts.parallelToolCalls = options.parallelToolCalls;
 	if (options.previousResponseId !== undefined) opts.previousResponseId = options.previousResponseId;
+	if (options.store !== undefined) opts.store = options.store;
 	if (options.seed !== undefined) opts.seed = options.seed;
 	if (options.logitBias !== undefined) opts.logitBias = options.logitBias;
 	if (options.user !== undefined) opts.user = options.user;
@@ -322,7 +323,7 @@ async function refreshGatewayApiKeyAfterAuthError(
 			error: message,
 		});
 		if (switched) {
-			return storage.getApiKey(provider, sessionId, { modelId: model.id, signal });
+			return storage.getApiKey(provider, sessionId, { modelId: model.id, signal, requestId });
 		}
 		// No sibling available — fall through to invalidation so the next
 		// request re-resolves from scratch after the cooldown expires.
@@ -435,7 +436,7 @@ function mirrorRequestAbort(req: Request): AbortController {
 
 // (handlePassthrough removed — see note above.)
 
-/** Wrap an SSE body so quota-probe leases settle on success or release on abandon. */
+/** Wrap an SSE body so quota-probe leases settle on success and turn reservations release on abandon. */
 export function releaseProbeOnStreamEnd(
 	stream: ReadableStream<Uint8Array>,
 	storage: AuthStorage,
@@ -450,8 +451,7 @@ export function releaseProbeOnStreamEnd(
 		released = true;
 		// Wait for the canonical assistant result so probing/committed gates reflect
 		// error/abort outcomes before EOF can settle a quota probe.
-		// Only successful EOF settlement needs the canonical result.
-		if (settleProbe && settled) await settled.catch(() => {});
+		if (settled) await settled.catch(() => {});
 		// Settle only on positive completion evidence (committed output or a
 		// successful terminal). Never settle a still-probing gate after pre-SSE
 		// failure — format encoders turn errors into frames + normal close.
@@ -463,7 +463,7 @@ export function releaseProbeOnStreamEnd(
 		) {
 			storage.settleQuotaProbeSuccess(requestId);
 		}
-		storage.clearQuotaProbe(requestId);
+		storage.releaseTurnReservation(requestId);
 	};
 	return new ReadableStream({
 		async pull(controller) {
@@ -474,6 +474,7 @@ export function releaseProbeOnStreamEnd(
 					controller.close();
 					return;
 				}
+				storage.renewTurnReservation(requestId);
 				controller.enqueue(value);
 			} catch (error) {
 				await release(false);
@@ -481,12 +482,14 @@ export function releaseProbeOnStreamEnd(
 			}
 		},
 		async cancel(reason) {
+			// Cancel upstream first so the encoder's onCancel can settle events.result()
+			// before we await settlement — otherwise release holds the turn reservation
+			// while the model finishes after the client already disconnected.
 			await reader.cancel(reason).catch(() => {});
 			await release(false);
 		},
 	});
 }
-
 
 async function handleFormatEndpoint(
 	route: { module: FormatModule; label: string },
@@ -612,7 +615,7 @@ async function handleFormatEndpoint(
 		});
 	} catch (error) {
 		if (controller.signal.aborted) {
-			bootOpts.storage.clearQuotaProbe(requestId);
+			bootOpts.storage.releaseTurnReservation(requestId);
 			return clientClosedResponse(route);
 		}
 		const classified = classifyGatewayError(error);
@@ -626,15 +629,13 @@ async function handleFormatEndpoint(
 		});
 		logger.debug("auth-gateway route decision", redactedDecisionSummary(skipped));
 		logger.warn("auth-gateway getApiKey threw", { provider: model.provider, peer, error: classified.message });
-		bootOpts.storage.clearQuotaProbe(requestId);
+		bootOpts.storage.releaseTurnReservation(requestId);
 		return route.module.formatError(classified.status, classified.type, classified.message);
 	}
-	if (controller.signal.aborted) return clientClosedResponse(route);
 	if (controller.signal.aborted) {
-		bootOpts.storage.clearQuotaProbe(requestId);
+		bootOpts.storage.releaseTurnReservation(requestId);
 		return clientClosedResponse(route);
 	}
-	const traces = bootOpts.decisionTraces ?? new RouteDecisionTraceLog();
 	if (!apiKey) {
 		const skipped = traces.record({
 			requestId,
@@ -645,7 +646,7 @@ async function handleFormatEndpoint(
 			reason: "credential_unavailable",
 		});
 		logger.debug("auth-gateway route decision", redactedDecisionSummary(skipped));
-		bootOpts.storage.clearQuotaProbe(requestId);
+		bootOpts.storage.releaseTurnReservation(requestId);
 		const coolingDown = bootOpts.storage.hasCoolingDownCredentials(model.provider, model.id);
 		return route.module.formatError(
 			coolingDown ? 429 : 401,
@@ -745,25 +746,25 @@ async function handleFormatEndpoint(
 			});
 			return route.module.formatError(classified.status, classified.type, classified.message);
 		} finally {
-			bootOpts.storage.clearQuotaProbe(requestId);
+			bootOpts.storage.releaseTurnReservation(requestId);
 		}
 	}
 
 	let events: AssistantMessageEventStream;
 	try {
 		if (controller.signal.aborted) {
-			bootOpts.storage.clearQuotaProbe(requestId);
+			bootOpts.storage.releaseTurnReservation(requestId);
 			return clientClosedResponse(route);
 		}
 		events = streamSimple(model, parsed.context, streamOpts);
 	} catch (error) {
-		bootOpts.storage.clearQuotaProbe(requestId);
+		bootOpts.storage.releaseTurnReservation(requestId);
 		const classified = classifyGatewayError(error);
 		logger.warn("auth-gateway streamSimple threw", { format: route.label, error: classified.message, peer });
 		return route.module.formatError(classified.status, classified.type, classified.message);
 	}
 	if (controller.signal.aborted) {
-		bootOpts.storage.clearQuotaProbe(requestId);
+		bootOpts.storage.releaseTurnReservation(requestId);
 		return clientClosedResponse(route);
 	}
 	const settled = events.result();
@@ -876,7 +877,7 @@ async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, pe
 		});
 	} catch (error) {
 		if (controller.signal.aborted) {
-			bootOpts.storage.clearQuotaProbe(requestId);
+			bootOpts.storage.releaseTurnReservation(requestId);
 			return aborted();
 		}
 		const classified = classifyGatewayError(error);
@@ -890,15 +891,13 @@ async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, pe
 		});
 		logger.debug("auth-gateway route decision", redactedDecisionSummary(skipped));
 		logger.warn("auth-gateway getApiKey threw", { provider: model.provider, peer, error: classified.message });
-		bootOpts.storage.clearQuotaProbe(requestId);
+		bootOpts.storage.releaseTurnReservation(requestId);
 		return piNative.formatError(classified.status, classified.type, classified.message);
 	}
-	if (controller.signal.aborted) return aborted();
 	if (controller.signal.aborted) {
-		bootOpts.storage.clearQuotaProbe(requestId);
+		bootOpts.storage.releaseTurnReservation(requestId);
 		return aborted();
 	}
-	const traces = bootOpts.decisionTraces ?? new RouteDecisionTraceLog();
 	if (!apiKey) {
 		const skipped = traces.record({
 			requestId,
@@ -909,7 +908,7 @@ async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, pe
 			reason: "credential_unavailable",
 		});
 		logger.debug("auth-gateway route decision", redactedDecisionSummary(skipped));
-		bootOpts.storage.clearQuotaProbe(requestId);
+		bootOpts.storage.releaseTurnReservation(requestId);
 		const coolingDown = bootOpts.storage.hasCoolingDownCredentials(model.provider, model.id);
 		return piNative.formatError(
 			coolingDown ? 429 : 401,
@@ -1003,25 +1002,25 @@ async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, pe
 			logger.warn("auth-gateway non-streaming aborted", { format: "pi-native", error: classified.message, peer });
 			return piNative.formatError(classified.status, classified.type, classified.message);
 		} finally {
-			bootOpts.storage.clearQuotaProbe(requestId);
+			bootOpts.storage.releaseTurnReservation(requestId);
 		}
 	}
 
 	let events: AssistantMessageEventStream;
 	try {
 		if (controller.signal.aborted) {
-			bootOpts.storage.clearQuotaProbe(requestId);
+			bootOpts.storage.releaseTurnReservation(requestId);
 			return aborted();
 		}
 		events = streamSimple(model, parsed.context, streamOpts);
 	} catch (error) {
-		bootOpts.storage.clearQuotaProbe(requestId);
+		bootOpts.storage.releaseTurnReservation(requestId);
 		const classified = classifyGatewayError(error);
 		logger.warn("auth-gateway streamSimple threw", { format: "pi-native", error: classified.message, peer });
 		return piNative.formatError(classified.status, classified.type, classified.message);
 	}
 	if (controller.signal.aborted) {
-		bootOpts.storage.clearQuotaProbe(requestId);
+		bootOpts.storage.releaseTurnReservation(requestId);
 		return aborted();
 	}
 	const settled = events.result();

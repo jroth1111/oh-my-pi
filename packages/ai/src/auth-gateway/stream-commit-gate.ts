@@ -39,6 +39,7 @@ export class StreamCommitGate {
 		return this.#state;
 	}
 
+	/** True once a successful terminal (`response.completed` / `incomplete`) was observed. */
 	get sawSuccessfulTerminal(): boolean {
 		return this.#sawSuccessfulTerminal;
 	}
