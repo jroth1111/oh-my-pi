@@ -1,8 +1,6 @@
 import { describe, expect, test, vi } from "bun:test";
-import { getProviderDefinition } from "../src/registry/registry";
+import { loginTogether } from "../src/registry/together";
 import type { FetchImpl } from "../src/types";
-
-const loginTogether = getProviderDefinition("together")!.login!;
 
 // Together's serverless API rejects models that only exist behind a dedicated
 // endpoint (e.g. `moonshotai/Kimi-K2.5`) with an HTTP 400 `model_not_available`

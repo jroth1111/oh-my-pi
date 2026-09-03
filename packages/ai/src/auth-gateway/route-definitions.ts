@@ -1,6 +1,7 @@
 import { isEnoent, isRecord } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
 import type { GatewayErrorDisposition } from "../error/gateway";
+import type { AffinityLevel, StatePortability, StatePortabilityScope } from "./affinity";
 import type { RouteDefinition, RouteNode } from "./route-graph";
 
 const GATEWAY_ERROR_DISPOSITIONS = {
@@ -24,6 +25,43 @@ function parseDisposition(value: unknown): GatewayErrorDisposition {
 	return value as GatewayErrorDisposition;
 }
 
+const AFFINITY_LEVELS = {
+	none: true,
+	preferred: true,
+	required: true,
+} as const satisfies Record<AffinityLevel, true>;
+
+const PORTABILITY_SCOPES = {
+	portable: true,
+	provider: true,
+	account: true,
+	deployment: true,
+} as const satisfies Record<StatePortabilityScope, true>;
+
+function parseAffinity(value: unknown): AffinityLevel {
+	if (typeof value !== "string" || !Object.hasOwn(AFFINITY_LEVELS, value)) {
+		throw new AIError.ValidationError(`Unknown affinity level: ${String(value)}`);
+	}
+	return value as AffinityLevel;
+}
+
+function parsePortability(value: unknown): StatePortability {
+	if (!isRecord(value)) {
+		throw new AIError.ValidationError("Portability must be an object");
+	}
+	if (typeof value.scope !== "string" || !Object.hasOwn(PORTABILITY_SCOPES, value.scope)) {
+		throw new AIError.ValidationError(`Unknown portability scope: ${String(value.scope)}`);
+	}
+	const portability: StatePortability = { scope: value.scope as StatePortabilityScope };
+	if ("origin" in value) {
+		if (typeof value.origin !== "string") {
+			throw new AIError.ValidationError("Portability origin must be a string");
+		}
+		portability.origin = value.origin;
+	}
+	return portability;
+}
+
 function parseNode(input: unknown): RouteNode {
 	if (!isRecord(input)) {
 		throw new AIError.ValidationError("Route node must be an object");
@@ -33,7 +71,9 @@ function parseNode(input: unknown): RouteNode {
 		if (typeof input.model !== "string" || input.model.length === 0) {
 			throw new AIError.ValidationError("Target node missing model");
 		}
-		return { type: "target", model: input.model };
+		const target: { type: "target"; model: string; weight?: number } = { type: "target", model: input.model };
+		if (typeof input.weight === "number" && Number.isFinite(input.weight)) target.weight = input.weight;
+		return target;
 	}
 	if (type === "fallback") {
 		if (!Array.isArray(input.on)) {
@@ -45,6 +85,46 @@ function parseNode(input: unknown): RouteNode {
 		const on = input.on.map(parseDisposition);
 		const children = input.children.map(parseNode);
 		return { type: "fallback", on, children };
+	}
+	if (type === "balance") {
+		if (input.strategy !== "rr" && input.strategy !== "weighted") {
+			throw new AIError.ValidationError(`Unknown balance strategy: ${String(input.strategy)}`);
+		}
+		if (!Array.isArray(input.children)) {
+			throw new AIError.ValidationError("Balance node missing children");
+		}
+		return { type: "balance", strategy: input.strategy, children: input.children.map(parseNode) };
+	}
+	if (type === "conditional") {
+		if (!isRecord(input.when)) {
+			throw new AIError.ValidationError("Conditional node missing when object");
+		}
+		const when: { vision?: boolean } = {};
+		if ("vision" in input.when) {
+			if (typeof input.when.vision !== "boolean") {
+				throw new AIError.ValidationError("Conditional when.vision must be a boolean");
+			}
+			when.vision = input.when.vision;
+		}
+		if (!Array.isArray(input.children)) {
+			throw new AIError.ValidationError("Conditional node missing children");
+		}
+		return { type: "conditional", when, children: input.children.map(parseNode) };
+	}
+	if (type === "domain") {
+		if (typeof input.name !== "string" || input.name.length === 0) {
+			throw new AIError.ValidationError("Domain node missing name");
+		}
+		if (!Array.isArray(input.children)) {
+			throw new AIError.ValidationError("Domain node missing children");
+		}
+		return { type: "domain", name: input.name, children: input.children.map(parseNode) };
+	}
+	if (type === "route-ref") {
+		if (typeof input.route !== "string" || input.route.length === 0) {
+			throw new AIError.ValidationError("Route-ref node missing route");
+		}
+		return { type: "route-ref", route: input.route };
 	}
 	throw new AIError.ValidationError(`Unknown route node type: ${String(type)}`);
 }
@@ -63,7 +143,14 @@ export function parseRouteDefinition(input: unknown): RouteDefinition {
 	if (!("root" in input)) {
 		throw new AIError.ValidationError("Route definition missing root");
 	}
-	return { id: input.id, root: parseNode(input.root) };
+	const definition: RouteDefinition = { id: input.id, root: parseNode(input.root) };
+	if ("affinity" in input) {
+		definition.affinity = parseAffinity(input.affinity);
+	}
+	if ("portability" in input) {
+		definition.portability = parsePortability(input.portability);
+	}
+	return definition;
 }
 
 /**

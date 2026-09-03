@@ -41,6 +41,7 @@ function host(overrides: Partial<TodoTrackerHost> = {}): {
 		settings: Settings.isolated({ "todo.enabled": true, "todo.reminders": true, "todo.remindersMax": 3 }),
 		model: (): Model | undefined => undefined,
 		agentKind: () => "main",
+		cwd: () => "/tmp",
 		emitSessionEvent: async () => {},
 		scheduleAgentContinue: () => {
 			continuations.count++;
@@ -51,6 +52,7 @@ function host(overrides: Partial<TodoTrackerHost> = {}): {
 		getEnabledToolNames: () => ["todo"],
 		toolRegistry: () => new Map<string, AgentTool>(),
 		planModeEnabled: () => false,
+		prewalkWillHandoff: () => false,
 		consumeLastServedToolChoiceLabel: () => undefined,
 		...overrides,
 	};

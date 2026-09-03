@@ -1,10 +1,9 @@
 import { buildModel } from "./build";
-import { collapseBuiltVariants } from "./compat/collapse";
-import { resolveModelPolicy } from "./compat/resolve";
 import { readModelCache, writeModelCache } from "./model-cache";
 import { type GeneratedProvider, getBundledModels } from "./models";
 import type { Api, Model, ModelCost, ModelSpec, Provider, TokenCost } from "./types";
 import { isRecord } from "./utils";
+import { collapseBuiltModelVariants } from "./variant-collapse";
 
 const DEFAULT_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
 const NON_AUTHORITATIVE_RETRY_MS = 5 * 60 * 1000;
@@ -262,7 +261,7 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 			: restoredCache.models;
 		const source: ModelResolutionSource = cacheContribution.length > 0 ? "cache" : "bundled";
 		return {
-			models: collapseBuiltVariants(cachedModels),
+			models: collapseBuiltModelVariants(cachedModels),
 			stale: false,
 			source,
 			...(source === "cache" ? { updatedAt: cache.updatedAt } : {}),
@@ -314,7 +313,7 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 	const mergedWithCache = mergeDynamicModels(staticModels, cacheModels);
 	const mergedWithModelsDev = mergeDynamicModels(mergedWithCache, modelsDevModels);
 	const mergedModels = mergeDynamicModels(mergedWithModelsDev, dynamicModels);
-	const models = collapseBuiltVariants(
+	const models = collapseBuiltModelVariants(
 		authoritativeDynamicFetchSucceeded ? retainModelIds(mergedModels, dynamicModels) : mergedModels,
 	);
 	const resolutionAuthoritative = !hasRemoteFetcher || remoteResolutionComplete || shouldUseFreshCacheAsAuthoritative;
@@ -355,7 +354,7 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 			const latestCacheModels = additiveStaticModelIds
 				? preparedLatestCacheModels.filter(model => !additiveStaticModelIds.has(model.id))
 				: preparedLatestCacheModels;
-			const fallbackSnapshotModels = collapseBuiltVariants(
+			const fallbackSnapshotModels = collapseBuiltModelVariants(
 				mergeDynamicModels(mergeDynamicModels(staticModels, latestCacheModels), modelsDevModels),
 			);
 			writeModelCache(
@@ -544,10 +543,7 @@ function mergeDynamicModel<TApi extends Api>(existingModel: Model<TApi>, dynamic
 	const dynamicInputAuthoritative =
 		endpointChanged ||
 		(existingModel.provider === "github-copilot" && dynamicModel.provider === "github-copilot") ||
-		(existingModel.provider === "deepinfra" && dynamicModel.provider === "deepinfra") ||
-		(existingModel.provider === "grokbot" && dynamicModel.provider === "grokbot");
-	const dynamicLimitsAuthoritative =
-		resolveModelPolicy(dynamicModel).catalog.credentialScopedCatalog === true;
+		(existingModel.provider === "deepinfra" && dynamicModel.provider === "deepinfra");
 	const supportsImage = dynamicInputAuthoritative
 		? dynamicModel.input.includes("image")
 		: existingModel.input.includes("image") || dynamicModel.input.includes("image");
@@ -556,14 +552,10 @@ function mergeDynamicModel<TApi extends Api>(existingModel: Model<TApi>, dynamic
 	// whole truth: when the wire advertises only the `none` off-state the
 	// mapper emits `reasoning: false`, and OR-ing the bundled reference's
 	// stale `reasoning: true` back would re-arm an effort dial the route
-	// doesn't expose. Grokbot AvailableModels is similarly authoritative —
-	// a live `reasoning: false` must not be OR-upgraded by offline seed
-	// reasoning (or KDL would re-attach effort ladders at buildModel).
-	// Other providers keep the OR so a bundled reasoning flag survives a
-	// discovery row that simply omits the capability.
+	// doesn't expose. Other providers keep the OR so a bundled reasoning flag
+	// survives a discovery row that simply omits the capability.
 	const dynamicReasoningAuthoritative =
-		(existingModel.provider === "synthetic" && dynamicModel.provider === "synthetic") ||
-		(existingModel.provider === "grokbot" && dynamicModel.provider === "grokbot");
+		existingModel.provider === "synthetic" && dynamicModel.provider === "synthetic";
 	const reasoning = dynamicReasoningAuthoritative
 		? dynamicModel.reasoning
 		: existingModel.reasoning || dynamicModel.reasoning;
@@ -583,14 +575,8 @@ function mergeDynamicModel<TApi extends Api>(existingModel: Model<TApi>, dynamic
 			cacheWrite: preferDiscoveryCost(dynamicModel.cost.cacheWrite, existingModel.cost.cacheWrite),
 			...(longContextCost ? { longContext: longContextCost } : {}),
 		},
-		contextWindow:
-			dynamicLimitsAuthoritative && dynamicModel.contextWindow === null
-				? null
-				: preferDiscoveryLimit(dynamicModel.contextWindow, existingModel.contextWindow),
-		maxTokens:
-			dynamicLimitsAuthoritative && dynamicModel.maxTokens === null
-				? null
-				: preferDiscoveryLimit(dynamicModel.maxTokens, existingModel.maxTokens),
+		contextWindow: preferDiscoveryLimit(dynamicModel.contextWindow, existingModel.contextWindow),
+		maxTokens: preferDiscoveryLimit(dynamicModel.maxTokens, existingModel.maxTokens),
 		headers: dynamicModel.headers ? { ...existingModel.headers, ...dynamicModel.headers } : existingModel.headers,
 		compat: dynamicModel.compatConfig ?? existingModel.compatConfig,
 		contextPromotionTarget: dynamicModel.contextPromotionTarget ?? existingModel.contextPromotionTarget,

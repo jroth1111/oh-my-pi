@@ -5,7 +5,6 @@ import type { TimeRange } from "../types";
 const VALID_SECTIONS: DashboardSection[] = [
 	"overview",
 	"requests",
-	"traces",
 	"errors",
 	"models",
 	"providers",
@@ -18,7 +17,7 @@ const VALID_SECTIONS: DashboardSection[] = [
 
 const VALID_RANGES: TimeRange[] = ["1h", "24h", "7d", "30d", "90d", "all"];
 
-function parseHash(hash: string): { section: DashboardSection; range: TimeRange; session: string | null } {
+function parseHash(hash: string): { section: DashboardSection; range: TimeRange } {
 	const cleanHash = hash.replace(/^#\/?/, "");
 	const [pathPart, queryPart] = cleanHash.split("?");
 
@@ -27,22 +26,15 @@ function parseHash(hash: string): { section: DashboardSection; range: TimeRange;
 		: "overview";
 
 	let range: TimeRange = "24h";
-	let session: string | null = null;
 	if (queryPart) {
 		const params = new URLSearchParams(queryPart);
 		const rangeParam = params.get("range") as TimeRange;
 		if (VALID_RANGES.includes(rangeParam)) {
 			range = rangeParam;
 		}
-		session = params.get("s");
 	}
 
-	return { section, range, session };
-}
-
-function buildHash(section: string, range: TimeRange, session?: string | null): string {
-	const sessionPart = session ? `&s=${encodeURIComponent(session)}` : "";
-	return `/${section}?range=${range}${sessionPart}`;
+	return { section, range };
 }
 
 export function useHashRoute() {
@@ -59,39 +51,31 @@ export function useHashRoute() {
 		};
 	}, []);
 
-	const updateHash = useCallback((section: string, range: TimeRange, session?: string | null) => {
-		window.location.hash = buildHash(section, range, session);
+	const updateHash = useCallback((section: string, range: TimeRange) => {
+		window.location.hash = `/${section}?range=${range}`;
 	}, []);
 
 	const setSection = useCallback(
 		(newSection: DashboardSection) => {
-			// The deep-linked session only applies to the traces view.
-			updateHash(newSection, route.range, newSection === "traces" ? route.session : null);
+			updateHash(newSection, route.range);
 		},
-		[route.range, route.session, updateHash],
+		[route.range, updateHash],
 	);
 
 	const setRange = useCallback(
 		(newRange: string) => {
 			const nextRange = VALID_RANGES.includes(newRange as TimeRange) ? (newRange as TimeRange) : "24h";
-			updateHash(route.section, nextRange, route.session);
+			updateHash(route.section, nextRange);
 		},
-		[route.section, route.session, updateHash],
-	);
-
-	const setSession = useCallback(
-		(file: string | null) => {
-			updateHash(route.section, route.range, file);
-		},
-		[route.section, route.range, updateHash],
+		[route.section, updateHash],
 	);
 
 	useEffect(() => {
 		const currentHash = window.location.hash;
 		const parsed = parseHash(currentHash);
-		const expectedHash = `#${buildHash(parsed.section, parsed.range, parsed.session)}`;
+		const expectedHash = `#/${parsed.section}?range=${parsed.range}`;
 		if (currentHash !== expectedHash) {
-			window.location.hash = buildHash(parsed.section, parsed.range, parsed.session);
+			window.location.hash = `/${parsed.section}?range=${parsed.range}`;
 		}
 	}, []);
 
@@ -100,7 +84,5 @@ export function useHashRoute() {
 		setSection,
 		range: route.range,
 		setRange,
-		session: route.session,
-		setSession,
 	};
 }

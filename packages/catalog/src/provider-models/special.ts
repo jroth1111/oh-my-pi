@@ -1,18 +1,12 @@
 import { once } from "@oh-my-pi/pi-utils";
 import { buildModel } from "../build";
-import { apiRouteFor } from "../compat/behavior";
 import { type CodexModelDiscoveryResult, fetchCodexModels } from "../discovery/codex";
 import type { DevinModelDiscoveryOptions } from "../discovery/devin";
 import { buildGitLabDuoWorkflowFallbackModel, fetchGitLabDuoWorkflowModels } from "../discovery/gitlab-duo-workflow";
-import { fetchGrokbotAvailableModels } from "../discovery/grokbot";
-import { resolveGrokbotDiscoveryIdentity } from "../discovery/grokbot-auth";
 import type { ModelManagerOptions } from "../model-manager";
-import { getBundledModel } from "../models";
-import type { Api, FetchImpl, Model, ModelSpec } from "../types";
+import type { FetchImpl, Model, ModelSpec } from "../types";
 import { DEVIN_DEFAULT_BASE_URL } from "../wire/devin";
-import { toModelSpec } from "./bundled-references";
 import { resolveModelCacheProviderId } from "./cache-provider-id";
-import { buildGrokbotStaticSeed } from "./grokbot";
 
 // ---------------------------------------------------------------------------
 // OpenAI Codex
@@ -123,16 +117,11 @@ const cursorDiscovery = once(() => import("../discovery/cursor"));
 
 /**
  * Synthetic Cursor "auto" model. Cursor's backend routes the wire id "default"
- * to a per-turn model selection (the same way Cursor's own UI does). The
- * cursor provider translates the external id "auto" to the wire id "default"
- * (see `resolveCursorWireModel` in providers/cursor.ts).
+ * to a per-turn model selection (the same way Cursor's own UI does).
  *
  * Exposed as a prebuilt catalog entry so id-resolving callers — notably the
  * auth-gateway, where an external OpenAI-compatible client can send
- * `{"model":"auto"}` — get a valid `Model<"cursor-agent">` instead of a 404,
- * and so "auto" can surface in `/v1/models` listings. Limits are conservative
- * defaults because the routed model is unknown upfront; cost is zero since
- * Cursor does not bill per-token for auto routing.
+ * `{"model":"auto"}` — get a valid `Model<"cursor-agent">` instead of a 404.
  */
 export const CURSOR_AUTO_MODEL: Model<"cursor-agent"> = buildModel({
 	id: "auto",
@@ -146,131 +135,6 @@ export const CURSOR_AUTO_MODEL: Model<"cursor-agent"> = buildModel({
 	contextWindow: 200_000,
 	maxTokens: 16_384,
 });
-
-// ---------------------------------------------------------------------------
-// GitLab Duo Chat
-// ---------------------------------------------------------------------------
-
-const GITLAB_DUO_ANTHROPIC_BASE_URL = "https://cloud.gitlab.com/ai/v1/proxy/anthropic/";
-const GITLAB_DUO_OPENAI_BASE_URL = "https://cloud.gitlab.com/ai/v1/proxy/openai/v1";
-
-export type GitLabDuoModelIdentity = {
-	upstreamModelId: string;
-	referenceProvider: "anthropic" | "openai";
-	referenceModelId: string;
-};
-
-/**
- * Duo's public aliases are deployment identity, not model metadata. The
- * reference ids select bundled first-party rows; capabilities, prices, and
- * limits are copied from those rows rather than repeated here.
- */
-const GITLAB_DUO_MODEL_IDENTITIES: Readonly<Record<string, GitLabDuoModelIdentity>> = {
-	"duo-chat-opus-4-6": {
-		upstreamModelId: "claude-opus-4-6",
-		referenceProvider: "anthropic",
-		referenceModelId: "claude-opus-4-6",
-	},
-	"duo-chat-sonnet-4-6": {
-		upstreamModelId: "claude-sonnet-4-6",
-		referenceProvider: "anthropic",
-		referenceModelId: "claude-sonnet-4-6",
-	},
-	"duo-chat-opus-4-5": {
-		upstreamModelId: "claude-opus-4-5-20251101",
-		referenceProvider: "anthropic",
-		referenceModelId: "claude-opus-4-5-20251101",
-	},
-	"duo-chat-sonnet-4-5": {
-		upstreamModelId: "claude-sonnet-4-5-20250929",
-		referenceProvider: "anthropic",
-		referenceModelId: "claude-sonnet-4-5-20250929",
-	},
-	"duo-chat-haiku-4-5": {
-		upstreamModelId: "claude-haiku-4-5-20251001",
-		referenceProvider: "anthropic",
-		referenceModelId: "claude-haiku-4-5-20251001",
-	},
-	"duo-chat-gpt-5-1": {
-		upstreamModelId: "gpt-5.1-2025-11-13",
-		referenceProvider: "openai",
-		referenceModelId: "gpt-5.1",
-	},
-	"duo-chat-gpt-5-2": {
-		upstreamModelId: "gpt-5.2-2025-12-11",
-		referenceProvider: "openai",
-		referenceModelId: "gpt-5.2",
-	},
-	"duo-chat-gpt-5-mini": {
-		upstreamModelId: "gpt-5-mini-2025-08-07",
-		referenceProvider: "openai",
-		referenceModelId: "gpt-5-mini",
-	},
-	"duo-chat-gpt-5-codex": {
-		upstreamModelId: "gpt-5-codex",
-		referenceProvider: "openai",
-		referenceModelId: "gpt-5-codex",
-	},
-	"duo-chat-gpt-5-2-codex": {
-		upstreamModelId: "gpt-5.2-codex",
-		referenceProvider: "openai",
-		referenceModelId: "gpt-5.2-codex",
-	},
-};
-
-export function resolveGitLabDuoModelIdentity(modelId: string): GitLabDuoModelIdentity | undefined {
-	const direct = GITLAB_DUO_MODEL_IDENTITIES[modelId];
-	if (direct) return direct;
-	for (const alias in GITLAB_DUO_MODEL_IDENTITIES) {
-		const identity = GITLAB_DUO_MODEL_IDENTITIES[alias];
-		if (identity?.upstreamModelId === modelId) return identity;
-	}
-	return undefined;
-}
-
-function gitLabDuoDisplayName(alias: string): string {
-	const parts = alias.slice("duo-chat-".length).split("-");
-	const family = parts.shift();
-	if (!family) return alias;
-	const numeric: string[] = [];
-	while (parts[0] !== undefined && /^\d+$/.test(parts[0])) {
-		const part = parts.shift();
-		if (part !== undefined) numeric.push(part);
-	}
-	const familyName = family === "gpt" ? "GPT" : `${family[0]?.toUpperCase() ?? ""}${family.slice(1)}`;
-	const version = numeric.length > 0 ? `${family === "gpt" ? "-" : " "}${numeric.join(".")}` : "";
-	const suffix = parts.map(part => `${part[0]?.toUpperCase() ?? ""}${part.slice(1)}`).join(" ");
-	return `Duo Chat ${familyName}${version}${suffix ? ` ${suffix}` : ""}`;
-}
-
-export function getGitLabDuoModels(): Model<Api>[] {
-	const models: Model<Api>[] = [];
-	for (const alias in GITLAB_DUO_MODEL_IDENTITIES) {
-		const identity = GITLAB_DUO_MODEL_IDENTITIES[alias];
-		if (!identity) continue;
-		const reference = getBundledModel(identity.referenceProvider, identity.referenceModelId);
-		if (!reference) {
-			throw new Error(
-				`Missing bundled ${identity.referenceProvider}/${identity.referenceModelId} reference for ${alias}`,
-			);
-		}
-		const route = apiRouteFor("gitlab-duo", alias)?.api;
-		if (route !== "anthropic-messages" && route !== "openai-completions" && route !== "openai-responses") {
-			throw new Error(`Missing GitLab Duo API route for ${alias}`);
-		}
-		models.push(
-			buildModel({
-				...toModelSpec(reference),
-				id: alias,
-				name: gitLabDuoDisplayName(alias),
-				api: route,
-				provider: "gitlab-duo",
-				baseUrl: route === "anthropic-messages" ? GITLAB_DUO_ANTHROPIC_BASE_URL : GITLAB_DUO_OPENAI_BASE_URL,
-			}),
-		);
-	}
-	return models;
-}
 
 // ---------------------------------------------------------------------------
 // GitLab Duo Workflow
@@ -412,66 +276,12 @@ export function devinModelManagerOptions(config: DevinModelManagerConfig = {}): 
 }
 
 const devinDiscovery = once(() => import("../discovery/devin"));
-
-// ---------------------------------------------------------------------------
-// Grok Bot provider (InferenceService Stream)
-// ---------------------------------------------------------------------------
-
-export interface GrokbotModelManagerConfig {
-	apiKey?: string;
-	baseUrl?: string;
-	fetch?: FetchImpl;
-	/** Override `x-sand-box-namespace` for cache scoping (defaults to GROKBOT_NAMESPACE). */
-	namespace?: string;
-	/** Override `x-cursor-client-version` for cache scoping (defaults to GROKBOT_CLIENT_VERSION). */
-	clientVersion?: string;
-	/** Caller/model headers forwarded to AvailableModels mint + request. */
-	headers?: Record<string, string>;
-}
-
-export function grokbotModelManagerOptions(
-	config: GrokbotModelManagerConfig = {},
-): ModelManagerOptions<"grokbot-sand"> {
-	const { apiKey, baseUrl, fetch, headers } = config;
-	// Prefer a fully resolved identity from async prep (catalog refresh) so
-	// construction never sync-reads secrets/grokbot.env on the TUI event loop.
-	const ns = config.namespace?.trim();
-	const ver = config.clientVersion?.trim();
-	const identity =
-		ns && ver
-			? { namespace: ns, clientVersion: ver }
-			: resolveGrokbotDiscoveryIdentity({
-					namespace: config.namespace,
-					clientVersion: config.clientVersion,
-				});
-	return {
-		providerId: "grokbot",
-		cacheProviderId: resolveModelCacheProviderId("grokbot", {
-			apiKey,
-			baseUrl,
-			namespace: identity.namespace,
-			clientVersion: identity.clientVersion,
-			headers,
-		}),
-		staticModels: buildGrokbotStaticSeed(baseUrl),
-		...(apiKey
-			? {
-					dynamicModelsAuthoritative: true,
-					fetchDynamicModels: async () => fetchGrokbotAvailableModels({ apiKey, baseUrl, fetch, headers }),
-				}
-			: undefined),
-	};
-}
-
 // ---------------------------------------------------------------------------
 // Zai
 // ---------------------------------------------------------------------------
 
 export interface ZaiModelManagerConfig {}
 
-/** Creates model-manager options for Z.AI's mixed native and Anthropic transports. */
-export function zaiModelManagerOptions(
-	_config: ZaiModelManagerConfig = {},
-): ModelManagerOptions<"anthropic-messages" | "openai-completions"> {
+export function zaiModelManagerOptions(_config: ZaiModelManagerConfig = {}): ModelManagerOptions<"anthropic-messages"> {
 	return { providerId: "zai" };
 }

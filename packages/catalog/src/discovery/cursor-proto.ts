@@ -2882,6 +2882,27 @@ export const GetUsableModelsResponseSchema: MessageCodec<GetUsableModelsResponse
 	{ no: 1, name: "models", kind: "message", T: () => ModelDetailsSchema, repeat: true },
 ]);
 
+/** Cursor agent message agent.v1.GetDefaultModelForCliRequest. */
+export interface GetDefaultModelForCliRequest extends ProtoMessage {}
+
+export const GetDefaultModelForCliRequestSchema: MessageCodec<GetDefaultModelForCliRequest> = pb<GetDefaultModelForCliRequest>(
+	"agent.v1.GetDefaultModelForCliRequest",
+);
+
+/** Cursor agent message agent.v1.GetDefaultModelForCliResponse. */
+export interface GetDefaultModelForCliResponse extends ProtoMessage {
+	modelId?: string;
+	displayName?: string;
+}
+
+export const GetDefaultModelForCliResponseSchema: MessageCodec<GetDefaultModelForCliResponse> = pb<GetDefaultModelForCliResponse>(
+	"agent.v1.GetDefaultModelForCliResponse",
+	[
+		{ no: 1, name: "modelId", kind: "string", optional: true },
+		{ no: 2, name: "displayName", kind: "string", optional: true },
+	],
+);
+
 /** Cursor agent message agent.v1.GitDiff. */
 export interface GitDiff extends ProtoMessage {
 	diffs: FileDiff[];

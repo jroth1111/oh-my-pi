@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import { googleGeminiCliProjectHook } from "@oh-my-pi/pi-ai/oauth/google-gemini-cli";
+import { GoogleOAuthFlow, type GoogleOAuthFlowConfig } from "@oh-my-pi/pi-ai/oauth/google-oauth-shared";
+import type { OAuthController } from "@oh-my-pi/pi-ai/oauth/types";
 import { extractGoogleValidationUrl } from "@oh-my-pi/pi-ai/utils/google-validation";
 
 const VALIDATION_URL = "https://accounts.google.com/signin/continue?sarp=1&scc=1&plt=AKgnsbtTOKEN";
@@ -52,55 +53,97 @@ describe("extractGoogleValidationUrl", () => {
 	});
 });
 
-async function runProjectHook(email?: string) {
-	return googleGeminiCliProjectHook(
-		{
-			access: "access-token",
-			refresh: "refresh-token",
-			expires: Date.now() + 3600_000,
-			...(email ? { email } : {}),
-		},
-		{
-			provider: "google-gemini-cli",
-			phase: "login",
-			raw: { refresh_token: "refresh-token" },
-			fetch,
-		},
+const TOKEN_URL = "https://oauth2.example.com/token";
+
+function urlOf(input: string | URL | Request): string {
+	if (typeof input === "string") return input;
+	if (input instanceof URL) return input.href;
+	return input.url;
+}
+
+function makeConfig(discoverProject: GoogleOAuthFlowConfig["discoverProject"]): GoogleOAuthFlowConfig {
+	return {
+		provider: "google-gemini-cli",
+		clientId: "client-id",
+		clientSecret: "client-secret",
+		authUrl: "https://accounts.example.com/o/oauth2/auth",
+		tokenUrl: TOKEN_URL,
+		scopes: ["scope-a"],
+		callbackPort: 0,
+		callbackPath: "/callback",
+		discoverProject,
+	};
+}
+
+/** Stub the token-exchange POST and the optional userinfo GET that exchangeToken issues. */
+function stubTokenAndUserInfo(email?: string): void {
+	vi.spyOn(globalThis, "fetch").mockImplementation(
+		Object.assign(
+			async (input: string | URL | Request) => {
+				if (urlOf(input).includes("userinfo")) {
+					if (!email) return new Response("{}", { status: 401 });
+					return new Response(JSON.stringify({ email }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				return new Response(
+					JSON.stringify({ access_token: "access-token", refresh_token: "refresh-token", expires_in: 3600 }),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			},
+			{ preconnect: fetch.preconnect },
+		),
 	);
 }
 
-describe("Google OAuth account verification", () => {
+describe("GoogleOAuthFlow account verification", () => {
+	const ctrl: OAuthController = {};
+
 	afterEach(() => {
 		vi.restoreAllMocks();
 	});
 
 	it("rewrites a VALIDATION_REQUIRED discovery failure into an actionable message naming the account", async () => {
-		vi.spyOn(globalThis, "fetch").mockResolvedValue(
-			new Response(validationBody, { status: 403, statusText: "Forbidden" }),
+		stubTokenAndUserInfo("user@example.com");
+		const flow = new GoogleOAuthFlow(
+			ctrl,
+			makeConfig(async () => {
+				throw new Error(
+					`Could not discover or provision an Antigravity project. loadCodeAssist failed: 403 Forbidden: ${validationBody}`,
+				);
+			}),
 		);
 
-		await expect(runProjectHook("user@example.com")).rejects.toThrow(
+		await expect(flow.exchangeToken("auth-code", "state", "https://localhost/callback")).rejects.toThrow(
 			`Account verification required for user@example.com. Visit ${VALIDATION_URL} to continue, then sign in again.`,
 		);
 	});
 
-	it("omits the account clause when no email was resolved", async () => {
-		vi.spyOn(globalThis, "fetch").mockResolvedValue(
-			new Response(validationBody, { status: 403, statusText: "Forbidden" }),
+	it("omits the account clause when the userinfo lookup yields no email", async () => {
+		stubTokenAndUserInfo();
+		const flow = new GoogleOAuthFlow(
+			ctrl,
+			makeConfig(async () => {
+				throw new Error(`loadCodeAssist failed: 403 Forbidden: ${validationBody}`);
+			}),
 		);
 
-		await expect(runProjectHook()).rejects.toThrow(
+		await expect(flow.exchangeToken("auth-code", "state", "https://localhost/callback")).rejects.toThrow(
 			`Account verification required. Visit ${VALIDATION_URL} to continue, then sign in again.`,
 		);
 	});
 
-	it("propagates a non-validation discovery error untouched", async () => {
-		vi.spyOn(globalThis, "fetch").mockResolvedValue(
-			new Response("service unavailable", { status: 503, statusText: "Service Unavailable" }),
+	it("propagates the original discovery error untouched when it is not VALIDATION_REQUIRED", async () => {
+		stubTokenAndUserInfo("user@example.com");
+		const original = "Could not discover or provision a Google Cloud project. Set GOOGLE_CLOUD_PROJECT.";
+		const flow = new GoogleOAuthFlow(
+			ctrl,
+			makeConfig(async () => {
+				throw new Error(original);
+			}),
 		);
 
-		await expect(runProjectHook("user@example.com")).rejects.toThrow(
-			"loadCodeAssist failed: 503 Service Unavailable: service unavailable",
-		);
+		await expect(flow.exchangeToken("auth-code", "state", "https://localhost/callback")).rejects.toThrow(original);
 	});
 });

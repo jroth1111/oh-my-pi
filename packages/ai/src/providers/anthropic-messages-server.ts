@@ -4,12 +4,9 @@ import { logger } from "@oh-my-pi/pi-utils";
 import { captureRequestHeaders, resolvePromptCacheKey } from "../auth-gateway/http";
 import * as AIError from "../error";
 import type {
-	AnthropicMessagePayload,
 	AnthropicServerToolContent,
 	AssistantMessage,
-	AssistantMessageEvent,
 	AssistantMessageEventStream,
-	DeveloperMessage,
 	Message,
 	RedactedThinkingContent,
 	StopReason,
@@ -30,7 +27,7 @@ import {
 	type AnthropicUserContentBlock,
 	anthropicMessagesRequestSchema,
 } from "./anthropic-messages-server-schema";
-import { isAnthropicServerToolHistoryBlock, THINKING_BINDING_CONTROLS_BETA } from "./anthropic-wire";
+import { isAnthropicServerToolHistoryBlock } from "./anthropic-wire";
 
 /**
  * Anthropic Messages API (https://docs.anthropic.com/en/api/messages) ↔ pi-ai
@@ -39,7 +36,6 @@ import { isAnthropicServerToolHistoryBlock, THINKING_BINDING_CONTROLS_BETA } fro
  */
 
 import type { AuthGatewayStreamControl, AuthGatewayParsedRequest as ParsedRequest } from "../auth-gateway/types";
-import { resolveAuthGatewayWireModelId } from "../auth-gateway/types";
 
 export type { ParsedRequest };
 
@@ -253,7 +249,6 @@ function walkTools(tools: AnthropicTool[] | undefined): Tool[] | undefined {
 		name: tool.name,
 		description: tool.description ?? "",
 		parameters: tool.input_schema as Record<string, unknown>,
-		deferLoading: tool.defer_loading,
 	}));
 }
 
@@ -320,34 +315,6 @@ function deriveCacheRetention(data: {
  * Values outside this table (none exist in the schema today) are ignored
  * rather than guessed at.
  */
-function walkSystemMessage(message: AnthropicMessage, timestamp: number): DeveloperMessage {
-	const text: TextContent[] = [];
-	const toolChanges: NonNullable<AnthropicMessagePayload["toolChanges"]> = [];
-	if (typeof message.content === "string") {
-		if (message.content.length > 0) text.push({ type: "text", text: message.content });
-	} else {
-		for (const block of message.content) {
-			if (block.type === "text") {
-				if (block.text.length > 0) text.push({ type: "text", text: block.text });
-			} else if (block.type === "tool_addition" || block.type === "tool_removal") {
-				toolChanges.push({ type: block.type, name: block.tool.name });
-			}
-		}
-	}
-	const payload: AnthropicMessagePayload = {
-		type: "anthropicMessage",
-		clearAt: message.clear_at,
-		effort: message.output_config?.effort ?? undefined,
-		toolChanges: toolChanges.length > 0 ? toolChanges : undefined,
-	};
-	return {
-		role: "developer",
-		content: text,
-		providerPayload: payload,
-		timestamp,
-	};
-}
-
 const REASONING_EFFORT_BY_WIRE: Partial<Record<string, Effort>> = {
 	low: Effort.Low,
 	medium: Effort.Medium,
@@ -367,8 +334,6 @@ export function parseRequest(body: unknown, headers?: Headers): ParsedRequest {
 	for (const message of data.messages as AnthropicMessage[]) {
 		if (message.role === "user") {
 			for (const m of walkUserContent(message.content, now)) messages.push(m);
-		} else if (message.role === "system") {
-			messages.push(walkSystemMessage(message, now));
 		} else {
 			const assistant: AssistantMessage = {
 				role: "assistant",
@@ -401,9 +366,6 @@ export function parseRequest(body: unknown, headers?: Headers): ParsedRequest {
 		options.parallelToolCalls = false;
 	}
 	if (data.thinking) {
-		if (data.thinking.type !== "disabled" && data.thinking.block_binding) {
-			options.anthropicPrefixMismatchBehavior = data.thinking.block_binding.prefix_mismatch_behavior;
-		}
 		switch (data.thinking.type) {
 			case "enabled":
 				options.explicitThinkingBudgetTokens = data.thinking.budget_tokens;
@@ -533,11 +495,7 @@ function encodeUsage(message: AssistantMessage): Record<string, unknown> {
 	};
 }
 
-export function encodeResponse(
-	message: AssistantMessage,
-	requestedModelId: string,
-	options?: ParsedRequest["options"],
-): Record<string, unknown> {
+export function encodeResponse(message: AssistantMessage, requestedModelId: string): Record<string, unknown> {
 	if (message.stopReason === "error" || message.stopReason === "aborted") {
 		throw new AIError.ProviderResponseError(
 			message.errorMessage ?? `anthropic-messages: upstream ${message.stopReason}`,
@@ -551,14 +509,13 @@ export function encodeResponse(
 		id: message.responseId ?? newMessageId(),
 		type: "message",
 		role: "assistant",
-		model: resolveAuthGatewayWireModelId(message, requestedModelId, options),
+		model: requestedModelId,
 		content: encodeContentBlocks(message),
 		stop_reason: mapStopReasonOut(message.stopReason),
 		// TODO: surface the matched stop sequence once pi-ai's
 		// `AssistantMessage.stopReason` carries the matched string. Intentionally
 		// `null` for now (Anthropic schema allows it).
 		stop_sequence: null,
-		...(message.inputTransformations ? { input_transformations: message.inputTransformations } : {}),
 		usage: encodeUsage(message),
 	};
 }
@@ -595,13 +552,10 @@ const ZERO_WIRE_USAGE: Record<string, unknown> = {
 export function encodeStream(
 	events: AssistantMessageEventStream,
 	requestedModelId: string,
-	options?: ParsedRequest["options"],
+	_options?: ParsedRequest["options"],
 	control?: AuthGatewayStreamControl,
 ): ReadableStream<Uint8Array> {
 	let pingTimer: NodeJS.Timeout | undefined;
-	const bindingControlsRequested =
-		options?.headers?.["anthropic-beta"]?.split(",").some(beta => beta.trim() === THINKING_BINDING_CONTROLS_BETA) ??
-		false;
 	let cancelled = control?.signal?.aborted === true;
 	const markCancelled = () => {
 		cancelled = true;
@@ -613,26 +567,11 @@ export function encodeStream(
 			pingTimer = undefined;
 		}
 	};
-	let effectiveModelId = requestedModelId;
-	// Cursor auto may start as catalog `auto`, discovered `default`, or a concrete
-	// id with `x-cursor-auto-mode: true`. Defer message_start until an explicit
-	// `routed_model` event lands (or content/done forces emit).
-	let cursorAutoRoutingResolved = false;
-	const deferStartForCursorAuto = (modelId: string | undefined): boolean => {
-		// Cursor's discovered auto wire id is `default` (OpenRouter uses `auto`).
-		// Defer `default` even without the auto-mode header so gateway clients that
-		// select the bundled Cursor default still wait for routing.
-		if (modelId === "default") return true;
-		// Only Cursor auto intent buffers the literal `auto` id — otherwise OpenRouter
-		// (and similar) models named `auto` would non-stream until done.
-		if (options?.cursorAutoMode !== true) return false;
-		if (modelId === "auto") return true;
-		return !cursorAutoRoutingResolved;
-	};
 	return new ReadableStream<Uint8Array>({
 		async start(controller) {
 			const messageId = newMessageId();
 			let started = false;
+			let lastPartial: AssistantMessage | undefined;
 			const open = new Map<number, OpenBlock>();
 
 			const ensureStart = (partial: AssistantMessage | undefined) => {
@@ -645,15 +584,12 @@ export function encodeStream(
 							id: messageId,
 							type: "message",
 							role: "assistant",
-							model: effectiveModelId,
+							model: requestedModelId,
 							content: [],
 							stop_reason: null,
 							// TODO: same as encodeResponse — surface matched stop sequence
 							// once pi-ai propagates it.
 							stop_sequence: null,
-							...(bindingControlsRequested
-								? { input_transformations: partial?.inputTransformations ?? [] }
-								: {}),
 							usage: partial ? encodeUsage(partial) : ZERO_WIRE_USAGE,
 						},
 					}),
@@ -698,207 +634,145 @@ export function encodeStream(
 				}
 			}, STREAM_PING_INTERVAL_MS);
 
-			const noteRoutedModel = (model: string | undefined) => {
-				if (!model) return;
-				const allowRewrite =
-					options?.cursorAutoMode === true || requestedModelId === "default" || requestedModelId === "auto";
-				if (allowRewrite && model !== effectiveModelId) effectiveModelId = model;
-			};
-
-			const markAutoRoutingResolved = (model: string | undefined) => {
-				noteRoutedModel(model);
-				cursorAutoRoutingResolved = true;
-			};
-
-			const processEvent = (ev: AssistantMessageEvent): "continue" | "return" => {
-				if ("partial" in ev) lastPartial = ev.partial;
-				if ("message" in ev) lastPartial = ev.message;
-				switch (ev.type) {
-					case "start":
-						// Defer while Cursor auto routing is unresolved so clients see
-						// the routed model, not auto/default/the pre-route placeholder.
-						if (deferStartForCursorAuto(ev.partial.model)) break;
-						ensureStart(ev.partial);
-						break;
-					case "text_start": {
-						emitServerToolBlocksBefore(ev.partial, ev.contentIndex);
-						ensureStart(ev.partial);
-						open.set(ev.contentIndex, { index: ev.contentIndex, kind: "text" });
-						controller.enqueue(
-							sseFrame("content_block_start", {
-								type: "content_block_start",
-								index: ev.contentIndex,
-								content_block: { type: "text", text: "" },
-							}),
-						);
-						break;
-					}
-					case "text_delta":
-						controller.enqueue(
-							sseFrame("content_block_delta", {
-								type: "content_block_delta",
-								index: ev.contentIndex,
-								delta: { type: "text_delta", text: ev.delta },
-							}),
-						);
-						break;
-					case "text_end":
-						closeBlock(ev.contentIndex);
-						break;
-					case "thinking_start": {
-						emitServerToolBlocksBefore(ev.partial, ev.contentIndex);
-						ensureStart(ev.partial);
-						open.set(ev.contentIndex, { index: ev.contentIndex, kind: "thinking" });
-						controller.enqueue(
-							sseFrame("content_block_start", {
-								type: "content_block_start",
-								index: ev.contentIndex,
-								content_block: { type: "thinking", thinking: "" },
-							}),
-						);
-						break;
-					}
-					case "thinking_delta":
-						controller.enqueue(
-							sseFrame("content_block_delta", {
-								type: "content_block_delta",
-								index: ev.contentIndex,
-								delta: { type: "thinking_delta", thinking: ev.delta },
-							}),
-						);
-						break;
-					case "thinking_end": {
-						const c = ev.partial.content[ev.contentIndex];
-						if (c?.type === "thinking" && c.thinkingSignature) {
-							controller.enqueue(
-								sseFrame("content_block_delta", {
-									type: "content_block_delta",
-									index: ev.contentIndex,
-									delta: { type: "signature_delta", signature: c.thinkingSignature },
-								}),
-							);
-						}
-						closeBlock(ev.contentIndex);
-						break;
-					}
-					case "toolcall_start": {
-						emitServerToolBlocksBefore(ev.partial, ev.contentIndex);
-						ensureStart(ev.partial);
-						const tc = ev.partial.content[ev.contentIndex] as ToolCall | undefined;
-						open.set(ev.contentIndex, { index: ev.contentIndex, kind: "tool_use" });
-						controller.enqueue(
-							sseFrame("content_block_start", {
-								type: "content_block_start",
-								index: ev.contentIndex,
-								content_block: {
-									type: "tool_use",
-									id: tc?.id ?? "",
-									name: tc?.name ?? "",
-									input: {},
-								},
-							}),
-						);
-						break;
-					}
-					case "toolcall_delta":
-						controller.enqueue(
-							sseFrame("content_block_delta", {
-								type: "content_block_delta",
-								index: ev.contentIndex,
-								delta: { type: "input_json_delta", partial_json: ev.delta },
-							}),
-						);
-						break;
-					case "toolcall_end":
-						closeBlock(ev.contentIndex);
-						break;
-					case "done": {
-						for (const idx of [...open.keys()]) closeBlock(idx);
-						emitServerToolBlocksBefore(ev.message, ev.message.content.length);
-						// Auto-mode may have deferred start with no content events.
-						ensureStart(ev.message);
-						controller.enqueue(
-							sseFrame("message_delta", {
-								type: "message_delta",
-								// TODO: surface matched stop sequence once pi-ai
-								// propagates it on the `done` event.
-								delta: { stop_reason: mapStopReasonOut(ev.reason), stop_sequence: null },
-								usage: encodeUsage(ev.message),
-							}),
-						);
-						controller.enqueue(sseFrame("message_stop", { type: "message_stop" }));
-						controller.close();
-						return "return";
-					}
-					case "error": {
-						const msg = ev.error.errorMessage ?? "stream error";
-						controller.enqueue(sseFrame("error", { type: "error", error: { type: "api_error", message: msg } }));
-						controller.close();
-						return "return";
-					}
-				}
-				return "continue";
-			};
-
 			try {
 				if (cancelled) {
 					controller.close();
 					return;
 				}
-				// Hold content events until Cursor auto routing resolves so
-				// message_start is not permanently stamped with auto/default/the
-				// pre-route placeholder when text arrives before the checkpoint.
-				const pendingWhileRouting: AssistantMessageEvent[] = [];
-				const flushPending = () => {
-					const held = pendingWhileRouting.splice(0);
-					for (const heldEv of held) {
-						if (processEvent(heldEv) === "return") return true;
-					}
-					return false;
-				};
 				for await (const ev of events) {
 					if (cancelled) return;
-					if (ev.type === "routed_model") {
-						// Explicit InteractionUpdate.routedModel / checkpoint signal —
-						// never treat repeated partial.model observations as proof.
-						markAutoRoutingResolved(ev.model);
-						if (flushPending()) return;
-						continue;
+					switch (ev.type) {
+						case "start":
+							ensureStart(ev.partial);
+							break;
+						case "text_start": {
+							emitServerToolBlocksBefore(ev.partial, ev.contentIndex);
+							ensureStart(ev.partial);
+							open.set(ev.contentIndex, { index: ev.contentIndex, kind: "text" });
+							controller.enqueue(
+								sseFrame("content_block_start", {
+									type: "content_block_start",
+									index: ev.contentIndex,
+									content_block: { type: "text", text: "" },
+								}),
+							);
+							break;
+						}
+						case "text_delta":
+							controller.enqueue(
+								sseFrame("content_block_delta", {
+									type: "content_block_delta",
+									index: ev.contentIndex,
+									delta: { type: "text_delta", text: ev.delta },
+								}),
+							);
+							break;
+						case "text_end":
+							closeBlock(ev.contentIndex);
+							break;
+						case "thinking_start": {
+							emitServerToolBlocksBefore(ev.partial, ev.contentIndex);
+							ensureStart(ev.partial);
+							open.set(ev.contentIndex, { index: ev.contentIndex, kind: "thinking" });
+							controller.enqueue(
+								sseFrame("content_block_start", {
+									type: "content_block_start",
+									index: ev.contentIndex,
+									content_block: { type: "thinking", thinking: "" },
+								}),
+							);
+							break;
+						}
+						case "thinking_delta":
+							controller.enqueue(
+								sseFrame("content_block_delta", {
+									type: "content_block_delta",
+									index: ev.contentIndex,
+									delta: { type: "thinking_delta", thinking: ev.delta },
+								}),
+							);
+							break;
+						case "thinking_end": {
+							const c = ev.partial.content[ev.contentIndex];
+							if (c?.type === "thinking" && c.thinkingSignature) {
+								controller.enqueue(
+									sseFrame("content_block_delta", {
+										type: "content_block_delta",
+										index: ev.contentIndex,
+										delta: { type: "signature_delta", signature: c.thinkingSignature },
+									}),
+								);
+							}
+							closeBlock(ev.contentIndex);
+							break;
+						}
+						case "toolcall_start": {
+							emitServerToolBlocksBefore(ev.partial, ev.contentIndex);
+							ensureStart(ev.partial);
+							const tc = ev.partial.content[ev.contentIndex] as ToolCall | undefined;
+							open.set(ev.contentIndex, { index: ev.contentIndex, kind: "tool_use" });
+							controller.enqueue(
+								sseFrame("content_block_start", {
+									type: "content_block_start",
+									index: ev.contentIndex,
+									content_block: {
+										type: "tool_use",
+										id: tc?.id ?? "",
+										name: tc?.name ?? "",
+										input: {},
+									},
+								}),
+							);
+							break;
+						}
+						case "toolcall_delta":
+							controller.enqueue(
+								sseFrame("content_block_delta", {
+									type: "content_block_delta",
+									index: ev.contentIndex,
+									delta: { type: "input_json_delta", partial_json: ev.delta },
+								}),
+							);
+							break;
+						case "toolcall_end":
+							closeBlock(ev.contentIndex);
+							break;
+						case "done": {
+							for (const idx of [...open.keys()]) closeBlock(idx);
+							emitServerToolBlocksBefore(ev.message, ev.message.content.length);
+							controller.enqueue(
+								sseFrame("message_delta", {
+									type: "message_delta",
+									// TODO: surface matched stop sequence once pi-ai
+									// propagates it on the `done` event.
+									delta: { stop_reason: mapStopReasonOut(ev.reason), stop_sequence: null },
+									usage: encodeUsage(ev.message),
+								}),
+							);
+							controller.enqueue(sseFrame("message_stop", { type: "message_stop" }));
+							controller.close();
+							return;
+						}
+						case "error": {
+							const msg = ev.error.errorMessage ?? "stream error";
+							controller.enqueue(
+								sseFrame("error", { type: "error", error: { type: "api_error", message: msg } }),
+							);
+							controller.close();
+							return;
+						}
 					}
-					if ("partial" in ev) noteRoutedModel(ev.partial.model);
-					if ("message" in ev) noteRoutedModel(ev.message.model);
-
-					// Terminal events must release any held content (force start with the
-					// best-known model) so clients still get a coherent SSE envelope when
-					// routing never arrives.
-					if (ev.type === "done" || ev.type === "error") {
-						if (ev.type === "done") ensureStart(ev.message);
-						if (flushPending()) return;
-						if (processEvent(ev) === "return") return;
-						continue;
-					}
-
-					const deferring = !started && deferStartForCursorAuto(effectiveModelId);
-					if (deferring) {
-						// Skip bare start; buffer everything else until routing lands.
-						if (ev.type !== "start") pendingWhileRouting.push(ev);
-						continue;
-					}
-
-					if (flushPending()) return;
-					if (processEvent(ev) === "return") return;
 				}
-				if (flushPending()) return;
 				// Stream ended without an explicit done: emit a complete envelope
 				// (message_start + message_delta carrying a stop_reason) so strict
 				// clients don't reject the response as a protocol error.
-				ensureStart(undefined);
-				for (const idx of Array.from(open.keys())) closeBlock(idx);
+				ensureStart(lastPartial);
+				for (const idx of [...open.keys()]) closeBlock(idx);
 				controller.enqueue(
 					sseFrame("message_delta", {
 						type: "message_delta",
 						delta: { stop_reason: "end_turn", stop_sequence: null },
-						usage: ZERO_WIRE_USAGE,
+						usage: lastPartial ? encodeUsage(lastPartial) : ZERO_WIRE_USAGE,
 					}),
 				);
 				controller.enqueue(sseFrame("message_stop", { type: "message_stop" }));

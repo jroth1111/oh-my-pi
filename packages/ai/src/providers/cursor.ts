@@ -1,7 +1,6 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import http2 from "node:http2";
-import { classifyModel } from "@oh-my-pi/pi-catalog/compat/taxonomy";
 import type {
 	ConversationStep,
 	CursorRule,
@@ -161,6 +160,7 @@ import {
 	toJson,
 } from "@oh-my-pi/pi-catalog/discovery/protobuf";
 import { THINKING_EFFORTS } from "@oh-my-pi/pi-catalog/effort";
+import { isKimiK3ModelId, parseOpenAIModel } from "@oh-my-pi/pi-catalog/identity";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import {
 	$env,
@@ -212,10 +212,9 @@ import { deterministicUuid } from "../utils/deterministic-id";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { connectProxiedSocket, getProxyForUrl } from "../utils/proxy";
 import { createRequestDebugSession, isRequestDebugEnabled, type RequestDebugResponseLog } from "../utils/request-debug";
-import { sanitizeSchemaForCursor, toolWireSchema } from "../utils/schema/wire";
+import { toolWireSchema } from "../utils/schema/wire";
 import { getNamedToolChoiceName } from "../utils/tool-choice";
 import { formatConnectEndStreamError } from "./connect-error-detail";
-import mcpExternalHandoffMessage from "./cursor-external-tool-handoff.md" with { type: "text" };
 import {
 	buildMcpStateResult,
 	buildNeutralHookResult,
@@ -374,8 +373,6 @@ export interface CursorOptions extends StreamOptions {
 	conversationId?: string;
 	execHandlers?: CursorExecHandlers;
 	onToolResult?: CursorToolResultHandler;
-	/** Treat unhandled MCP calls as accepted handoffs to an external executor. */
-	externalToolExecutor?: boolean;
 	/** Wire model id selected after thinking-effort routing (`resolveWireModelId`). */
 	wireModelId?: string;
 	/**
@@ -681,7 +678,7 @@ function streamCursorWithWireMode(
 			const signal = options?.signal;
 			while (inFlightDispatches.size > 0) {
 				if (signal?.aborted) return;
-				const settled = Promise.all(inFlightDispatches);
+				const settled = Promise.all([...inFlightDispatches]);
 				if (!signal) {
 					await settled;
 					continue;
@@ -765,10 +762,7 @@ function streamCursorWithWireMode(
 			const { requestBytes, conversationState } = builtRequest;
 			serializedFallbackWireModelId = builtRequest.fallbackWireModelId;
 			conversationStateCache.set(conversationId, conversationState);
-			const requestContextTools = buildMcpToolDefinitions(
-				context.tools,
-				model.requiresCursorToolSchemaProjection === true,
-			);
+			const requestContextTools = buildMcpToolDefinitions(context.tools);
 			const requestContextRules = buildCursorRequestContextRules(context.systemPrompt);
 			// Auto mode may request wire id "default" while output.model stays the
 			// selected catalog id (or "auto"). Track the request intent so routed
@@ -2257,10 +2251,7 @@ async function handleExecServerMessage(
 				execHandlers?.mcp?.bind(execHandlers),
 				onToolResult,
 				toolResult => buildMcpResultFromToolResult(mcpCall, toolResult),
-				_reason =>
-					externalToolExecutor && !execHandlers?.mcp
-						? buildMcpExternalHandoffResult()
-						: buildMcpToolNotFoundResult(mcpCall),
+				_reason => buildMcpToolNotFoundResult(mcpCall),
 				error => buildMcpErrorResult(error),
 				synthesizeMcp ? { toolCallId: mcpCall.toolCallId, toolName: mcpCall.toolName } : null,
 			);
@@ -4419,27 +4410,6 @@ function buildMcpResultFromToolResult(_mcpCall: CursorMcpCall, toolResult: ToolR
 	});
 }
 
-const MCP_EXTERNAL_HANDOFF_MESSAGE = mcpExternalHandoffMessage.trim();
-
-function buildMcpExternalHandoffResult() {
-	return create(McpResultSchema, {
-		result: {
-			case: "success",
-			value: create(McpSuccessSchema, {
-				content: [
-					create(McpToolResultContentItemSchema, {
-						content: {
-							case: "text",
-							value: create(McpTextContentSchema, { text: MCP_EXTERNAL_HANDOFF_MESSAGE }),
-						},
-					}),
-				],
-				isError: false,
-			}),
-		},
-	});
-}
-
 function buildMcpToolNotFoundResult(mcpCall: CursorMcpCall) {
 	return create(McpResultSchema, {
 		result: {
@@ -4478,7 +4448,7 @@ export function mergeCursorMcpToolCallArgs(
 	streamed: Record<string, unknown> | undefined,
 	completion: Record<string, unknown> | undefined,
 ): Record<string, unknown> {
-	const merged: Record<string, unknown> = { ...streamed };
+	const merged: Record<string, unknown> = { ...(streamed ?? {}) };
 	if (!completion) return merged;
 	for (const [key, completionValue] of Object.entries(completion)) {
 		const streamedValue = merged[key];
@@ -4968,7 +4938,7 @@ export function processInteractionUpdate(
 	} else if (updateCase === "turnEnded") {
 		output.stopReason = "stop";
 		if (
-			classifyModel("cursor", output.model).family === "k3" &&
+			isKimiK3ModelId(output.model) &&
 			!output.content.some(item => item.type === "thinking" && item.thinking.length > 0)
 		) {
 			logger.warn(
@@ -4984,9 +4954,6 @@ export function processInteractionUpdate(
 		const modelId = typeof routed?.modelId === "string" ? routed.modelId.trim() : "";
 		if (modelId) {
 			output.model = modelId;
-			// Explicit signal for auth-gateway SSE: do not treat repeated
-			// `partial.model` observations as proof routing completed.
-			stream.push({ type: "routed_model", model: modelId, partial: output });
 		}
 	} else if (updateCase === "tokenDelta") {
 		const tokenDelta = update.message.value;
@@ -5025,7 +4992,6 @@ function handleConversationCheckpointUpdate(
 				?.modelName;
 			if (modelName) {
 				output.model = modelName;
-				stream?.push({ type: "routed_model", model: modelName, partial: output });
 				break;
 			}
 		} catch {
@@ -5108,10 +5074,7 @@ function isJsonValue(value: unknown): value is JsonValue {
 	return true;
 }
 
-export function buildMcpToolDefinitions(
-	tools: Tool[] | undefined,
-	requiresCursorToolSchemaProjection = false,
-): McpToolDefinition[] {
+export function buildMcpToolDefinitions(tools: Tool[] | undefined): McpToolDefinition[] {
 	if (!tools || tools.length === 0) {
 		return [];
 	}
@@ -5131,8 +5094,7 @@ export function buildMcpToolDefinitions(
 	const forwarded = writeTool ? [...advertisedTools, writeTool] : advertisedTools;
 
 	return forwarded.map(tool => {
-		const wireSchema = toolWireSchema(tool);
-		const jsonSchema = requiresCursorToolSchemaProjection ? sanitizeSchemaForCursor(wireSchema) : wireSchema;
+		const jsonSchema = toolWireSchema(tool);
 		const schemaValue: JsonValue =
 			jsonSchema !== null && !Array.isArray(jsonSchema) && isJsonValue(jsonSchema)
 				? jsonSchema
@@ -5221,7 +5183,7 @@ type CursorRootPromptAssistantContentPart =
 function canReplayCursorThinking(msg: AssistantMessage, targetModelId: string | undefined): boolean {
 	return (
 		targetModelId !== undefined &&
-		classifyModel("cursor", targetModelId).family === "k3" &&
+		isKimiK3ModelId(targetModelId) &&
 		msg.api === "cursor-agent" &&
 		msg.provider === "cursor" &&
 		msg.model === targetModelId
@@ -5269,7 +5231,7 @@ function assertCursorKimiK3HistoryReplayable(
 	activeUserMessageIndex: number,
 	targetModelId: string | undefined,
 ): void {
-	if (!targetModelId || classifyModel("cursor", targetModelId).family !== "k3") return;
+	if (!targetModelId || !isKimiK3ModelId(targetModelId)) return;
 	const historyEnd = activeUserMessageIndex >= 0 ? activeUserMessageIndex : messages.length;
 	const missingThinkingTurns: number[] = [];
 	const newlyWarnedKeys: string[] = [];
@@ -5728,12 +5690,7 @@ function resolveCursorWireModel(
 	const match = /^(.*)-(minimal|low|medium|high|xhigh|max)(-fast)?$/.exec(wireModelId);
 	const base = match?.[1];
 	const effort = match?.[2];
-	if (
-		base &&
-		effort &&
-		(THINKING_EFFORTS as readonly string[]).includes(effort) &&
-		classifyModel("cursor", base).class === "openai"
-	) {
+	if (base && effort && (THINKING_EFFORTS as readonly string[]).includes(effort) && parseOpenAIModel(base) !== null) {
 		return {
 			modelId: `${base}${match[3] ?? ""}`,
 			parameters: [create(RequestedModel_ModelParameterbytesSchema, { id: "reasoning", value: effort })],
@@ -5882,11 +5839,6 @@ async function buildGrpcRequestForWireMode(
 		modelDetails,
 		requestedModel,
 		conversationId: state.conversationId,
-		clientSupportsInlineImages: options?.cursorClientSupportsInlineImages === true,
-		clientSupportsRoutedModelUpdate: options?.cursorClientSupportsRoutedModelUpdate === true,
-		clientSupportsPromptContextUsageRpc: options?.cursorClientSupportsPromptContextUsageRpc === true,
-		runId: options?.cursorRunId ?? "",
-		agentSessionId: options?.cursorAgentSessionId ?? "",
 	});
 
 	// Apply customSystemPrompt BEFORE the hook so the onPayload replacement is the

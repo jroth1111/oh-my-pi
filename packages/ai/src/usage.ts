@@ -51,6 +51,11 @@ export interface UsageScope {
 	projectId?: string;
 	orgId?: string;
 	modelId?: string;
+	/**
+	 * Model family token (e.g. "claude", "gemini"). Distinct from `modelId`,
+	 * which identifies a specific model rather than the family it belongs to.
+	 */
+	modelFamily?: string;
 	tier?: string;
 	windowId?: string;
 	shared?: boolean;
@@ -409,15 +414,6 @@ export interface CredentialRankingStrategy {
 	 * block written under one scope is invisible to requests and to healing.
 	 */
 	blockScopes?(context?: CredentialRankingContext): string[];
-	/**
-	 * Backoff scopes a fresh usage report can vouch for, each with the limits
-	 * gating it. {@link AuthStorage} clears a stale block under a returned scope
-	 * once every listed limit is below exhaustion, so a 429 whose retry-after
-	 * overstated the real reset does not sideline a recovered account until the
-	 * clock runs out. Scopes not returned expire by clock only. Codex heals
-	 * through its meter metadata instead and omits this.
-	 */
-	healableBlockScopes?(report: UsageReport): { blockScope: string; limits: UsageLimit[] }[];
 	/** Fallback window durations (ms) when limits don't specify durationMs. */
 	windowDefaults: {
 		primaryMs: number;

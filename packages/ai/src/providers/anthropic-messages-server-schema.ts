@@ -115,23 +115,6 @@ const systemBlockSchema = type({
 	"cache_control?": cacheControlSchema,
 });
 
-const toolReferenceSchema = type({
-	type: "'tool_reference'",
-	name: "string >= 1",
-});
-
-const toolAdditionBlockSchema = type({
-	type: "'tool_addition'",
-	tool: toolReferenceSchema,
-});
-
-const toolRemovalBlockSchema = type({
-	type: "'tool_removal'",
-	tool: toolReferenceSchema,
-});
-
-const systemMessageBlockSchema = systemBlockSchema.or(toolAdditionBlockSchema).or(toolRemovalBlockSchema);
-
 export const systemSchema = type("string").or(systemBlockSchema.array()).or("undefined");
 
 // ─── Messages ──────────────────────────────────────────────────────────────
@@ -154,11 +137,7 @@ export const userMessageSchema = type({
 
 export const systemMessageSchema = type({
 	role: "'system'",
-	content: type("string").or(systemMessageBlockSchema.array()),
-	"clear_at?": "'never' | 'next_user_message'",
-	"output_config?": {
-		"effort?": "'low' | 'medium' | 'high' | 'xhigh' | 'max'",
-	},
+	content: type("string").or(systemBlockSchema.array()),
 });
 
 export const assistantMessageSchema = type({
@@ -175,7 +154,6 @@ export const toolSchema = type({
 	"description?": "string",
 	input_schema: { "[string]": "unknown" },
 	"cache_control?": cacheControlSchema,
-	"defer_loading?": "boolean",
 });
 
 // ─── Tool choice ───────────────────────────────────────────────────────────
@@ -206,15 +184,10 @@ export const toolChoiceSchema = type({
 // suppresses reasoning even on models that default it on; `adaptive` lets the
 // provider pick the budget on the fly. Extra hints (`display: "omitted"`, …)
 // are accepted but ignored on the translate path.
-const blockBindingSchema = type({
-	prefix_mismatch_behavior: "'drop_block' | 'error'",
-});
-
 export const thinkingConfigSchema = type({
 	type: "'enabled'",
 	budget_tokens: "number",
 	"display?": "unknown",
-	"block_binding?": blockBindingSchema,
 })
 	.or({
 		type: "'disabled'",
@@ -224,7 +197,6 @@ export const thinkingConfigSchema = type({
 		type: "'adaptive'",
 		"budget_tokens?": "number",
 		"display?": "unknown",
-		"block_binding?": blockBindingSchema,
 	});
 
 const taskBudgetSchema = type({

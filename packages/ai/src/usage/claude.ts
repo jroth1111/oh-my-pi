@@ -1,5 +1,5 @@
 import { scheduler } from "node:timers/promises";
-import { classifyModel } from "@oh-my-pi/pi-catalog/compat/taxonomy";
+import { bareModelId, parseAnthropicModel } from "@oh-my-pi/pi-catalog/identity";
 import { toNumber } from "@oh-my-pi/pi-catalog/utils";
 import * as AIError from "../error";
 import { claudeCodeVersion } from "../providers/claude-code-fingerprint";
@@ -706,8 +706,7 @@ export const claudeUsageProvider: UsageProvider = {
 function getClaudeModelKind(context: CredentialRankingContext | undefined): ClaudeModelKind | undefined {
 	const modelId = context?.modelId;
 	if (!modelId) return undefined;
-	const family = classifyModel("anthropic", modelId).family;
-	return family === "opus" || family === "sonnet" || family === "fable" || family === "mythos" ? family : undefined;
+	return parseAnthropicModel(bareModelId(modelId))?.kind;
 }
 
 /**

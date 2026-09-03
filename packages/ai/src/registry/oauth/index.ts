@@ -2,9 +2,7 @@
 // High-level API
 // ============================================================================
 
-import { authPolicyFor } from "@oh-my-pi/pi-catalog/compat/auth";
 import * as AIError from "../../error";
-import { jwtExpiryMs, NEVER_EXPIRES } from "../engine/common";
 import { getProviderDefinition, PROVIDER_REGISTRY } from "../registry";
 import type {
 	OAuthCredentials,
@@ -86,7 +84,19 @@ export async function refreshOAuthToken(
 	// don't expire) return the credentials unchanged.
 	return def.refreshToken ? def.refreshToken(credentials, signal) : credentials;
 }
-const JWT_EXPIRY_SKEW_MS = 5 * 60_000;
+function getPerplexityJwtExpiryMs(token: string): number | undefined {
+	const parts = token.split(".");
+	if (parts.length !== 3) return undefined;
+	const payload = parts[1];
+	if (!payload) return undefined;
+	try {
+		const decoded = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as { exp?: unknown };
+		if (typeof decoded.exp !== "number" || !Number.isFinite(decoded.exp)) return undefined;
+		return decoded.exp * 1000 - 5 * 60_000;
+	} catch {
+		return undefined;
+	}
+}
 
 /**
  * Build API-key bytes for a provider from an already-fresh OAuth credential.
@@ -109,16 +119,14 @@ export async function getOAuthApiKey(
 		return null;
 	}
 
-	const policy = authPolicyFor(provider);
-	const jwtOrNever = policy?.expiry === "jwt-or-never";
-	if (jwtOrNever) {
-		// Session JWTs (Perplexity) usually omit `exp` (server-side sessions).
-		// Trust the JWT claim when present; otherwise treat the credential as
-		// non-expiring rather than honoring a stale stored `expires` (older
-		// logins wrote loginTime+1h).
+	if (provider === "perplexity") {
+		// Perplexity JWTs usually omit `exp` (server-side sessions). Trust the JWT
+		// claim when present; otherwise treat the credential as non-expiring rather
+		// than honoring a stale stored `expires` (older logins wrote loginTime+1h).
+		const NEVER_EXPIRES = 8.64e15;
 		const normalizedExpires =
 			creds.expires > 0 && creds.expires < 10_000_000_000 ? creds.expires * 1000 : creds.expires;
-		const jwtExpiry = jwtExpiryMs(creds.access, JWT_EXPIRY_SKEW_MS);
+		const jwtExpiry = getPerplexityJwtExpiryMs(creds.access);
 		const expires = jwtExpiry ?? Math.max(normalizedExpires, NEVER_EXPIRES);
 		if (expires !== creds.expires) {
 			creds = { ...creds, expires };
@@ -132,8 +140,8 @@ export async function getOAuthApiKey(
 	// trigger a `__remote__`-against-real-provider failure that gets classified
 	// as `invalid_grant` and disables the row. Refuse loudly instead.
 	if (Date.now() >= creds.expires) {
-		if (jwtOrNever) {
-			const jwtExpiry = jwtExpiryMs(creds.access, JWT_EXPIRY_SKEW_MS);
+		if (provider === "perplexity") {
+			const jwtExpiry = getPerplexityJwtExpiryMs(creds.access);
 			if (jwtExpiry && Date.now() < jwtExpiry) {
 				const fallbackCredentials = { ...creds, expires: jwtExpiry };
 				return { newCredentials: fallbackCredentials, apiKey: fallbackCredentials.access };
@@ -144,21 +152,24 @@ export async function getOAuthApiKey(
 			{ kind: "validation", provider },
 		);
 	}
-	// Providers declaring `api-key-format "structured"` need request-time
-	// credential metadata, so the API key is the JSON-encoded credential.
-	const apiKey =
-		policy?.apiKeyFormat === "structured"
-			? JSON.stringify({
-					apiEndpoint: creds.apiEndpoint,
-					token: creds.access,
-					enterpriseUrl: creds.enterpriseUrl,
-					projectId: creds.projectId,
-					refreshToken: creds.refresh,
-					expiresAt: creds.expires,
-					email: creds.email,
-					accountId: creds.accountId,
-				})
-			: creds.access;
+	// For providers that need request-time credential metadata, return JSON.
+	const needsStructuredApiKey =
+		provider === "github-copilot" ||
+		provider === "google-gemini-cli" ||
+		provider === "google-antigravity" ||
+		provider === "alibaba-coding-plan";
+	const apiKey = needsStructuredApiKey
+		? JSON.stringify({
+				apiEndpoint: creds.apiEndpoint,
+				token: creds.access,
+				enterpriseUrl: creds.enterpriseUrl,
+				projectId: creds.projectId,
+				refreshToken: creds.refresh,
+				expiresAt: creds.expires,
+				email: creds.email,
+				accountId: creds.accountId,
+			})
+		: creds.access;
 	return { newCredentials: creds, apiKey };
 }
 

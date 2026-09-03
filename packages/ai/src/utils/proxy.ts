@@ -196,7 +196,7 @@ function wrapFetchWithProxyUrl(fetchImpl: FetchImpl, proxyUrl: string | undefine
 			return fetchImpl(input, init);
 		}
 
-		const mergedInit = { ...init, proxy: proxyUrl };
+		const mergedInit = { ...(init ?? {}), proxy: proxyUrl };
 		return fetchImpl(input, mergedInit);
 	};
 
@@ -299,6 +299,7 @@ export async function connectProxiedSocket(
 	const { promise, resolve, reject } = Promise.withResolvers<tls.TLSSocket>();
 
 	const readyEvent = useProxySsl ? "secureConnect" : "connect";
+	let rawSocket: net.Socket | undefined;
 	let tunnelSocket: tls.TLSSocket | undefined;
 	let timeout: NodeJS.Timeout | undefined;
 	let responseData = "";
@@ -413,7 +414,7 @@ export async function connectProxiedSocket(
 		timeout.unref?.();
 	}
 
-	const rawSocket = useProxySsl
+	rawSocket = useProxySsl
 		? tls.connect({
 				host: proxyHost,
 				port: proxyPort,

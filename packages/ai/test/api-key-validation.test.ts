@@ -7,11 +7,8 @@ import {
 	validateApiKeyAgainstModelsEndpoint,
 	validateOpenAICompatibleApiKey,
 } from "../src/registry/api-key-validation";
-import { getProviderDefinition } from "../src/registry/registry";
+import { loginQianfan } from "../src/registry/qianfan";
 import type { FetchImpl } from "../src/types";
-
-const loginQianfan = getProviderDefinition("qianfan")?.login;
-if (!loginQianfan) throw new Error("Qianfan login is not registered");
 
 type Validator = (fetch: FetchImpl) => Promise<void>;
 

@@ -12,12 +12,12 @@ export interface ExecutionState {
 	routeId: string;
 	generation: number;
 	attemptedTargets: ReadonlySet<string>;
+	attemptedCredentials: ReadonlySet<number>;
 	retryCount: number;
 	fallbackCount: number;
 	committed: boolean;
 	currentTarget: string;
-	/** True after a sibling-credential retry for the current target failed. */
-	siblingsExhausted?: boolean;
+	siblingsExhausted: boolean;
 }
 
 /**
@@ -27,9 +27,6 @@ export interface ExecutionState {
 type ConductorRoute = CompiledRoute & {
 	targets: readonly string[];
 	fallbacks: Readonly<Partial<Record<GatewayErrorDisposition, readonly string[]>>>;
-	fallbackByTarget?: Readonly<
-		Partial<Record<string, Readonly<Partial<Record<GatewayErrorDisposition, readonly string[]>>>>>
-	>;
 };
 
 function firstUnused(ids: readonly string[] | undefined, attempted: ReadonlySet<string>): string | undefined {
@@ -38,18 +35,6 @@ function firstUnused(ids: readonly string[] | undefined, attempted: ReadonlySet<
 		if (!attempted.has(id)) return id;
 	}
 	return undefined;
-}
-
-function fallbackTargets(
-	route: ConductorRoute,
-	currentTarget: string,
-	disposition: GatewayErrorDisposition,
-): readonly string[] | undefined {
-	const byTarget = route.fallbackByTarget;
-	if (byTarget && Object.keys(byTarget).length > 0) {
-		return byTarget[currentTarget]?.[disposition];
-	}
-	return route.fallbacks[disposition];
 }
 
 /**
@@ -61,8 +46,9 @@ export function decideAttempt(args: {
 	state: ExecutionState;
 	classification?: GatewayErrorClassification;
 	commitState: StreamCommitState;
+	preferredTargetId?: string;
 }): ConductorAction {
-	const { state, classification, commitState } = args;
+	const { state, classification, commitState, preferredTargetId } = args;
 	const route = args.route as ConductorRoute;
 
 	if (commitState !== "probing" || state.committed) {
@@ -70,7 +56,12 @@ export function decideAttempt(args: {
 	}
 
 	if (!classification) {
-		const next = firstUnused(route.targets, state.attemptedTargets);
+		const next =
+			preferredTargetId !== undefined &&
+			route.targets.includes(preferredTargetId) &&
+			!state.attemptedTargets.has(preferredTargetId)
+				? preferredTargetId
+				: firstUnused(route.targets, state.attemptedTargets);
 		return next === undefined ? { type: "terminal" } : { type: "dispatch", targetModelId: next };
 	}
 
@@ -94,7 +85,11 @@ export function decideAttempt(args: {
 		case "provider_unavailable":
 		case "model_unavailable":
 		case "context_overflow": {
-			const next = firstUnused(fallbackTargets(route, state.currentTarget, disposition), state.attemptedTargets);
+			// Stay inside the disposition's compiled fallback list. Falling through
+			// to firstUnused(route.targets) would bypass the tree (e.g. retry a
+			// small model on context_overflow, or any unused leaf after a
+			// preferred-later failure).
+			const next = firstUnused(route.fallbacks[disposition], state.attemptedTargets);
 			return next === undefined ? { type: "terminal" } : { type: "fallback_target", targetModelId: next };
 		}
 		default: {

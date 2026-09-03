@@ -201,21 +201,14 @@ describe("getCopilotPremiumMultiplier", () => {
 });
 
 describe("buildCopilotDynamicHeaders", () => {
-	it("uses Copilot CLI identity for user-initiated requests", () => {
+	it("uses model multiplier for user-initiated requests", () => {
 		const { headers, premiumRequests } = buildCopilotDynamicHeaders({
 			messages: [],
 			hasImages: false,
 			premiumMultiplier: 0.33,
 		});
-		expect(headers).toEqual({
-			"User-Agent": "copilot/1.0.82",
-			"Editor-Version": "copilot/1.0.82",
-			"Copilot-Integration-Id": "copilot-developer-cli",
-			"Copilot-Harness-Id": "copilot-sdk",
-			"Openai-Intent": "conversation-agent",
-			"X-Initiator": "user",
-			"X-Interaction-Type": "conversation-user",
-		});
+		expect(headers["X-Initiator"]).toBe("user");
+		expect(headers["Openai-Intent"]).toBe("conversation-edits");
 		expect(premiumRequests).toBe(0.33);
 	});
 
@@ -257,19 +250,6 @@ describe("buildCopilotDynamicHeaders", () => {
 		).toBe(1);
 	});
 
-	it("infers agent initiation when bundled model headers are present", () => {
-		const model = getBundledModel("github-copilot", "gpt-4o");
-		const { headers, premiumRequests } = buildCopilotDynamicHeaders({
-			messages: [{ role: "tool", tool_call_id: "call_abc123", content: "done" }],
-			hasImages: false,
-			premiumMultiplier: 3,
-			headers: model.headers,
-		});
-		expect(headers["X-Initiator"]).toBe("agent");
-		expect(headers["X-Interaction-Type"]).toBe("conversation-agent");
-		expect(premiumRequests).toBe(0);
-	});
-
 	it("preserves explicit initiator override over inferred value and sets 0 premium requests for agent", () => {
 		const { headers, premiumRequests } = buildCopilotDynamicHeaders({
 			messages: [
@@ -284,8 +264,7 @@ describe("buildCopilotDynamicHeaders", () => {
 			initiatorOverride: "agent",
 		});
 		expect(headers["X-Initiator"]).toBe("agent");
-		expect(headers["Openai-Intent"]).toBe("conversation-agent");
-		expect(headers["X-Interaction-Type"]).toBe("conversation-agent");
+		expect(headers["Openai-Intent"]).toBe("conversation-edits");
 		expect(premiumRequests).toBe(0);
 	});
 
@@ -296,8 +275,7 @@ describe("buildCopilotDynamicHeaders", () => {
 			premiumMultiplier: 3,
 		});
 		expect(headers["X-Initiator"]).toBe("user");
-		expect(headers["Openai-Intent"]).toBe("conversation-agent");
-		expect(headers["X-Interaction-Type"]).toBe("conversation-user");
+		expect(headers["Openai-Intent"]).toBe("conversation-edits");
 		expect(headers["Copilot-Vision-Request"]).toBe("true");
 		expect(premiumRequests).toBe(3);
 	});

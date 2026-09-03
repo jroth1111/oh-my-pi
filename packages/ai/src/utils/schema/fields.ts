@@ -104,7 +104,7 @@ export const NON_STRUCTURAL_SCHEMA_KEYS: Record<string, true> = {
 	title: true,
 	$comment: true,
 	if: true,
-	// oxlint-disable-next-line unicorn/no-thenable -- JSON Schema keyword
+	// biome-ignore lint/suspicious/noThenProperty: JSON Schema keyword
 	then: true,
 	else: true,
 	not: true,

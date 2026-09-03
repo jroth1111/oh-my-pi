@@ -89,7 +89,7 @@ export interface AuthBrokerServerHandle {
 function json(status: number, body: unknown, headers?: Record<string, string>): Response {
 	return new Response(JSON.stringify(body), {
 		status,
-		headers: { "Content-Type": "application/json", ...headers },
+		headers: { "Content-Type": "application/json", ...(headers ?? {}) },
 	});
 }
 
@@ -260,9 +260,9 @@ class GenerationGate {
 	}
 
 	#wake(generation: number): void {
-		for (const [waitingFor, waiters] of Array.from(this.#waiters)) {
+		for (const [waitingFor, waiters] of [...this.#waiters]) {
 			if (generation <= waitingFor) continue;
-			for (const resolve of Array.from(waiters)) resolve();
+			for (const resolve of [...waiters]) resolve();
 		}
 	}
 }
@@ -352,7 +352,6 @@ function projectCredentialBlocksForLegacyClient(blocks: readonly CredentialBlock
 			blockScope: "shared",
 			blockedUntilMs: Math.max(shared?.blockedUntilMs ?? 0, block.blockedUntilMs),
 			...(updatedAtMs !== undefined ? { updatedAtMs } : {}),
-			...(block.retryAfter === true || shared?.retryAfter === true ? { retryAfter: true } : {}),
 		};
 	}
 	if (shared) projected.push(shared);
@@ -372,7 +371,6 @@ function buildCredentialBlockGroups(
 			blockScope: block.blockScope,
 			blockedUntilMs: block.blockedUntilMs,
 			updatedAtMs: block.updatedAtMs,
-			...(block.retryAfter === true ? { retryAfter: true } : {}),
 		};
 		const existing = byCredentialId.get(block.credentialId);
 		if (existing) {
@@ -590,7 +588,7 @@ function serveSnapshotStream(
 						generation: snapshot.generation,
 					});
 				}
-				for (const id of Array.from(lastByCredId.keys())) {
+				for (const id of [...lastByCredId.keys()]) {
 					if (seenIds.has(id)) continue;
 					lastByCredId.delete(id);
 					const payload: SnapshotStreamRemovedEvent = {

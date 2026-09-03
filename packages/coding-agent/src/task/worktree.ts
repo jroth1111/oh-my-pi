@@ -933,7 +933,7 @@ export async function commitToBranch(
 export interface MergeBranchResult {
 	merged: string[];
 	/** Branches whose revision loop finished (includes all-empty cherry-picks). */
-	processed: string[];
+	processed?: string[];
 	failed: string[];
 	conflict?: string;
 	/** Set when cherry-picks landed on HEAD but restoring the stashed working tree failed. */

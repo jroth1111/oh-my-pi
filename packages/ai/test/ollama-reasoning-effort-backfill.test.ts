@@ -16,9 +16,12 @@ function abortedSignal(): AbortSignal {
 }
 
 describe("ollama effort ladder normalization reaches the Responses wire", () => {
-	it("resolves Ollama's provider ladder and sends native max on the wire", async () => {
-		// Ollama's provider policy owns the low/medium/high/max wire vocabulary,
-		// so requests at the top tier serialize `max` verbatim.
+	it("normalizes a stale ollama spec and sends native max on the wire", async () => {
+		// A cached/custom spec from before the wire-exact ladder existed:
+		// reasoning-capable with `minimal` offered. buildModel must normalize
+		// the ladder to Ollama's low/medium/high/max vocabulary so requests at
+		// the top tier serialize `max` verbatim (HTTP 400 `invalid reasoning
+		// value: "minimal"` was the historical failure of the stale surface).
 		const model = buildModel({
 			id: "gemma4:e4b",
 			name: "gemma4:e4b",
@@ -30,6 +33,7 @@ describe("ollama effort ladder normalization reaches the Responses wire", () => 
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 			contextWindow: 128_000,
 			maxTokens: 8_192,
+			thinking: { mode: "effort", efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High] },
 		});
 
 		// The stale `minimal` tier is gone; selecting it clamps to the floor.

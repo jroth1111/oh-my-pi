@@ -1,5 +1,4 @@
 import { Buffer } from "node:buffer";
-import { quotaTierFor } from "@oh-my-pi/pi-catalog/compat/behavior";
 import { toNumber } from "@oh-my-pi/pi-catalog/utils";
 import { USER_AGENT } from "@oh-my-pi/pi-utils";
 import type {
@@ -580,7 +579,7 @@ function scopeCodexLimitsForRequest(report: UsageReport, context?: CredentialRan
 
 /** True when the requested model spends the separate Spark meter. */
 function isCodexSparkRequest(context?: CredentialRankingContext): boolean {
-	return context?.modelId !== undefined && quotaTierFor("openai-codex", context.modelId) === "spark";
+	return (context?.modelId ?? "").toLowerCase().includes("-spark");
 }
 
 export const codexRankingStrategy: CredentialRankingStrategy = {

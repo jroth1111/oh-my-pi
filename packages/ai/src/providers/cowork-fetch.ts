@@ -1,4 +1,4 @@
-import type { IncomingMessage } from "node:http";
+import type { ClientRequest, IncomingMessage } from "node:http";
 import * as https from "node:https";
 import * as stream from "node:stream";
 import * as tls from "node:tls";
@@ -144,6 +144,7 @@ async function sendCoworkRequest(
 	const tlsOptions = resolveTlsOptions(url, init.tls);
 	const headers = buildOrderedHeaders(url, sourceHeaders, body);
 	const result = Promise.withResolvers<Response>();
+	let request: ClientRequest | undefined;
 	const release = (): void => {
 		signal?.removeEventListener("abort", abort);
 	};
@@ -156,7 +157,7 @@ async function sendCoworkRequest(
 		signal.throwIfAborted();
 	}
 	signal?.addEventListener("abort", abort, { once: true });
-	const request = https.request(
+	request = https.request(
 		{
 			protocol: url.protocol,
 			hostname: url.hostname,

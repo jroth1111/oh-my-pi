@@ -8,6 +8,7 @@ import {
 	registerOAuthProvider,
 	unregisterOAuthProviders,
 } from "@oh-my-pi/pi-ai/registry/oauth";
+import * as anthropicOauth from "@oh-my-pi/pi-ai/registry/oauth/anthropic";
 import type { OAuthCredentials, OAuthProvider } from "@oh-my-pi/pi-ai/registry/oauth/types";
 import { getEnvApiKey } from "@oh-my-pi/pi-ai/stream";
 
@@ -93,21 +94,10 @@ describe("provider registry auth surface", () => {
 		// zenmux has no refresher → returned as-is.
 		expect(await refreshOAuthToken("zenmux", creds)).toBe(creds);
 
-		const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
-			new Response(
-				JSON.stringify({
-					access_token: "a2",
-					refresh_token: "r2",
-					expires_in: 120,
-					account: { uuid: "account", email_address: "user@example.com" },
-				}),
-				{ status: 200, headers: { "Content-Type": "application/json" } },
-			),
-		);
-		const refreshed = await refreshOAuthToken("anthropic", creds);
-		expect(refreshed.access).toBe("a2");
-		expect(refreshed.refresh).toBe("r2");
-		expect(fetchSpy).toHaveBeenCalledTimes(1);
+		const refreshed: OAuthCredentials = { refresh: "r2", access: "a2", expires: Date.now() + 120_000 };
+		const spy = vi.spyOn(anthropicOauth, "refreshAnthropicToken").mockResolvedValue(refreshed);
+		expect(await refreshOAuthToken("anthropic", creds)).toBe(refreshed);
+		expect(spy).toHaveBeenCalledWith("r");
 
 		await expect(refreshOAuthToken("nonexistent-provider" as OAuthProvider, creds)).rejects.toThrow(
 			"Unknown OAuth provider",

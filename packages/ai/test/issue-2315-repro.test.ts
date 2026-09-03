@@ -78,7 +78,7 @@ describe("issue #2315 — MiniMax M2 / GPT-OSS catalog excludes unsupported reas
 		expect(body.reasoning_effort).toBe("low");
 	});
 
-	it("resolves MiniMax M2 thinking metadata through the catalog engine before sending a request", async () => {
+	it("normalizes stale cached MiniMax M2 thinking metadata before disableReasoning sends a request", async () => {
 		const base = getBundledModel("fireworks", "minimax-m2.7") as Model<"openai-completions">;
 		const model = buildModel({
 			id: base.id,
@@ -87,6 +87,11 @@ describe("issue #2315 — MiniMax M2 / GPT-OSS catalog excludes unsupported reas
 			provider: "fireworks",
 			baseUrl: base.baseUrl,
 			reasoning: true,
+			thinking: {
+				mode: "effort",
+				efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.XHigh],
+				effortMap: { minimal: "none", xhigh: "max" },
+			},
 			input: base.input,
 			cost: base.cost,
 			contextWindow: base.contextWindow,

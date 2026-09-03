@@ -1,7 +1,11 @@
 import { type } from "@oh-my-pi/omptype";
-import { collapseVariants, type VariantCollapseTable } from "../compat/collapse";
 import type { ModelSpec } from "../types";
 import { discoveryFetch, toPositiveNumber } from "../utils";
+import {
+	ANTIGRAVITY_VARIANT_COLLAPSE_TABLE,
+	collapseEffortVariants,
+	type VariantCollapseTable,
+} from "../variant-collapse";
 import { ensureAntigravityVersion, getAntigravityUserAgent } from "../wire/gemini-headers";
 
 export const ANTIGRAVITY_PRIMARY_ENDPOINT = "https://daily-cloudcode-pa.googleapis.com";
@@ -232,10 +236,7 @@ export async function fetchAntigravityDiscoveryModels(
 		// Collapse effort-tier variants at the source so runtime discovery,
 		// the gemini-cli re-provision, and the catalog generator all see
 		// logical ids only.
-		const collapsed = collapseVariants(
-			models,
-			options.collapseTable === undefined ? undefined : { table: options.collapseTable },
-		);
+		const collapsed = collapseEffortVariants(models, options.collapseTable ?? ANTIGRAVITY_VARIANT_COLLAPSE_TABLE);
 		collapsed.sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
 		return collapsed;
 	}

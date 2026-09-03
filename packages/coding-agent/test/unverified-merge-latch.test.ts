@@ -57,6 +57,7 @@ function host(
 			continuations.count++;
 		},
 		promptGeneration: () => 1,
+		prewalkWillHandoff: () => false,
 		hasPendingAsyncWake: () => false,
 		getActiveToolNames: () => verifyTools,
 		getEnabledToolNames: () => verifyTools,

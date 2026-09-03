@@ -686,12 +686,12 @@ describe("AuthStorage OAuth login upgrade and multi-account coexistence", () => 
 				sourceId: "auth-storage-login-upgrade-test",
 				login: async () => {
 					if (!loginReturns) throw new Error("no credentials");
-					const { type: _type, ...rest } = loginReturns;
+					const { type, ...rest } = loginReturns;
 					return rest;
 				},
 				refreshToken: async () => {
 					if (!loginReturns) throw new Error("no credentials");
-					const { type: _type, ...rest } = loginReturns;
+					const { type, ...rest } = loginReturns;
 					return rest;
 				},
 			});

@@ -7,21 +7,10 @@ import { isRecord } from "../utils";
  * login / token refresh flow lives in `@oh-my-pi/pi-ai`'s registry.
  */
 
-const COPILOT_CLI_VERSION = "1.0.82";
-const COPILOT_CLI_USER_AGENT = `copilot/${COPILOT_CLI_VERSION}`;
+export const COPILOT_USER_AGENT = "opencode/1.3.15" as const;
 
-/** Headers sent by Copilot CLI to GitHub API and OAuth endpoints. */
-export const COPILOT_GITHUB_HEADERS = {
-	"User-Agent": COPILOT_CLI_USER_AGENT,
-} as const;
-
-/** Copilot CLI identity sent to the Copilot API. */
-export const COPILOT_CAPI_IDENTITY_HEADERS = {
-	...COPILOT_GITHUB_HEADERS,
-	"Editor-Version": COPILOT_CLI_USER_AGENT,
-	"Copilot-Integration-Id": "copilot-developer-cli",
-	"Copilot-Harness-Id": "copilot-sdk",
-	"Openai-Intent": "conversation-agent",
+export const OPENCODE_HEADERS = {
+	"User-Agent": COPILOT_USER_AGENT,
 } as const;
 
 /**
@@ -33,44 +22,13 @@ export const COPILOT_CAPI_IDENTITY_HEADERS = {
  * of 1M for Claude Opus). Never send this to `api.github.com` REST endpoints —
  * they validate `X-GitHub-Api-Version` against the REST version vocabulary.
  */
-export const COPILOT_API_VERSION = "2026-08-01" as const;
+export const COPILOT_API_VERSION = "2026-06-01" as const;
 
-/** Headers shared by Copilot API model requests and model definitions. */
+/** Headers for `api.githubcopilot.com` (capi) requests: discovery, chat, policy. */
 export const COPILOT_API_HEADERS = {
-	...COPILOT_CAPI_IDENTITY_HEADERS,
+	...OPENCODE_HEADERS,
 	"X-GitHub-Api-Version": COPILOT_API_VERSION,
 } as const;
-
-/** Copilot CLI headers for user-initiated model discovery. */
-export const COPILOT_DISCOVERY_HEADERS = {
-	...COPILOT_API_HEADERS,
-	"X-Initiator": "user",
-} as const;
-
-const MANAGED_COPILOT_HEADER_NAMES: Record<string, true> = {
-	"user-agent": true,
-	"editor-version": true,
-	"copilot-integration-id": true,
-	"copilot-harness-id": true,
-	"openai-intent": true,
-	"x-github-api-version": true,
-	"x-initiator": true,
-	"x-interaction-type": true,
-};
-
-/** Preserve model-specific headers while enforcing the current Copilot API identity. */
-export function mergeCopilotApiHeaders(headers?: Readonly<Record<string, string>>): Record<string, string> {
-	const merged: Record<string, string> = {};
-	if (headers) {
-		for (const name in headers) {
-			const value = headers[name];
-			if (value !== undefined && !MANAGED_COPILOT_HEADER_NAMES[name.toLowerCase()]) {
-				merged[name] = value;
-			}
-		}
-	}
-	return { ...merged, ...COPILOT_API_HEADERS };
-}
 
 type GitHubCopilotApiKeyPayload = {
 	token?: unknown;
@@ -133,7 +91,7 @@ export async function discoverGitHubCopilotApiEndpoint(
 			headers: {
 				Accept: "application/json",
 				Authorization: `token ${token}`,
-				...COPILOT_GITHUB_HEADERS,
+				...OPENCODE_HEADERS,
 			},
 			signal,
 		});

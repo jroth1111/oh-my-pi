@@ -24,27 +24,6 @@ describe("StreamCommitGate", () => {
 		expect(gate.classifyAndObserve("heartbeat", 4)).toBe("probing");
 	});
 
-	it("keeps structural Responses item/part events pre-commit", () => {
-		const gate = new StreamCommitGate();
-		expect(gate.classifyAndObserve("response.output_item.added", 40)).toBe("probing");
-		expect(gate.classifyAndObserve("response.content_part.added", 40)).toBe("probing");
-		expect(gate.classifyAndObserve("response.output_text.delta", 12)).toBe("committed");
-	});
-
-	it("keeps pi-native start pre-commit and commits on text delta", () => {
-		const gate = new StreamCommitGate();
-		expect(gate.classifyAndObserve("start", 20)).toBe("probing");
-		expect(gate.classifyAndObserve("text_start", 20)).toBe("probing");
-		expect(gate.classifyAndObserve("text_delta", 12)).toBe("committed");
-	});
-
-	it("uses downstream SSE for openai-responses and pi-native (negative: chat is upstream-fed)", () => {
-		expect(commitGateObservesDownstreamSse("openai-responses")).toBe(true);
-		expect(commitGateObservesDownstreamSse("pi-native")).toBe(true);
-		expect(commitGateObservesDownstreamSse("openai-chat")).toBe(false);
-		expect(commitGateObservesDownstreamSse("anthropic-messages")).toBe(false);
-	});
-
 	it("commits when prelude reaches 4 MiB even on metadata", () => {
 		const gate = new StreamCommitGate();
 		expect(gate.classifyAndObserve("response.created", FOUR_MIB)).toBe("committed");
@@ -76,6 +55,12 @@ describe("StreamCommitGate", () => {
 		expect(gate.classifyAndObserve("response.created", 20)).toBe("probing");
 		expect(gate.classifyAndObserve("response.failed", 20)).toBe("terminated");
 		expect(gate.state).not.toBe("committed");
+	});
+
+	it("uses downstream SSE only for openai-responses (negative: chat is upstream-fed)", () => {
+		expect(commitGateObservesDownstreamSse("openai-responses")).toBe(true);
+		expect(commitGateObservesDownstreamSse("openai-chat")).toBe(false);
+		expect(commitGateObservesDownstreamSse("anthropic-messages")).toBe(false);
 	});
 
 	it("observeSseCommit counts frame.length not chunk.byteLength (negative heartbeat steal)", async () => {
@@ -153,63 +138,6 @@ describe("holdSseUntilCommit (prelude replay buffer)", () => {
 		expect(gate.state).toBe("committed");
 	});
 
-	it("observes output-plus-terminal frames in one chunk", async () => {
-		const gate = new StreamCommitGate();
-		const held = holdSseUntilCommit(
-			sse([
-				"event: response.output_text.delta\ndata: {\"delta\":\"hi\"}\n\nevent: response.failed\ndata: {}\n\n",
-			]),
-			gate,
-		);
-		const out = await collect(held);
-		expect(out).toContain("response.output_text.delta");
-		expect(out).toContain("response.failed");
-		expect(gate.state).toBe("terminated");
-		expect(gate.sawSuccessfulTerminal).toBe(false);
-	});
-
-	it("observes terminals after commit while forwarding unchanged", async () => {
-		const gate = new StreamCommitGate();
-		const held = holdSseUntilCommit(
-			sse([
-				"event: response.output_text.delta\ndata: {\"delta\":\"hi\"}\n\n",
-				"event: response.failed\ndata: {}\n\n",
-			]),
-			gate,
-		);
-		const out = await collect(held);
-		expect(out).toContain("response.output_text.delta");
-		expect(out).toContain("response.failed");
-		expect(gate.state).toBe("terminated");
-		expect(gate.sawSuccessfulTerminal).toBe(false);
-	});
-
-	it("records sawSuccessfulTerminal only for completed/incomplete terminals", () => {
-		const ok = new StreamCommitGate();
-		ok.classifyAndObserve("response.created", 10);
-		ok.classifyAndObserve("response.completed", 10);
-		expect(ok.state).toBe("terminated");
-		expect(ok.sawSuccessfulTerminal).toBe(true);
-
-		const fail = new StreamCommitGate();
-		fail.classifyAndObserve("response.created", 10);
-		fail.classifyAndObserve("response.failed", 10);
-		expect(fail.state).toBe("terminated");
-		expect(fail.sawSuccessfulTerminal).toBe(false);
-	});
-
-	it("forwards successful terminal-only streams instead of aborting", async () => {
-		const gate = new StreamCommitGate();
-		const held = holdSseUntilCommit(
-			sse(["event: response.created\ndata: {}\n\n", "event: response.completed\ndata: {}\n\n"]),
-			gate,
-		);
-		const out = await collect(held);
-		expect(out).toContain("response.created");
-		expect(out).toContain("response.completed");
-		expect(gate.state).toBe("terminated");
-	});
-
 	it("aborts with the dead attempt's frames on a pre-commit retryable terminal", async () => {
 		const gate = new StreamCommitGate();
 		const held = holdSseUntilCommit(
@@ -226,28 +154,6 @@ describe("holdSseUntilCommit (prelude replay buffer)", () => {
 		// the dead attempt's metadata is returned to the failover loop for
 		// discarding — the replacement attempt's stream starts from byte zero
 		expect(aborted?.frames.length).toBeGreaterThan(0);
-		expect(gate.state).toBe("terminated");
-	});
-
-	it("metadata then failure never reaches the client (stream-commit contract)", async () => {
-		const gate = new StreamCommitGate();
-		const held = holdSseUntilCommit(
-			sse([
-				"event: response.created\ndata: {}\n\n",
-				"event: response.failed\ndata: {\"error\":{\"message\":\"upstream\"}}\n\n",
-			]),
-			gate,
-		);
-		let aborted: PreludeAbortedError | undefined;
-		try {
-			await collect(held);
-		} catch (error) {
-			aborted = error as PreludeAbortedError;
-		}
-		expect(aborted).toBeInstanceOf(PreludeAbortedError);
-		// Client must not observe the pre-commit failure frames; only the failover
-		// loop sees them via PreludeAbortedError.
-		expect(aborted?.frames.some(f => new TextDecoder().decode(f).includes("response.failed"))).toBe(true);
 		expect(gate.state).toBe("terminated");
 	});
 

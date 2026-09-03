@@ -1,4 +1,4 @@
-import { classifyModel } from "../compat/taxonomy";
+import { modelFamilyToken } from "./family";
 
 export type Dialect =
 	| "glm"
@@ -16,7 +16,7 @@ export type Dialect =
 export const FALLBACK_DIALECT: Dialect = "xml";
 
 export function preferredDialect(modelId: string): Dialect {
-	switch (classifyModel("", modelId, { lenient: true }).class) {
+	switch (modelFamilyToken(modelId)) {
 		case "anthropic":
 			return "anthropic";
 		case "glm":

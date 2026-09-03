@@ -122,7 +122,7 @@ describe("supportsFreeformApplyPatch", () => {
 	});
 
 	test("applyPatchToolType: function disables", () => {
-		expect(supportsFreeformApplyPatch(makeModel({ id: "gpt-4", applyPatchToolType: "function" }))).toBe(false);
+		expect(supportsFreeformApplyPatch(makeModel({ applyPatchToolType: "function" }))).toBe(false);
 	});
 
 	test("flag is the sole signal — id/baseUrl are irrelevant", () => {
@@ -131,7 +131,7 @@ describe("supportsFreeformApplyPatch", () => {
 				makeModel({ id: "gpt-4", baseUrl: "https://proxy.example/", applyPatchToolType: "freeform" }),
 			),
 		).toBe(true);
-		expect(supportsFreeformApplyPatch(makeModel({ id: "gpt-4", baseUrl: "https://api.openai.com/v1" }))).toBe(false);
+		expect(supportsFreeformApplyPatch(makeModel({ id: "gpt-5", baseUrl: "https://api.openai.com/v1" }))).toBe(false);
 	});
 });
 
@@ -155,19 +155,15 @@ describe("convertTools: freeform emission", () => {
 	});
 
 	test("falls back to function tool when flag is absent", () => {
-		const [out] = convertTools([editTool], false, makeModel({ id: "gpt-4" })) as unknown as Array<
-			Record<string, unknown>
-		>;
+		const [out] = convertTools([editTool], false, makeModel()) as unknown as Array<Record<string, unknown>>;
 		expect(out.type).toBe("function");
 		expect(out.name).toBe("edit");
 	});
 
 	test("applyPatchToolType=function explicitly disables", () => {
-		const [out] = convertTools(
-			[editTool],
-			false,
-			makeModel({ id: "gpt-4", applyPatchToolType: "function" }),
-		) as unknown as Array<Record<string, unknown>>;
+		const [out] = convertTools([editTool], false, makeModel({ applyPatchToolType: "function" })) as unknown as Array<
+			Record<string, unknown>
+		>;
 		expect(out.type).toBe("function");
 	});
 
@@ -540,7 +536,7 @@ describe("codex-backend convertTools (chatgpt.com/backend-api)", () => {
 	});
 
 	test("falls back to function tool when flag is absent", () => {
-		const [out] = convertCodexTools([editTool], makeCodexModel({ id: "gpt-4" }));
+		const [out] = convertCodexTools([editTool], makeCodexModel());
 		expect(out.type).toBe("function");
 		expect(out.name).toBe("edit");
 	});

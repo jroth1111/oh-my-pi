@@ -1,16 +1,16 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import { getProviderDefinition } from "../../../src/registry/registry";
 import {
 	buildXAICliBillingUrl,
 	extractXAIAccessTokenSubject,
 	fetchXAIOAuthIdentity,
 	getXAICliBillingHeaders,
 	isXAIAccessTokenExpiring,
+	loginXAIOAuth,
 	parseXAIAccessTokenPayload,
+	refreshXAIOAuthToken,
 	validateXAIBillingEndpoint,
 	validateXAIEndpoint,
 } from "../../../src/registry/oauth/xai-oauth";
-import type { OAuthController, OAuthCredentials } from "../../../src/registry/oauth/types";
 import type { FetchImpl } from "../../../src/types";
 
 afterEach(() => {
@@ -98,37 +98,10 @@ function createDeviceFlowFetch(
 
 function requestForm(request: RecordedRequest | undefined): URLSearchParams {
 	const body = request?.init?.body;
-	if (body instanceof URLSearchParams) return body;
-	if (typeof body === "string") return new URLSearchParams(body);
-	throw new Error("Expected an application/x-www-form-urlencoded request body");
-}
-
-function xaiProvider() {
-	const provider = getProviderDefinition("xai-oauth");
-	if (!provider?.login || !provider.refreshToken) throw new Error("expected xai-oauth provider");
-	return { login: provider.login, refreshToken: provider.refreshToken };
-}
-
-async function loginXAI(ctrl: OAuthController = {}): Promise<OAuthCredentials> {
-	if (ctrl.fetch) vi.spyOn(globalThis, "fetch").mockImplementation(ctrl.fetch as typeof fetch);
-	const result = await xaiProvider().login({
-		...ctrl,
-		onAuth: ctrl.onAuth ?? (() => {}),
-		onPrompt: ctrl.onPrompt ?? (async () => ""),
-	});
-	if (typeof result === "string") throw new Error("expected xAI OAuth credentials");
-	return result;
-}
-
-async function refreshXAI(
-	refreshToken: string,
-	fetchOverride?: FetchImpl,
-	signal?: AbortSignal,
-): Promise<OAuthCredentials> {
-	if (fetchOverride) vi.spyOn(globalThis, "fetch").mockImplementation(fetchOverride as typeof fetch);
-	const refresh = xaiProvider().refreshToken;
-	if (!refresh) throw new Error("expected xai-oauth refresh");
-	return refresh({ access: "stored-access", refresh: refreshToken, expires: 0 }, signal);
+	if (!(body instanceof URLSearchParams)) {
+		throw new Error("Expected an application/x-www-form-urlencoded request body");
+	}
+	return body;
 }
 
 describe("isXAIAccessTokenExpiring", () => {
@@ -274,7 +247,18 @@ describe("validateXAIEndpoint", () => {
 	});
 });
 
-describe("xAI OAuth refresh", () => {
+describe("refreshXAIOAuthToken", () => {
+	it("rejects an empty refresh_token without making a network call", async () => {
+		const fetchMock = vi.fn(async () => {
+			throw new Error("fetch should not be called when refresh_token is empty");
+		});
+
+		await expect(refreshXAIOAuthToken("", fetchMock as unknown as typeof fetch)).rejects.toThrow(
+			/missing refresh_token/,
+		);
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
+
 	it("persists refreshed OAuth identity from OIDC userinfo", async () => {
 		const accessToken = jwtWithPayload({ sub: "jwt-sub" });
 		const requests: RecordedRequest[] = [];
@@ -292,13 +276,16 @@ describe("xAI OAuth refresh", () => {
 			throw new Error(`Unexpected xAI OAuth request: ${url}`);
 		});
 
-		await expect(refreshXAI("old-refresh-token", fetchMock as unknown as typeof fetch)).resolves.toMatchObject({
+		await expect(
+			refreshXAIOAuthToken("old-refresh-token", fetchMock as unknown as typeof fetch),
+		).resolves.toMatchObject({
 			access: accessToken,
 			refresh: "old-refresh-token",
 			accountId: "profile-sub",
-			email: "User@Example.com",
+			email: "user@example.com",
 		});
 		expect(requests.map(request => request.url)).toEqual([DISCOVERY_URL, TOKEN_ENDPOINT, USERINFO_URL]);
+		expect(requests.find(request => request.url === TOKEN_ENDPOINT)?.init?.redirect).toBe("error");
 	});
 
 	it("binds refresh HTTP requests to the caller abort signal", async () => {
@@ -319,7 +306,7 @@ describe("xAI OAuth refresh", () => {
 			throw new Error(`Unexpected xAI OAuth request: ${url}`);
 		};
 
-		await refreshXAI("old-refresh-token", fetchMock, controller.signal);
+		await refreshXAIOAuthToken("old-refresh-token", fetchMock, controller.signal);
 		const refreshSignal = requests.find(request => request.url === TOKEN_ENDPOINT)?.init?.signal;
 		expect(refreshSignal?.aborted).toBe(false);
 
@@ -328,7 +315,7 @@ describe("xAI OAuth refresh", () => {
 	});
 });
 
-describe("xAI OAuth login", () => {
+describe("loginXAIOAuth", () => {
 	it("performs the RFC 8628 device flow and returns the issued credentials", async () => {
 		const now = 1_800_000_000_000;
 		vi.spyOn(Date, "now").mockReturnValue(now);
@@ -353,7 +340,7 @@ describe("xAI OAuth login", () => {
 			throw new Error("device authorization must not request a pasted code");
 		});
 
-		const credentials = await loginXAI({
+		const credentials = await loginXAIOAuth({
 			fetch: fetchMock,
 			onAuth,
 			onProgress,
@@ -361,17 +348,17 @@ describe("xAI OAuth login", () => {
 		});
 
 		expect(requests.map(request => request.url)).toEqual([
-			DEVICE_CODE_URL,
 			DISCOVERY_URL,
+			DEVICE_CODE_URL,
 			TOKEN_ENDPOINT,
 			USERINFO_URL,
 		]);
 
-		const discoveryRequest = requests[1];
+		const discoveryRequest = requests[0];
 		expect(discoveryRequest?.init?.method).toBe("GET");
 		expect(new Headers(discoveryRequest?.init?.headers).get("Accept")).toBe("application/json");
 
-		const deviceRequest = requests[0];
+		const deviceRequest = requests[1];
 		expect(deviceRequest?.init?.method).toBe("POST");
 		const deviceHeaders = new Headers(deviceRequest?.init?.headers);
 		expect(deviceHeaders.get("Content-Type")).toBe("application/x-www-form-urlencoded");
@@ -404,7 +391,7 @@ describe("xAI OAuth login", () => {
 		]);
 		expect(authEvents[0]?.instructions).not.toMatch(/hermes/i);
 		expect(onManualCodeInput).not.toHaveBeenCalled();
-		expect(progress).toEqual(["Requesting device authorization...", "Waiting for device authorization..."]);
+		expect(progress).toEqual(["Waiting for xAI device authorization..."]);
 		expect(credentials).toEqual({
 			access: "access-token",
 			refresh: "refresh-token",
@@ -426,11 +413,11 @@ describe("xAI OAuth login", () => {
 			},
 		]);
 
-		const credentials = await loginXAI({ fetch: fetchMock });
+		const credentials = await loginXAIOAuth({ fetch: fetchMock });
 
 		const tokenRequests = requests.filter(request => request.url === TOKEN_ENDPOINT);
 		expect(tokenRequests).toHaveLength(3);
-		expect(tokenRequests.every(request => request.init?.redirect === undefined)).toBe(true);
+		expect(tokenRequests.every(request => request.init?.redirect === "error")).toBe(true);
 		expect(tokenRequests.map(request => Object.fromEntries(requestForm(request)))).toEqual([
 			{
 				grant_type: "urn:ietf:params:oauth:grant-type:device_code",
@@ -469,7 +456,7 @@ describe("xAI OAuth login", () => {
 			{ body: { error: "userinfo unavailable" }, status: 503 },
 		);
 
-		const credentials = await loginXAI({ fetch: fetchMock, signal: controller.signal });
+		const credentials = await loginXAIOAuth({ fetch: fetchMock, signal: controller.signal });
 
 		expect(credentials).toMatchObject({
 			access: accessToken,
@@ -477,7 +464,7 @@ describe("xAI OAuth login", () => {
 			accountId: "jwt-sub",
 		});
 		expect(requests.at(-1)?.url).toBe(USERINFO_URL);
-		expect(requests.at(-1)?.init?.signal).toBe(controller.signal);
+		expect(requests.at(-1)?.init?.signal).not.toBe(controller.signal);
 	});
 
 	it("keeps the JWT subject when userinfo returns only an email", async () => {
@@ -495,9 +482,9 @@ describe("xAI OAuth login", () => {
 			{ body: { email: "User@Example.com" } },
 		);
 
-		await expect(loginXAI({ fetch: fetchMock })).resolves.toMatchObject({
+		await expect(loginXAIOAuth({ fetch: fetchMock })).resolves.toMatchObject({
 			accountId: "jwt-sub",
-			email: "User@Example.com",
+			email: "user@example.com",
 		});
 	});
 
@@ -511,7 +498,9 @@ describe("xAI OAuth login", () => {
 			},
 		]);
 
-		await expect(loginXAI({ fetch: fetchMock })).rejects.toThrow(/xai-oauth token response missing access token/);
+		await expect(loginXAIOAuth({ fetch: fetchMock })).rejects.toThrow(
+			/xAI device-code token response missing access_token/,
+		);
 		expect(requests.filter(request => request.url === TOKEN_ENDPOINT)).toHaveLength(1);
 	});
 });

@@ -5,25 +5,17 @@ export type StreamCommitState = "probing" | "committed" | "terminated";
 
 const DEFAULT_MAX_PRELUDE_BYTES = 4 * 1024 * 1024;
 
-/** Downstream SSE observer is used for Responses and pi-native; upstream onSseEvent must not also feed the gate. */
+/** Downstream SSE observer is used for Responses; upstream onSseEvent must not also feed the gate. */
 export function commitGateObservesDownstreamSse(formatLabel: string): boolean {
-	return formatLabel === "openai-responses" || formatLabel === "pi-native";
+	return formatLabel === "openai-responses";
 }
 
 const METADATA_EVENTS: Record<string, true> = {
 	"response.created": true,
 	"response.in_progress": true,
 	"response.queued": true,
-	"response.output_item.added": true,
-	"response.content_part.added": true,
-	message_start: true,
 	heartbeat: true,
 	ping: true,
-	// Pi-native encoder emits a synthetic `start` before any assistant content.
-	start: true,
-	text_start: true,
-	thinking_start: true,
-	toolcall_start: true,
 };
 
 /**
@@ -37,7 +29,6 @@ export class StreamCommitGate {
 	#maxPreludeBytes: number;
 	#prelude: Uint8Array[] = [];
 	#preludeBytes = 0;
-	#sawSuccessfulTerminal = false;
 
 	constructor(maxPreludeBytes: number = DEFAULT_MAX_PRELUDE_BYTES) {
 		this.#maxPreludeBytes = maxPreludeBytes;
@@ -47,18 +38,12 @@ export class StreamCommitGate {
 		return this.#state;
 	}
 
-	/** True once a successful terminal (`response.completed` / `incomplete`) was observed. */
-	get sawSuccessfulTerminal(): boolean {
-		return this.#sawSuccessfulTerminal;
-	}
-
 	/** Reset to probing for the next fallback attempt (clears prelude). */
 	reset(): void {
 		this.#state = "probing";
 		this.#bytes = 0;
 		this.#prelude = [];
 		this.#preludeBytes = 0;
-		this.#sawSuccessfulTerminal = false;
 	}
 
 	classifyAndObserve(eventType: string, byteLength: number): StreamCommitState {
@@ -73,7 +58,6 @@ export class StreamCommitGate {
 		}
 
 		const kind = classifyCommitEvent(eventType);
-		if (kind === "terminal-success") this.#sawSuccessfulTerminal = true;
 		if (this.#state === "committed") {
 			// Post-commit, every terminal event ends the stream's failover
 			// eligibility — including `response.failed` (retryable elsewhere),
@@ -143,10 +127,10 @@ export class PreludeAbortedError extends Error {
 export function classifyCommitEvent(eventType: string): CommitClass {
 	if (!eventType) return "output";
 	if (METADATA_EVENTS[eventType]) return "metadata";
-	if (eventType === "response.completed" || eventType === "done") return "terminal-success";
+	if (eventType === "response.completed") return "terminal-success";
 	if (eventType === "response.failed") return "terminal-retryable";
 	if (eventType === "response.incomplete") return "terminal-success";
-	if (eventType === "response.error" || eventType === "error") return "terminal-failure";
+	if (eventType === "response.error") return "terminal-failure";
 	return "output";
 }
 
@@ -168,22 +152,10 @@ function nextSseFrame(pending: string): { frame: string; rest: string } | undefi
 
 function eventTypeFromFrame(frame: string): string {
 	let eventType = "";
-	let data = "";
 	for (const line of frame.split(/\r?\n/)) {
 		if (line.startsWith("event:")) eventType = line.slice(6).trim();
-		else if (line.startsWith("data:")) data = line.slice(5).trim();
 	}
-	if (eventType) return eventType;
-	// Pi-native frames are data-only JSON with a canonical `type` field.
-	if (data && data !== "[DONE]") {
-		try {
-			const parsed = JSON.parse(data) as { type?: unknown };
-			if (typeof parsed.type === "string") return parsed.type;
-		} catch {
-			/* ignore non-JSON data frames */
-		}
-	}
-	return "";
+	return eventType;
 }
 
 /**
@@ -206,15 +178,6 @@ export function holdSseUntilCommit(
 		new TransformStream<Uint8Array, Uint8Array>({
 			transform(chunk, controller) {
 				if (committed) {
-					// Keep observing terminals after commit so committed→terminated
-					// transitions still happen; forward bytes unchanged.
-					pending += decoder.decode(chunk, { stream: true });
-					let next = nextSseFrame(pending);
-					while (next) {
-						gate.classifyAndObserve(eventTypeFromFrame(next.frame), next.frame.length);
-						pending = next.rest;
-						next = nextSseFrame(pending);
-					}
 					controller.enqueue(chunk);
 					return;
 				}
@@ -227,62 +190,26 @@ export function holdSseUntilCommit(
 					pending = next.rest;
 					next = nextSseFrame(pending);
 					if (state === "terminated") {
-						if (committed) {
-							// Post-commit terminal in the same chunk: observation only.
-							continue;
-						}
-						if (gate.sawSuccessfulTerminal) {
-							// Metadata-only success (created → completed/incomplete):
-							// flush the held prelude and finish without failover.
-							committed = true;
-							for (const held of gate.takePrelude() ?? []) controller.enqueue(held);
-							if (!buffered) controller.enqueue(chunk);
-						const kind = classifyCommitEvent(eventType);
-						if (kind === "terminal-success") {
-							// Empty/metadata-only successful completions still need held frames flushed.
-							// Empty/metadata-only successful completions still need their held frames flushed.
-							return;
-						}
-						// Dead attempt: its held frames belong to it and are never
-						// forwarded. The failover loop catches PreludeAbortedError,
-						// discards them, and dispatches a replacement attempt.
 						throw new PreludeAbortedError(gate.takePrelude() ?? [], eventType);
 					}
 					if (state === "committed") {
 						committed = true;
 						for (const held of gate.takePrelude() ?? []) controller.enqueue(held);
-						// Cap-crossing chunk was refused by bufferPrelude — still emit it.
 						if (!buffered) controller.enqueue(chunk);
-						// Keep parsing sibling frames in this chunk (e.g. output+failed)
-						// so the gate can still transition committed→terminated.
-						continue;
+						return;
 					}
 				}
-				if (!buffered && !committed) {
-						return;
 				if (!buffered) {
-					// Cap crossed without a commit event in this chunk: force commit and
-					// keep the rejected chunk so the SSE stream is not corrupted.
+					// Cap crossed: force commit observation and keep the rejected chunk.
 					gate.classifyAndObserve("response.output_item.added", chunk.byteLength);
 					committed = true;
 					for (const held of gate.takePrelude() ?? []) controller.enqueue(held);
 					controller.enqueue(chunk);
 				}
 			},
-			flush(controller) {
-				// Truncated tail without commit: drain the buffered prelude as a
-				// metadata-only commit so a holding consumer receives the upstream
-				// bytes instead of an empty successful stream.
-				if (!committed) {
-					committed = true;
-					gate.classifyAndObserve("response.completed", 0);
-				// Truncated / metadata-only EOF: commit and drain the held prelude so
-				// the client receives the frames instead of a silent empty success.
-				if (!committed && gate.state === "probing") {
-					gate.classifyAndObserve("", 0);
-				}
-					for (const held of gate.takePrelude() ?? []) controller.enqueue(held);
-				}
+			flush() {
+				// truncated tail without commit: treat as metadata-only commit so
+				// a holding consumer never stalls
 			},
 		}),
 	);

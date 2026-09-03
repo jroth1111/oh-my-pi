@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -12,34 +12,19 @@ afterEach(() => {
 });
 
 describe("auth-gateway RouteRegistry wiring", () => {
-	it("dispatches a registered virtual route to its compiled entry target", async () => {
-	it("dispatches a registered virtual route to its compiled target", async () => {
+	it("resolves the client model id through RouteRegistry before dispatch", async () => {
 		registerMockApi();
 		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gw-route-wire-"));
 		const storage = await AuthStorage.create(path.join(dir, "auth.db"));
 		storage.setRuntimeApiKey("openrouter", "test-key");
-		const mock = createMockModel({ provider: "openrouter", id: "mock/route-wire-target" });
-		mock.push({ content: ["from-virtual-route"] });
-		const registry = new RouteRegistry(id => {
-			if (id === "mock/route-wire-target") return mock.model;
-			return undefined;
-		});
-		registry.register({
-			id: "virtual/route-wire",
-			root: { type: "target", model: "mock/route-wire-target" },
-		const concrete = createMockModel({ provider: "openrouter", id: "concrete/route-wire" });
-		concrete.push({ content: ["ok"] });
-		const resolveModel = (id: string) => (id === "concrete/route-wire" ? concrete.model : undefined);
-		const registry = new RouteRegistry(resolveModel);
-			root: { type: "target", model: "concrete/route-wire" },
-		});
+		const mock = createMockModel({ provider: "openrouter", id: "mock/route-wire" });
+		mock.push({ content: ["ok"] });
+		const resolve = spyOn(RouteRegistry.prototype, "resolve");
 		const handle = startAuthGateway({
 			bind: "127.0.0.1:0",
 			bearerTokens: ["t"],
 			storage,
-			resolveModel: id => (id === "mock/route-wire-target" ? mock.model : undefined),
-			resolveModel,
-			routeRegistry: registry,
+			resolveModel: () => mock.model,
 			version: "test",
 		});
 		try {
@@ -47,39 +32,31 @@ describe("auth-gateway RouteRegistry wiring", () => {
 				method: "POST",
 				headers: { "Content-Type": "application/json", Authorization: "Bearer t" },
 				body: JSON.stringify({
-					model: "virtual/route-wire",
+					model: "mock/route-wire",
 					messages: [{ role: "user", content: "hi" }],
 					stream: false,
 				}),
 			});
 			expect(res.status).toBe(200);
-			const body = (await res.json()) as {
-				choices?: Array<{ message?: { content?: string } }>;
-			};
-			expect(body.choices?.[0]?.message?.content).toContain("from-virtual-route");
-			expect(mock.calls.length).toBe(1);
-			expect(concrete.calls.length).toBe(1);
-			const body = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
-			expect(body.choices?.[0]?.message?.content).toBe("ok");
+			expect(resolve.mock.calls.some(call => call[0] === "mock/route-wire")).toBe(true);
 		} finally {
+			resolve.mockRestore();
 			await handle.close();
 			storage.close();
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
 
-	it("404s when the virtual route id is not registered (negative)", async () => {
+	it("does not resolve when the model field is missing (negative)", async () => {
 		registerMockApi();
 		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gw-route-wire-miss-"));
 		const storage = await AuthStorage.create(path.join(dir, "auth.db"));
-		const resolveModel = () => undefined;
-		const registry = new RouteRegistry(resolveModel);
+		const resolve = spyOn(RouteRegistry.prototype, "resolve");
 		const handle = startAuthGateway({
 			bind: "127.0.0.1:0",
 			bearerTokens: ["t"],
 			storage,
-			resolveModel,
-			routeRegistry: registry,
+			resolveModel: () => undefined,
 			version: "test",
 		});
 		try {
@@ -87,13 +64,13 @@ describe("auth-gateway RouteRegistry wiring", () => {
 				method: "POST",
 				headers: { "Content-Type": "application/json", Authorization: "Bearer t" },
 				body: JSON.stringify({
-					model: "virtual/missing",
 					messages: [{ role: "user", content: "hi" }],
 				}),
 			});
 			expect(res.status).toBe(400);
-			expect(res.status).toBe(404);
+			expect(resolve.mock.calls.length).toBe(0);
 		} finally {
+			resolve.mockRestore();
 			await handle.close();
 			storage.close();
 			await fs.rm(dir, { recursive: true, force: true });

@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { isEnoent } from "@oh-my-pi/pi-utils";
-import { $, type Server } from "bun";
+import { $ } from "bun";
 import {
 	getBehaviorDashboardStats,
 	getCostDashboardStats,
@@ -30,7 +30,6 @@ import {
 	STATS_DASHBOARD_HOSTNAME_HEADER,
 	STATS_DASHBOARD_SECURITY_VERSION,
 } from "./port-conflict";
-import { buildSessionTrace, getTraceEntry, listSessionSummaries, TRACE_ETAG_VERSION, TracePathError } from "./trace";
 
 const EMBEDDED_CLIENT_ARCHIVE = decodeEmbeddedClientArchive(embeddedClientArchiveTxt);
 
@@ -283,41 +282,6 @@ export async function handleApi(req: Request): Promise<Response> {
 		const stats = await getGainDashboardStats(range, project);
 		return Response.json(stats);
 	}
-	if (path === "/api/sessions") {
-		const limitParam = Number(url.searchParams.get("limit") ?? "100");
-		const limit = Number.isFinite(limitParam) && limitParam > 0 ? Math.floor(limitParam) : 100;
-		const q = url.searchParams.get("q") ?? undefined;
-		return Response.json(await listSessionSummaries(limit, q));
-	}
-
-	if (path === "/api/session/trace") {
-		const file = url.searchParams.get("file");
-		if (!file) return Response.json({ error: "file required" }, { status: 400 });
-		try {
-			const trace = await buildSessionTrace(file);
-			const etag = `"${TRACE_ETAG_VERSION}:${trace.mtimeMs}"`;
-			if (req.headers.get("if-none-match") === etag) return new Response(null, { status: 304 });
-			return Response.json(trace, { headers: { ETag: etag } });
-		} catch (err) {
-			if (err instanceof TracePathError) return Response.json({ error: err.message }, { status: 400 });
-			if (isEnoent(err)) return Response.json({ error: "session not found" }, { status: 404 });
-			throw err;
-		}
-	}
-
-	if (path === "/api/session/entry") {
-		const file = url.searchParams.get("file");
-		const id = url.searchParams.get("id");
-		if (!file || !id) return Response.json({ error: "file and id required" }, { status: 400 });
-		try {
-			const entry = await getTraceEntry(file, id);
-			if (!entry) return Response.json({ error: "entry not found" }, { status: 404 });
-			return Response.json({ entry });
-		} catch (err) {
-			if (err instanceof TracePathError) return Response.json({ error: err.message }, { status: 400 });
-			throw err;
-		}
-	}
 
 	return new Response("Not Found", { status: 404 });
 }
@@ -350,7 +314,7 @@ export function formatStatsDashboardUrl(hostname: string, port: number): string 
 	return `http://${urlHostname}:${port}`;
 }
 
-function createDashboardServer(port: number, hostname: string): Server<undefined> {
+function createDashboardServer(port: number, hostname: string) {
 	const server = Bun.serve({
 		port,
 		hostname,
@@ -403,44 +367,23 @@ function createDashboardServer(port: number, hostname: string): Server<undefined
 /**
  * Start the HTTP server, reusing a live dashboard or reclaiming a stale omp listener.
  */
-export interface StatsServerHandle {
-	hostname: string;
-	port: number;
-	stop: () => void;
-}
-
-// Dashboards this process already bound, keyed by requested `hostname:port`.
-// A second in-process start (e.g. `/trace` twice in one session) must return
-// the live handle: probing our own port can time out under load and would
-// then dead-end in the reclaim path's self-PID guard.
-const activeServers = new Map<string, StatsServerHandle>();
-
-export async function startServer(port = 3847, hostname = STATS_DASHBOARD_HOSTNAME): Promise<StatsServerHandle> {
-	const activeKey = `${hostname}:${port}`;
-	if (port !== 0) {
-		const active = activeServers.get(activeKey);
-		if (active) return active;
-	}
+export async function startServer(
+	port = 3847,
+	hostname = STATS_DASHBOARD_HOSTNAME,
+): Promise<{ hostname: string; port: number; stop: () => void }> {
 	await ensureClientBuild();
 	const preparation = await prepareStatsPort(port, hostname);
 	if (preparation === "reuse") {
 		return { hostname, port, stop: () => {} };
 	}
-	const register = (server: Server<undefined>): StatsServerHandle => {
-		const handle: StatsServerHandle = {
-			hostname,
-			port: server.port ?? port,
-			stop: () => {
-				activeServers.delete(activeKey);
-				server.stop();
-			},
-		};
-		if (port !== 0) activeServers.set(activeKey, handle);
-		return handle;
-	};
 
 	try {
-		return register(createDashboardServer(port, hostname));
+		const server = createDashboardServer(port, hostname);
+		return {
+			hostname,
+			port: server.port ?? port,
+			stop: () => server.stop(),
+		};
 	} catch (error) {
 		if (!(error instanceof Error && "code" in error && error.code === "EADDRINUSE")) throw error;
 
@@ -450,7 +393,12 @@ export async function startServer(port = 3847, hostname = STATS_DASHBOARD_HOSTNA
 		}
 
 		try {
-			return register(createDashboardServer(port, hostname));
+			const server = createDashboardServer(port, hostname);
+			return {
+				hostname,
+				port: server.port ?? port,
+				stop: () => server.stop(),
+			};
 		} catch (retryError) {
 			throw new Error(`Failed to start stats dashboard on ${hostname}:${port} after reclaiming it.`, {
 				cause: retryError,

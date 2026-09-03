@@ -151,9 +151,6 @@ export function wrapInbandToolStream(
 					case "toolcall_end":
 						projector?.nativeToolEnd(event.contentIndex, event.toolCall);
 						break;
-					case "routed_model":
-						out.push(event);
-						break;
 					case "done":
 						projector ??= new InbandStreamProjector(out, tools, dialect, event.message, true);
 						projector.finish(event.message, true);
@@ -370,9 +367,6 @@ class InbandStreamProjector {
 					break;
 				case "thinkingEnd":
 					this.thinkingEnd();
-					break;
-				case "impliedThinkingEnd":
-					// Dialect scanners never emit this; only the leaked-thinking healer does.
 					break;
 				case "toolStart":
 					this.#beginTool(event);

@@ -45,6 +45,7 @@
  * three guarded attempts and then fail closed. Disable detection with
  * `PI_NO_THINKING_LOOP_GUARD=1`.
  */
+import { modelFamilyToken } from "@oh-my-pi/pi-catalog/identity";
 import { logger } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
 import type { Api, AssistantMessage, Model, StreamOptions } from "../types";
@@ -109,19 +110,23 @@ const CONCRETE_ANCHOR =
 	/`[^`]+`|\b\w{2,}\.[a-zA-Z]\w{0,4}\b|[\w-]+(?:\/[\w-]+){2,}|\b\w+_\w+\b|\b[a-z]+[A-Z]\w*\b|\b[A-Z][a-z]+[A-Z]\w*\b/g;
 
 /**
- * True when resolved compatibility policy enables semantic loop heuristics for
- * this model. Exact suffix-cycle detection applies to every enabled model
- * independently of this predicate.
+ * True when `model.id` belongs to a family guarded by the semantic loop
+ * heuristics: Gemini, DeepSeek, or Grok. Exact suffix-cycle detection applies to
+ * every enabled model independently of this predicate.
+ *
+ * Model identity is derived only from its id; provider and compatibility metadata
+ * do not opt opaque aliases into semantic detection.
  */
 export function isLoopGuardedModel(model: Model<Api>, options?: StreamOptions): boolean {
 	if (options?.loopGuard?.enabled === false) return false;
-	const compat = model.compat;
-	if (compat !== undefined) return "thinkingLoopGuard" in compat && compat.thinkingLoopGuard !== undefined;
-	// Custom API surfaces resolve no compat record, so the KDL `thinking-loop-guard`
-	// axis cannot land on them; fall back to the class facts the axis encodes
-	// (classes/{gemini,deepseek,xai}.kdl).
-	const cls = model.identity?.class;
-	return cls === "gemini" || cls === "deepseek" || cls === "xai";
+	switch (modelFamilyToken(model.id)) {
+		case "gemini":
+		case "deepseek":
+		case "grok":
+			return true;
+		default:
+			return false;
+	}
 }
 
 /**
@@ -187,7 +192,7 @@ export class ThinkingLoopDetector {
 				return null;
 			}
 			// An over-long segment is chunked so each piece stays comparable.
-			for (let rest = raw; rest.length > 0;) {
+			for (let rest = raw; rest.length > 0; ) {
 				const chunk = rest.length > SEGMENT_CHAR_CAP ? rest.slice(0, SEGMENT_CHAR_CAP) : rest;
 				rest = rest.slice(chunk.length);
 				const hit = this.#consumeSegment(chunk);
@@ -304,7 +309,7 @@ export class ThinkingLoopDetector {
  * real narration runaway burns dozens-to-hundreds of titles, so this still trips
  * fast on the actual pathology.
  */
-export const GEMINI_HEADER_RUNAWAY_THRESHOLD = 36;
+export const GEMINI_HEADER_RUNAWAY_THRESHOLD = 24;
 
 /**
  * True when a single trimmed line is a Gemini reasoning-summary title: a markdown
@@ -478,7 +483,7 @@ export function withThinkingLoopGuard<
 	const controller = new AbortController();
 	const caller = options?.signal;
 	const signal = caller ? AbortSignal.any([caller, controller.signal]) : controller.signal;
-	const merged = { ...options, signal } as O;
+	const merged = { ...(options ?? {}), signal } as O;
 	return guardThinkingLoopStream(dispatch(merged), model, controller, options);
 }
 

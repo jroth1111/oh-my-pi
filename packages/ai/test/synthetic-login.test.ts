@@ -1,8 +1,6 @@
 import { describe, expect, it, vi } from "bun:test";
-import { getProviderDefinition } from "@oh-my-pi/pi-ai/registry/registry";
+import { loginSynthetic } from "@oh-my-pi/pi-ai/registry/synthetic";
 import type { FetchImpl } from "@oh-my-pi/pi-ai/types";
-
-const loginSynthetic = getProviderDefinition("synthetic")!.login!;
 
 describe("synthetic login", () => {
 	it("validates API keys against the models endpoint instead of a deprecated model", async () => {

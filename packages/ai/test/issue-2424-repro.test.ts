@@ -12,20 +12,10 @@
  * @see https://github.com/can1357/oh-my-pi/issues/2424
  */
 import { afterEach, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
-import { getProviderDefinition } from "@oh-my-pi/pi-ai/registry";
-import type { OAuthCredentials, OAuthLoginCallbacks } from "@oh-my-pi/pi-ai/registry/oauth/types";
+import { loginGitLabDuo, refreshGitLabDuoToken } from "@oh-my-pi/pi-ai/registry/oauth/gitlab-duo";
 import type { FetchImpl } from "@oh-my-pi/pi-ai/types";
 
 const BUNDLED_CLIENT_ID = "da4edff2e6ebd2bc3208611e2768bc1c1dd7be791dc5ff26ca34ca9ee44f7d4b";
-const provider = getProviderDefinition("gitlab-duo");
-const login = (callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials | string> => {
-	if (!provider?.login) throw new Error("gitlab-duo login is unavailable");
-	return provider.login(callbacks);
-};
-const refresh = (credentials: OAuthCredentials): Promise<OAuthCredentials> => {
-	if (!provider?.refreshToken) throw new Error("gitlab-duo refresh is unavailable");
-	return provider.refreshToken(credentials);
-};
 
 function tokenResponse(): Response {
 	return new Response(
@@ -72,7 +62,7 @@ describe("gitlab-duo OAuth env overrides (issue #2424)", () => {
 		});
 
 		let capturedAuthUrl = "";
-		const credentials = await login({
+		const credentials = await loginGitLabDuo({
 			onAuth: info => {
 				capturedAuthUrl = info.url;
 			},
@@ -91,7 +81,6 @@ describe("gitlab-duo OAuth env overrides (issue #2424)", () => {
 		expect(tokenBodies[0].get("redirect_uri")).toBe("http://127.0.0.1:0/oauth-cb");
 		expect(tokenBodies[0].get("code")).toBe("auth-code-xyz");
 		expect(tokenBodies[0].get("grant_type")).toBe("authorization_code");
-		if (typeof credentials === "string") throw new Error("expected structured credentials");
 		expect(credentials.access).toBe("access-token");
 	});
 
@@ -99,7 +88,7 @@ describe("gitlab-duo OAuth env overrides (issue #2424)", () => {
 		const fetchMock: FetchImpl = vi.fn(async () => tokenResponse());
 
 		let capturedAuthUrl = "";
-		await login({
+		await loginGitLabDuo({
 			onAuth: info => {
 				capturedAuthUrl = info.url;
 			},
@@ -125,13 +114,13 @@ describe("gitlab-duo OAuth env overrides (issue #2424)", () => {
 	it("rejects an unparseable GITLAB_REDIRECT_URI without leaking the bundled client id", async () => {
 		process.env.GITLAB_REDIRECT_URI = "not a uri";
 		await expect(
-			login({
+			loginGitLabDuo({
 				onAuth: () => {},
 				onManualCodeInput: async () => "x",
 				onPrompt: async () => "",
 				signal: AbortSignal.timeout(1_000),
 			}),
-		).rejects.toThrow(/Invalid redirect URI override/);
+		).rejects.toThrow(/Invalid GITLAB_REDIRECT_URI/);
 	});
 
 	it("rejects HTTPS loopback GITLAB_REDIRECT_URI before opening browser auth", async () => {
@@ -139,13 +128,13 @@ describe("gitlab-duo OAuth env overrides (issue #2424)", () => {
 		const onAuth = vi.fn();
 
 		await expect(
-			login({
+			loginGitLabDuo({
 				onAuth,
 				onManualCodeInput: async () => "x",
 				onPrompt: async () => "",
 				signal: AbortSignal.timeout(1_000),
 			}),
-		).rejects.toThrow(/Loopback redirect URI overrides must use http:\/\//);
+		).rejects.toThrow(/loopback callbacks must use http:\/\//);
 
 		expect(onAuth).not.toHaveBeenCalled();
 	});
@@ -160,7 +149,7 @@ describe("gitlab-duo OAuth env overrides (issue #2424)", () => {
 		}) as typeof globalThis.fetch);
 
 		try {
-			await refresh({
+			await refreshGitLabDuoToken({
 				access: "old-access",
 				refresh: "old-refresh",
 				expires: Date.now() + 60_000,

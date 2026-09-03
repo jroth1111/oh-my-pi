@@ -5,7 +5,6 @@ import {
 	Cpu,
 	Folder,
 	LayoutDashboard,
-	ListTree,
 	Plug,
 	Smile,
 	TrendingUp,
@@ -16,7 +15,6 @@ import type React from "react";
 export type DashboardSection =
 	| "overview"
 	| "requests"
-	| "traces"
 	| "errors"
 	| "models"
 	| "providers"
@@ -43,11 +41,6 @@ export const routes: DashboardRoute[] = [
 		id: "requests",
 		label: "Requests",
 		icon: Activity,
-	},
-	{
-		id: "traces",
-		label: "Traces",
-		icon: ListTree,
 	},
 	{
 		id: "errors",

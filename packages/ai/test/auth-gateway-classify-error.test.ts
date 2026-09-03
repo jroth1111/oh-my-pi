@@ -1,6 +1,5 @@
 import { describe, expect, it } from "bun:test";
 import { classifyGatewayError, isRetryableGatewayDisposition } from "@oh-my-pi/pi-ai/error";
-import * as AIError from "@oh-my-pi/pi-ai/error";
 
 describe("auth-gateway classifyGatewayError", () => {
 	it("honours an explicit numeric `status` property on the error", () => {
@@ -172,6 +171,31 @@ describe("auth-gateway classifyGatewayError", () => {
 		expect(c.disposition).not.toBe("credential_transient");
 	});
 
+	it("maps 403 cyber_policy Trusted Access denials to policy_terminal, not credential_transient", () => {
+		const c = classifyGatewayError(
+			Object.assign(
+				new Error(
+					"Codex error event: This content was flagged for possible cybersecurity risk. Join Trusted Access for Cyber. (code=cyber_policy)",
+				),
+				{ status: 403 },
+			),
+		);
+		expect(c.status).toBe(403);
+		expect(c.owner).toBe("policy");
+		expect(c.disposition).toBe("policy_terminal");
+		expect(isRetryableGatewayDisposition(c.disposition)).toBe(false);
+		expect(c.disposition).not.toBe("credential_transient");
+	});
+
+	it("maps structured cyber_policy code on 403 to policy_terminal even with a bland message", () => {
+		const c = classifyGatewayError(
+			Object.assign(new Error("Forbidden"), { status: 403, code: "cyber_policy" }),
+		);
+		expect(c.owner).toBe("policy");
+		expect(c.disposition).toBe("policy_terminal");
+		expect(c.disposition).not.toBe("credential_transient");
+	});
+
 	it("maps provider-wide 429 to provider_transient rather than credential_quota", () => {
 		const c = classifyGatewayError(Object.assign(new Error("service overloaded"), { status: 429 }));
 		expect(c.status).toBe(429);
@@ -208,31 +232,6 @@ describe("auth-gateway classifyGatewayError", () => {
 		expect(c.owner).toBe("provider");
 		expect(c.disposition).toBe("provider_unavailable");
 	});
-
-	it("maps status-less cyber_policy wording to policy_terminal before synthetic 502", () => {
-		const result = classifyGatewayError(
-			"Codex error event: This content was flagged for possible cybersecurity risk. Join Trusted Access for Cyber. (code=cyber_policy)",
-		);
-		expect(result.disposition).toBe("policy_terminal");
-		expect(result.owner).toBe("policy");
-	});
-
-	it("maps model-does-not-exist wording to model_unavailable", () => {
-		const result = classifyGatewayError(
-			Object.assign(new Error("The model does not exist or you do not have access to it."), { status: 404 }),
-		);
-		expect(result.disposition).toBe("model_unavailable");
-		expect(result.owner).toBe("model");
-	});
-
-	it("maps 400 model-not-supported wording to model_unavailable", () => {
-		const result = classifyGatewayError(
-			Object.assign(new Error("The requested model is not supported"), { status: 400 }),
-		);
-		expect(result.disposition).toBe("model_unavailable");
-		expect(result.owner).toBe("model");
-	});
-
 });
 
 describe("classifyGatewayError authoritative-status precedence", () => {
@@ -260,137 +259,5 @@ describe("classifyGatewayError authoritative-status precedence", () => {
 		const c = classifyGatewayError(new Error("API error (400): prompt is too long: context length exceeded"));
 		expect(c.owner).toBe("request");
 		expect(c.disposition).toBe("context_overflow");
-	});
-
-	it("keeps structurally flagged content blocks terminal even without policy wording", () => {
-		const err = AIError.attach(
-			new Error("upstream rejected the generation"),
-			AIError.create(AIError.Flag.ContentBlocked),
-		);
-		const c = classifyGatewayError(err);
-		expect(c.owner).toBe("policy");
-		expect(c.disposition).toBe("policy_terminal");
-		expect(isRetryableGatewayDisposition(c.disposition)).toBe(false);
-	});
-
-	it("treats ProviderResponseError content-blocked kind as policy_terminal", () => {
-		const err = new AIError.ProviderResponseError("safety", {
-			provider: "test",
-			kind: "content-blocked",
-		});
-		const c = classifyGatewayError(err);
-		expect(c.owner).toBe("policy");
-		expect(c.disposition).toBe("policy_terminal");
-	});
-
-	it("does not rebrand an authoritative 5xx as gateway_terminal from body wording alone", () => {
-		const c = classifyGatewayError(
-			Object.assign(new Error("HTTP 503: internal invariant reported by upstream"), { status: 503 }),
-		);
-		expect(c.status).toBe(503);
-		expect(c.owner).toBe("provider");
-		expect(c.disposition).toBe("provider_unavailable");
-		expect(c.disposition).not.toBe("gateway_terminal");
-	});
-
-	it("keeps ordinary 429 throttles in the provider lane", () => {
-		const c = classifyGatewayError(Object.assign(new Error("Too many requests"), { status: 429 }));
-		expect(c.owner).toBe("provider");
-		expect(c.disposition).toBe("provider_transient");
-		expect(c.disposition).not.toBe("credential_transient");
-		expect(c.disposition).not.toBe("credential_quota");
-	});
-
-	it("does not assign credential_quota for informative non-billing 402 bodies", () => {
-		const c = classifyGatewayError(
-			Object.assign(new Error("A subscription is required for this endpoint"), { status: 402 }),
-		);
-		expect(c.disposition).not.toBe("credential_quota");
-		expect(c.owner).toBe("provider");
-		expect(c.disposition).toBe("provider_transient");
-	});
-});
-
-describe("classifyGatewayError review follow-ups", () => {
-	it("does not let abort wording override an authoritative provider status", () => {
-		const c = classifyGatewayError(Object.assign(new Error("HTTP 503: upstream request aborted"), { status: 503 }));
-		expect(c.status).toBe(503);
-		expect(c.owner).toBe("provider");
-		expect(c.disposition).not.toBe("cancelled");
-	});
-
-	it("keeps no-status overflow evidence terminal instead of provider_unavailable", () => {
-		const c = classifyGatewayError(new Error("prompt is too long: context length exceeded"));
-		expect(c.disposition).toBe("context_overflow");
-		expect(c.disposition).not.toBe("provider_unavailable");
-	});
-});
-
-describe("classifyGatewayError policy before auth", () => {
-	it("maps 403 cyber_policy Trusted Access denials to policy_terminal", () => {
-		const c = classifyGatewayError(
-			Object.assign(
-				new Error(
-					"Codex error event: This content was flagged for possible cybersecurity risk. Join Trusted Access for Cyber. (code=cyber_policy)",
-				),
-				{ status: 403 },
-			),
-		);
-		expect(c.owner).toBe("policy");
-		expect(c.disposition).toBe("policy_terminal");
-	});
-});
-
-describe("classifyGatewayError review follow-ups", () => {
-	it("does not let abort wording override an authoritative provider status", () => {
-		const c = classifyGatewayError(Object.assign(new Error("HTTP 503: upstream request aborted"), { status: 503 }));
-		expect(c.status).toBe(503);
-		expect(c.owner).toBe("provider");
-		expect(c.disposition).not.toBe("cancelled");
-	});
-
-	it("keeps no-status overflow evidence terminal instead of provider_unavailable", () => {
-		const c = classifyGatewayError(new Error("prompt is too long: context length exceeded"));
-		expect(c.disposition).toBe("context_overflow");
-		expect(c.disposition).not.toBe("provider_unavailable");
-	});
-});
-
-describe("classifyGatewayError review follow-ups", () => {
-	it("does not let abort wording override an authoritative provider status", () => {
-		const c = classifyGatewayError(Object.assign(new Error("HTTP 503: upstream request aborted"), { status: 503 }));
-		expect(c.status).toBe(503);
-		expect(c.owner).toBe("provider");
-		expect(c.disposition).not.toBe("cancelled");
-	});
-
-	it("keeps no-status overflow evidence terminal instead of provider_unavailable", () => {
-		const c = classifyGatewayError(new Error("prompt is too long: context length exceeded"));
-		expect(c.disposition).toBe("context_overflow");
-		expect(c.disposition).not.toBe("provider_unavailable");
-	});
-});
-
-describe("classifyGatewayError review follow-ups", () => {
-	it("does not let abort wording override an authoritative provider status", () => {
-		const c = classifyGatewayError(Object.assign(new Error("HTTP 503: upstream request aborted"), { status: 503 }));
-		expect(c.status).toBe(503);
-		expect(c.owner).toBe("provider");
-		expect(c.disposition).not.toBe("cancelled");
-	});
-
-	it("keeps no-status overflow evidence terminal instead of provider_unavailable", () => {
-		const c = classifyGatewayError(new Error("prompt is too long: context length exceeded"));
-		expect(c.disposition).toBe("context_overflow");
-		expect(c.disposition).not.toBe("provider_unavailable");
-	});
-});
-
-describe("classifyGatewayError model availability", () => {
-	it("maps OpenAI-style model-does-not-exist 404 to model_unavailable", () => {
-		const classified = classifyGatewayError(
-			Object.assign(new Error("The model `gpt-nope` does not exist or you do not have access to it"), { status: 404 }),
-		);
-		expect(classified.disposition).toBe("model_unavailable");
 	});
 });

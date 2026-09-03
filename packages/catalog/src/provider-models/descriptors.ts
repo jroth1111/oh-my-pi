@@ -9,7 +9,6 @@ import type { ModelManagerConfig, ProviderCatalogEntry, ProviderDescriptor } fro
 import { googleModelManagerOptions, googleVertexModelManagerOptions } from "./google";
 import { ollamaCloudModelManagerOptions } from "./ollama";
 import {
-	abliterationModelManagerOptions,
 	aiandModelManagerOptions,
 	aimlApiModelManagerOptions,
 	alibabaCodingPlanModelManagerOptions,
@@ -67,19 +66,10 @@ import {
 	cursorModelManagerOptions,
 	devinModelManagerOptions,
 	gitLabDuoWorkflowModelManagerOptions,
-	grokbotModelManagerOptions,
 	zaiModelManagerOptions,
 } from "./special";
 
 export const CATALOG_PROVIDERS = [
-	{
-		id: "abliteration",
-		defaultModel: "abliterated-model",
-		envVars: ["ABLITERATION_API_KEY", "ABLIT_KEY"],
-		createModelManagerOptions: (config: ModelManagerConfig) => abliterationModelManagerOptions(config),
-		dynamicModelsAuthoritative: true,
-		catalogDiscovery: { label: "Abliteration" },
-	},
 	{
 		id: "aiand",
 		defaultModel: "moonshotai/kimi-k2.7-code",
@@ -254,17 +244,6 @@ export const CATALOG_PROVIDERS = [
 		defaultModel: "gemini-3.1-pro-preview",
 		createModelManagerOptions: (config: ModelManagerConfig) => googleVertexModelManagerOptions(config),
 		allowUnauthenticated: true,
-	},
-	{
-		id: "grokbot",
-		defaultModel: "sand-default",
-		envVars: ["GROKBOT_RENEWAL_CREDENTIAL", "SAND_INFERENCE_RENEWAL_CREDENTIAL"],
-		dynamicModelsAuthoritative: true,
-		createModelManagerOptions: (config: ModelManagerConfig) => grokbotModelManagerOptions(config),
-		catalogDiscovery: {
-			label: "Grok Bot (not Cursor, not xAI)",
-			envVars: ["GROKBOT_RENEWAL_CREDENTIAL", "SAND_INFERENCE_RENEWAL_CREDENTIAL"],
-		},
 	},
 	{
 		id: "groq",

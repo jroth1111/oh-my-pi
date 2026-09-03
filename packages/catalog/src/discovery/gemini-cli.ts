@@ -1,11 +1,15 @@
 import { type } from "@oh-my-pi/omptype";
 import type { FetchImpl } from "@oh-my-pi/pi-utils";
-import { collapseVariants, type VariantCollapseTable } from "../compat/collapse";
-import { compareRevision, parseRevision } from "../compat/revision";
-import { classifyModel } from "../compat/taxonomy";
+import { parseGeminiModel, semverGte } from "../identity/classify";
+import { isGeminiModelId } from "../identity/family";
 import { createBundledReferenceMap } from "../provider-models/bundled-references";
 import type { ModelSpec } from "../types";
 import { discoveryFetch } from "../utils";
+import {
+	collapseEffortVariants,
+	GEMINI_CLI_VARIANT_COLLAPSE_TABLE,
+	type VariantCollapseTable,
+} from "../variant-collapse";
 import { getGeminiCliHeaders } from "../wire/gemini-headers";
 
 const DEFAULT_ENDPOINT = "https://cloudcode-pa.googleapis.com";
@@ -127,11 +131,9 @@ export async function fetchGeminiCliQuotaModels(
 
 	for (const bucket of parsed.buckets ?? []) {
 		const modelId = bucket.modelId?.trim();
-		if (!modelId || seen.has(modelId)) {
+		if (!modelId || seen.has(modelId) || !isGeminiModelId(modelId)) {
 			continue;
 		}
-		const identity = classifyModel("google-gemini-cli", modelId, { lenient: true });
-		if (identity.class !== "gemini") continue;
 		seen.add(modelId);
 
 		const reference = bundled.get(modelId);
@@ -140,16 +142,14 @@ export async function fetchGeminiCliQuotaModels(
 			continue;
 		}
 
-		const revision = identity.revision === undefined ? undefined : parseRevision(identity.revision);
-		const reasoningFloor = parseRevision(REASONING_MIN_VERSION);
+		const parsedId = parseGeminiModel(modelId);
 		models.push({
 			id: modelId,
 			name: modelId,
 			api: "google-gemini-cli",
 			provider: "google-gemini-cli",
 			baseUrl: endpoint,
-			reasoning:
-				revision !== undefined && reasoningFloor !== undefined && compareRevision(revision, reasoningFloor) >= 0,
+			reasoning: parsedId ? semverGte(parsedId.version, REASONING_MIN_VERSION) : false,
 			input: ["text", "image"],
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 			contextWindow: DEFAULT_CONTEXT_WINDOW,
@@ -157,10 +157,7 @@ export async function fetchGeminiCliQuotaModels(
 		});
 	}
 
-	const collapsed = collapseVariants(
-		models,
-		options.collapseTable === undefined ? undefined : { table: options.collapseTable },
-	);
+	const collapsed = collapseEffortVariants(models, options.collapseTable ?? GEMINI_CLI_VARIANT_COLLAPSE_TABLE);
 	collapsed.sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
 	return collapsed;
 }

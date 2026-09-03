@@ -1,8 +1,9 @@
 import * as AIError from "../error";
 import type { GatewayErrorDisposition } from "../error/gateway";
 import type { Api, Model } from "../types";
+import type { AffinityLevel, StatePortability } from "./affinity";
 
-export type TargetNode = { type: "target"; model: string };
+export type TargetNode = { type: "target"; model: string; weight?: number };
 
 export type FallbackNode = {
 	type: "fallback";
@@ -10,11 +11,36 @@ export type FallbackNode = {
 	children: readonly RouteNode[];
 };
 
-export type RouteNode = TargetNode | FallbackNode;
+export type BalanceNode = {
+	type: "balance";
+	strategy: "rr" | "weighted";
+	children: readonly RouteNode[];
+};
+
+export type ConditionalNode = {
+	type: "conditional";
+	when: { vision?: boolean };
+	children: readonly RouteNode[];
+};
+
+export type DomainNode = {
+	type: "domain";
+	name: string;
+	children: readonly RouteNode[];
+};
+
+export type RouteRefNode = {
+	type: "route-ref";
+	route: string;
+};
+
+export type RouteNode = TargetNode | FallbackNode | BalanceNode | ConditionalNode | DomainNode | RouteRefNode;
 
 export interface RouteDefinition {
 	id: string;
 	root: RouteNode;
+	affinity?: AffinityLevel;
+	portability?: StatePortability;
 }
 
 export interface CompiledRoute {
@@ -23,26 +49,17 @@ export interface CompiledRoute {
 	root: RouteNode;
 	/** DFS target model ids in visit order (primary first). */
 	targets: readonly string[];
-	/**
-	 * Union of next unused target ids per disposition (listing / diagnostics).
-	 * Runtime failover uses {@link fallbackByTarget} so nested rules stay scoped.
-	 */
+	/** Next unused target ids for this disposition; empty if none. */
 	fallbacks: Readonly<Partial<Record<GatewayErrorDisposition, readonly string[]>>>;
-	/**
-	 * From-target → disposition → next targets. Nested fallback edges only apply
-	 * when the failing target is inside that fallback branch.
-	 */
-	fallbackByTarget: Readonly<
-		Partial<Record<string, Readonly<Partial<Record<GatewayErrorDisposition, readonly string[]>>>>>
-	>;
+	affinity?: AffinityLevel;
+	portability?: StatePortability;
 }
 
 type ResolveModel = (modelId: string) => Model<Api> | undefined;
 
 type NodeCompile = {
 	targets: string[];
-	/** disposition → fromTarget → tos */
-	fallbacksByFrom: Partial<Record<GatewayErrorDisposition, Partial<Record<string, string[]>>>>;
+	fallbacks: Partial<Record<GatewayErrorDisposition, string[]>>;
 };
 
 /**
@@ -64,16 +81,28 @@ export class RouteRegistry {
 
 	/** Register/replace a virtual route. Bumps generation. Rejects cycles and empty fallback children. */
 	register(definition: RouteDefinition): void {
-		const compiled = compileNode(definition.root, new Set());
+		const compiled = compileDefinition(definition, id => this.#routes.get(id)?.root, this.#generation + 1);
 		this.#generation += 1;
-		this.#routes.set(definition.id, {
-			generation: this.#generation,
-			id: definition.id,
-			root: copyNode(definition.root),
-			targets: Object.freeze([...compiled.targets]),
-			fallbacks: freezeFallbacksUnion(compiled.fallbacksByFrom),
-			fallbackByTarget: freezeFallbacksByTarget(compiled.fallbacksByFrom),
-		});
+		this.#routes.set(definition.id, compiled);
+	}
+
+	/**
+	 * Atomically replace every virtual route. Compiles all definitions first;
+	 * on any throw, `#routes` and generation stay unchanged. Bumps generation once.
+	 */
+	replaceAll(defs: readonly RouteDefinition[]): void {
+		const nextGeneration = this.#generation + 1;
+		const pending = new Map<string, CompiledRoute>();
+		for (const definition of defs) {
+			const compiled = compileDefinition(
+				definition,
+				id => pending.get(id)?.root ?? this.#routes.get(id)?.root,
+				nextGeneration,
+			);
+			pending.set(definition.id, compiled);
+		}
+		this.#generation = nextGeneration;
+		this.#routes = pending;
 	}
 
 	/** Registered virtual routes in insertion order. Concrete catalog wraps are omitted. */
@@ -98,6 +127,8 @@ export class RouteRegistry {
 		if (virtual) return virtual;
 		const model = this.#resolveModel(modelId);
 		if (!model) return undefined;
+		// Preserve provider-qualified ids (`openai/gpt-5`) so affinity / fallback
+		// targets match the caller's route key, not the catalog's bare `model.id`.
 		const id = modelId.includes("/") ? modelId : model.id;
 		return {
 			generation: this.#generation,
@@ -105,169 +136,207 @@ export class RouteRegistry {
 			root: { type: "target", model: id },
 			targets: [id],
 			fallbacks: {},
-			fallbackByTarget: {},
 		};
 	}
 }
 
-function compileNode(node: RouteNode, seenOnPath: ReadonlySet<string>): NodeCompile {
-	if (node.type === "target") {
-		if (seenOnPath.has(node.model)) {
-			throw new AIError.ValidationError(`Route cycle: model "${node.model}" repeats on one path`);
+function compileDefinition(
+	definition: RouteDefinition,
+	lookup: (id: string) => RouteNode | undefined,
+	generation: number,
+): CompiledRoute {
+	const root = resolveRouteRefs(definition.root, lookup);
+	const compiled = compileNode(root, new Set());
+	return {
+		generation,
+		id: definition.id,
+		root: copyNode(root),
+		targets: Object.freeze([...compiled.targets]),
+		fallbacks: freezeFallbacks(compiled.fallbacks),
+		...(definition.affinity !== undefined ? { affinity: definition.affinity } : {}),
+		...(definition.portability !== undefined ? { portability: { ...definition.portability } } : {}),
+	};
+}
+
+function resolveRouteRefs(node: RouteNode, lookup: (id: string) => RouteNode | undefined): RouteNode {
+	switch (node.type) {
+		case "route-ref": {
+			const resolved = lookup(node.route);
+			if (resolved === undefined) {
+				throw new AIError.ValidationError("Unresolved route-ref");
+			}
+			return copyNode(resolved);
 		}
-		return { targets: [node.model], fallbacksByFrom: {} };
+		case "target":
+			return node.weight === undefined
+				? { type: "target", model: node.model }
+				: { type: "target", model: node.model, weight: node.weight };
+		case "fallback":
+			return {
+				type: "fallback",
+				on: node.on,
+				children: node.children.map(child => resolveRouteRefs(child, lookup)),
+			};
+		case "balance":
+			return {
+				type: "balance",
+				strategy: node.strategy,
+				children: node.children.map(child => resolveRouteRefs(child, lookup)),
+			};
+		case "conditional":
+			return {
+				type: "conditional",
+				when: { ...node.when },
+				children: node.children.map(child => resolveRouteRefs(child, lookup)),
+			};
+		case "domain":
+			return {
+				type: "domain",
+				name: node.name,
+				children: node.children.map(child => resolveRouteRefs(child, lookup)),
+			};
 	}
+}
+
+function compileNode(node: RouteNode, seenOnPath: ReadonlySet<string>): NodeCompile {
+	switch (node.type) {
+		case "target": {
+			if (seenOnPath.has(node.model)) {
+				throw new AIError.ValidationError(`Route cycle: model "${node.model}" repeats on one path`);
+			}
+			return { targets: [node.model], fallbacks: {} };
+		}
+		case "route-ref":
+			throw new AIError.ValidationError("Unresolved route-ref");
+		case "fallback":
+			return compileFallback(node, seenOnPath);
+		case "balance":
+		case "conditional":
+		case "domain":
+			return compileFlatten(node.children, seenOnPath);
+	}
+}
+
+function compileFallback(node: FallbackNode, seenOnPath: ReadonlySet<string>): NodeCompile {
 	if (node.children.length === 0) {
 		throw new AIError.ValidationError("Fallback node has empty children");
 	}
 
 	const targets: string[] = [];
-	const fallbacksByFrom: Partial<Record<GatewayErrorDisposition, Partial<Record<string, string[]>>>> = {};
+	const fallbacks: Partial<Record<GatewayErrorDisposition, string[]>> = {};
+	const afterPrimary: string[] = [];
 	const sequential = new Set(seenOnPath);
-	const childParts: Array<{ entryTargets: string[]; after: string[] }> = [];
-	const entryTargetsPerChild: string[][] = [];
-	const allTargetsPerChild: string[][] = [];
+	let primary = true;
 	for (const child of node.children) {
 		// Independent ancestor copy per sibling. Fallback subtrees must not
 		// inherit sequential sibling targets — those are other leaves.
 		const childSeen = new Set(child.type === "target" ? sequential : seenOnPath);
 		const part = compileNode(child, childSeen);
 		targets.push(...part.targets);
-		allTargetsPerChild.push([...part.targets]);
-		const entry =
-			child.type === "fallback"
-				? part.targets[0] !== undefined
-					? [part.targets[0]]
-					: []
-				: [...part.targets];
-		entryTargetsPerChild.push(entry);
-		mergeFallbacksByFrom(fallbacksByFrom, part.fallbacksByFrom);
+		if (!primary) afterPrimary.push(...part.targets);
+		mergeFallbacks(fallbacks, part.fallbacks);
 		if (child.type === "target") sequential.add(child.model);
-	}
-	// fallbackByTarget is keyed by model id; the same id in multiple sibling
-	// subtrees would merge nested edges across unreached branches.
-	const owner = new Map<string, number>();
-	for (let i = 0; i < allTargetsPerChild.length; i += 1) {
-		for (const id of allTargetsPerChild[i]!) {
-			const prev = owner.get(id);
-			if (prev !== undefined && prev !== i) {
-				throw new AIError.ValidationError(
-					`Ambiguous cross-branch reuse of model "${id}" under one fallback`,
-				);
-			}
-			owner.set(id, i);
-		}
-	}
-	// From each sibling entry, edges go to the remaining suffix of entry targets.
-	for (let i = 0; i < entryTargetsPerChild.length; i += 1) {
-	// From every reachable target in an earlier sibling subtree, edges go to
-	// the entry of each later sibling (not the full later subtree). Nested
-	// overflow can move A→B; B must still carry the outer edge to C.
-	for (let i = 0; i < allTargetsPerChild.length; i += 1) {
-		const suffix: string[] = [];
-		for (let j = i + 1; j < entryTargetsPerChild.length; j += 1) {
-			suffix.push(...entryTargetsPerChild[j]!);
-		}
-		childParts.push({ entryTargets: entryTargetsPerChild[i]!, after: suffix });
-		childParts.push({ entryTargets: allTargetsPerChild[i]!, after: suffix });
+		primary = false;
 	}
 	for (const disposition of node.on) {
-		let byFrom = fallbacksByFrom[disposition];
-		if (!byFrom) {
-			byFrom = {};
-			fallbacksByFrom[disposition] = byFrom;
-		}
-		for (const part of childParts) {
-			if (part.after.length === 0) continue;
-			for (const from of part.entryTargets) {
-				const existing = byFrom[from];
-				byFrom[from] = existing ? [...existing, ...part.after] : [...part.after];
-			}
-		}
+		if (afterPrimary.length === 0) continue;
+		const existing = fallbacks[disposition];
+		fallbacks[disposition] = existing ? [...existing, ...afterPrimary] : [...afterPrimary];
 	}
-	return { targets, fallbacksByFrom };
+	return { targets, fallbacks };
+}
+
+function compileFlatten(children: readonly RouteNode[], seenOnPath: ReadonlySet<string>): NodeCompile {
+	const targets: string[] = [];
+	const fallbacks: Partial<Record<GatewayErrorDisposition, string[]>> = {};
+	const sequential = new Set(seenOnPath);
+	for (const child of children) {
+		const childSeen = new Set(child.type === "target" ? sequential : seenOnPath);
+		const part = compileNode(child, childSeen);
+		targets.push(...part.targets);
+		mergeFallbacks(fallbacks, part.fallbacks);
+		if (child.type === "target") sequential.add(child.model);
+	}
+	return { targets, fallbacks };
 }
 
 function copyNode(node: RouteNode): RouteNode {
-	if (node.type === "target") {
-		return { type: "target", model: node.model };
+	switch (node.type) {
+		case "target":
+			return node.weight === undefined
+				? { type: "target", model: node.model }
+				: { type: "target", model: node.model, weight: node.weight };
+		case "fallback":
+			return {
+				type: "fallback",
+				on: Object.freeze([...node.on]),
+				children: Object.freeze(node.children.map(copyNode)),
+			};
+		case "balance":
+			return {
+				type: "balance",
+				strategy: node.strategy,
+				children: Object.freeze(node.children.map(copyNode)),
+			};
+		case "conditional":
+			return {
+				type: "conditional",
+				when: Object.freeze({ ...node.when }),
+				children: Object.freeze(node.children.map(copyNode)),
+			};
+		case "domain":
+			return {
+				type: "domain",
+				name: node.name,
+				children: Object.freeze(node.children.map(copyNode)),
+			};
+		case "route-ref":
+			return { type: "route-ref", route: node.route };
 	}
-	return {
-		type: "fallback",
-		on: Object.freeze([...node.on]),
-		children: Object.freeze(node.children.map(copyNode)),
-	};
 }
 
-function mergeFallbacksByFrom(
-	dest: Partial<Record<GatewayErrorDisposition, Partial<Record<string, string[]>>>>,
-	src: Partial<Record<GatewayErrorDisposition, Partial<Record<string, string[]>>>>,
+function mergeFallbacks(
+	dest: Partial<Record<GatewayErrorDisposition, string[]>>,
+	src: Partial<Record<GatewayErrorDisposition, string[]>>,
 ): void {
 	for (const key of Object.keys(src) as GatewayErrorDisposition[]) {
-		const fromMap = src[key];
-		if (!fromMap) continue;
-		let destFrom = dest[key];
-		if (!destFrom) {
-			destFrom = {};
-			dest[key] = destFrom;
-		}
-		for (const [from, tos] of Object.entries(fromMap)) {
-			if (!tos || tos.length === 0) continue;
-			const existing = destFrom[from];
-			destFrom[from] = existing ? [...existing, ...tos] : [...tos];
-		}
+		const extra = src[key];
+		if (!extra || extra.length === 0) continue;
+		const existing = dest[key];
+		dest[key] = existing ? [...existing, ...extra] : [...extra];
 	}
 }
 
-function freezeFallbacksUnion(
-	fallbacksByFrom: Partial<Record<GatewayErrorDisposition, Partial<Record<string, string[]>>>>,
+function freezeFallbacks(
+	fallbacks: Partial<Record<GatewayErrorDisposition, string[]>>,
 ): Readonly<Partial<Record<GatewayErrorDisposition, readonly string[]>>> {
 	const out: Partial<Record<GatewayErrorDisposition, readonly string[]>> = {};
-	for (const key of Object.keys(fallbacksByFrom) as GatewayErrorDisposition[]) {
-		const fromMap = fallbacksByFrom[key];
-		if (!fromMap) continue;
-		const seen = new Set<string>();
-		const list: string[] = [];
-		for (const tos of Object.values(fromMap)) {
-			if (!tos) continue;
-			for (const id of tos) {
-				if (seen.has(id)) continue;
-				seen.add(id);
-				list.push(id);
-			}
-		}
-		if (list.length > 0) out[key] = Object.freeze(list);
+	for (const key of Object.keys(fallbacks) as GatewayErrorDisposition[]) {
+		const list = fallbacks[key];
+		if (!list || list.length === 0) continue;
+		out[key] = Object.freeze([...list]);
 	}
 	return Object.freeze(out);
 }
 
-function freezeFallbacksByTarget(
-	fallbacksByFrom: Partial<Record<GatewayErrorDisposition, Partial<Record<string, string[]>>>>,
-): Readonly<Partial<Record<string, Readonly<Partial<Record<GatewayErrorDisposition, readonly string[]>>>>>> {
-	const byTarget: Partial<Record<string, Partial<Record<GatewayErrorDisposition, string[]>>>> = {};
-	for (const disposition of Object.keys(fallbacksByFrom) as GatewayErrorDisposition[]) {
-		const fromMap = fallbacksByFrom[disposition];
-		if (!fromMap) continue;
-		for (const [from, tos] of Object.entries(fromMap)) {
-			if (!tos || tos.length === 0) continue;
-			let dest = byTarget[from];
-			if (!dest) {
-				dest = {};
-				byTarget[from] = dest;
+/** Choose the first dispatch target, honouring a root balance strategy when present. */
+export function pickInitialRouteTarget(compiled: CompiledRoute, salt = 0): string | undefined {
+	if (compiled.targets.length === 0) return undefined;
+	if (compiled.root.type !== "balance") return compiled.targets[0];
+	if (compiled.root.strategy === "weighted") {
+		let best: string | undefined;
+		let bestWeight = -Infinity;
+		for (const child of compiled.root.children) {
+			if (child.type !== "target") continue;
+			const weight = child.weight ?? 1;
+			if (weight > bestWeight) {
+				bestWeight = weight;
+				best = child.model;
 			}
-			const existing = dest[disposition];
-			dest[disposition] = existing ? [...existing, ...tos] : [...tos];
 		}
+		return best ?? compiled.targets[0];
 	}
-	const out: Partial<Record<string, Readonly<Partial<Record<GatewayErrorDisposition, readonly string[]>>>>> = {};
-	for (const [from, dispMap] of Object.entries(byTarget)) {
-		const frozen: Partial<Record<GatewayErrorDisposition, readonly string[]>> = {};
-		for (const disposition of Object.keys(dispMap) as GatewayErrorDisposition[]) {
-			const list = dispMap[disposition];
-			if (!list || list.length === 0) continue;
-			frozen[disposition] = Object.freeze([...list]);
-		}
-		out[from] = Object.freeze(frozen);
-	}
-	return Object.freeze(out);
+	// Round-robin: rotate by salt so concurrent requests spread across children.
+	const idx = Math.abs(salt) % compiled.targets.length;
+	return compiled.targets[idx];
 }

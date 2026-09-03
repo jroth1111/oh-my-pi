@@ -118,6 +118,197 @@ describe("parseRouteDefinitions", () => {
 			]),
 		).toThrow(/empty/i);
 	});
+
+	it("parses a balance node", () => {
+		const parsed = parseRouteDefinitions([
+			{
+				id: "lb",
+				root: {
+					type: "balance",
+					strategy: "rr",
+					children: [
+						{ type: "target", model: "openai:gpt-4o" },
+						{ type: "target", model: "anthropic:claude-sonnet-4" },
+					],
+				},
+			},
+		]);
+		expect(parsed).toEqual([
+			{
+				id: "lb",
+				root: {
+					type: "balance",
+					strategy: "rr",
+					children: [
+						{ type: "target", model: "openai:gpt-4o" },
+						{ type: "target", model: "anthropic:claude-sonnet-4" },
+					],
+				},
+			},
+		]);
+	});
+
+	it("parses a weighted balance node", () => {
+		const parsed = parseRouteDefinitions([
+			{
+				id: "weighted",
+				root: {
+					type: "balance",
+					strategy: "weighted",
+					children: [{ type: "target", model: "openai:gpt-4o" }],
+				},
+			},
+		]);
+		expect(parsed[0]?.root).toEqual({
+			type: "balance",
+			strategy: "weighted",
+			children: [{ type: "target", model: "openai:gpt-4o" }],
+		});
+	});
+
+	it("parses a conditional node", () => {
+		const parsed = parseRouteDefinitions([
+			{
+				id: "vision",
+				root: {
+					type: "conditional",
+					when: { vision: true },
+					children: [{ type: "target", model: "openai:gpt-4o" }],
+				},
+			},
+		]);
+		expect(parsed).toEqual([
+			{
+				id: "vision",
+				root: {
+					type: "conditional",
+					when: { vision: true },
+					children: [{ type: "target", model: "openai:gpt-4o" }],
+				},
+			},
+		]);
+	});
+
+	it("parses a domain node", () => {
+		const parsed = parseRouteDefinitions([
+			{
+				id: "coding",
+				root: {
+					type: "domain",
+					name: "coding",
+					children: [{ type: "target", model: "openai:gpt-4o" }],
+				},
+			},
+		]);
+		expect(parsed).toEqual([
+			{
+				id: "coding",
+				root: {
+					type: "domain",
+					name: "coding",
+					children: [{ type: "target", model: "openai:gpt-4o" }],
+				},
+			},
+		]);
+	});
+
+	it("parses a route-ref node", () => {
+		const parsed = parseRouteDefinitions([{ id: "alias", root: { type: "route-ref", route: "primary" } }]);
+		expect(parsed).toEqual([{ id: "alias", root: { type: "route-ref", route: "primary" } }]);
+	});
+
+	it("rejects a conditional node missing when (negative)", () => {
+		expect(() =>
+			parseRouteDefinitions([
+				{
+					id: "bad",
+					root: {
+						type: "conditional",
+						children: [{ type: "target", model: "openai:gpt-4o" }],
+					},
+				},
+			]),
+		).toThrow(AIError.ValidationError);
+		expect(() =>
+			parseRouteDefinitions([
+				{
+					id: "bad",
+					root: {
+						type: "conditional",
+						children: [{ type: "target", model: "openai:gpt-4o" }],
+					},
+				},
+			]),
+		).toThrow(/when/i);
+	});
+
+	it("parses optional affinity and portability objects", () => {
+		const parsed = parseRouteDefinitions([
+			{
+				id: "sticky",
+				affinity: "required",
+				portability: { scope: "provider", origin: "anthropic" },
+				root: { type: "target", model: "anthropic:claude" },
+			},
+		]);
+		expect(parsed).toEqual([
+			{
+				id: "sticky",
+				affinity: "required",
+				portability: { scope: "provider", origin: "anthropic" },
+				root: { type: "target", model: "anthropic:claude" },
+			},
+		]);
+	});
+
+	it("parses portability without origin", () => {
+		const parsed = parseRouteDefinitions([
+			{
+				id: "portable",
+				affinity: "preferred",
+				portability: { scope: "portable" },
+				root: { type: "target", model: "openai:gpt-4o" },
+			},
+		]);
+		expect(parsed[0]?.affinity).toBe("preferred");
+		expect(parsed[0]?.portability).toEqual({ scope: "portable" });
+	});
+
+	it("rejects an unknown affinity level (negative)", () => {
+		expect(() =>
+			parseRouteDefinitions([
+				{
+					id: "bad",
+					affinity: "sticky",
+					root: { type: "target", model: "openai:gpt-4o" },
+				},
+			]),
+		).toThrow(AIError.ValidationError);
+	});
+
+	it("rejects an unknown portability scope (negative)", () => {
+		expect(() =>
+			parseRouteDefinitions([
+				{
+					id: "bad",
+					portability: { scope: "region", origin: "us" },
+					root: { type: "target", model: "openai:gpt-4o" },
+				},
+			]),
+		).toThrow(AIError.ValidationError);
+	});
+
+	it("rejects a non-object portability value (negative)", () => {
+		expect(() =>
+			parseRouteDefinitions([
+				{
+					id: "bad",
+					portability: "provider",
+					root: { type: "target", model: "openai:gpt-4o" },
+				},
+			]),
+		).toThrow(AIError.ValidationError);
+	});
 });
 
 describe("loadRouteDefinitionsFile", () => {

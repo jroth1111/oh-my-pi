@@ -34,6 +34,7 @@ import type {
 	WriteResult,
 } from "@oh-my-pi/pi-catalog/discovery/cursor-proto";
 import type { Effort } from "@oh-my-pi/pi-catalog/effort";
+import { isOpenAIModelId } from "@oh-my-pi/pi-catalog/identity/family";
 import type { Api, FetchImpl, KnownApi, Model, Provider, ThinkingBudgets, Usage } from "@oh-my-pi/pi-catalog/types";
 import type { ApiKey } from "./auth-retry";
 import type { BedrockOptions } from "./providers/amazon-bedrock";
@@ -46,7 +47,6 @@ import type { GitLabDuoWorkflowOptions } from "./providers/gitlab-duo-workflow";
 import type { GoogleOptions } from "./providers/google";
 import type { GoogleGeminiCliOptions } from "./providers/google-gemini-cli";
 import type { GoogleVertexOptions } from "./providers/google-vertex";
-import type { GrokbotOptions } from "./providers/grokbot";
 import type { OllamaChatOptions } from "./providers/ollama";
 import type { OpenAICodexResponsesOptions } from "./providers/openai-codex-responses";
 import type { OpenAICompletionsOptions } from "./providers/openai-completions";
@@ -85,7 +85,6 @@ export interface ApiOptionsMap {
 	"cursor-agent": CursorOptions;
 	"gitlab-duo-agent": GitLabDuoWorkflowOptions;
 	"devin-agent": DevinOptions;
-	"grokbot-sand": GrokbotOptions;
 }
 // Compile-time exhaustiveness check - this will fail if ApiOptionsMap doesn't have all KnownApi keys
 type _CheckExhaustive =
@@ -152,15 +151,7 @@ export type ServiceTierFamily = "openai" | "anthropic" | "google";
  */
 export type ServiceTierByFamily = Partial<Record<ServiceTierFamily, ServiceTier>>;
 
-type ServiceTierModel = Pick<Model, "provider" | "api" | "identity">;
-// The service-tier matrix below intentionally stays in TypeScript rather than
-// the KDL compat tree: `shouldSendServiceTier` accepts bare provider strings
-// (agent telemetry, google-shared header placement) and the stats parser
-// rebuilds slim `{ provider, api, identity }` models from historical session
-// JSONL — neither path holds a resolved compat record, so a KDL axis would
-// merely duplicate this table as its own fallback. The functions branch on
-// structured `classifyModel` facts, api, and a short provider list, which is
-// the sanctioned mechanism layer.
+type ServiceTierModel = Pick<Model, "provider" | "api" | "id">;
 
 function isOpenAIServiceTierApi(api: Api | undefined): boolean {
 	return api === "openai-completions" || api === "openai-responses" || api === "openai-codex-responses";
@@ -176,7 +167,7 @@ function isOpenAIServiceTierModel(model: ServiceTierModel): boolean {
 	return (
 		!excludesInferredOpenAIServiceTier(model.provider) &&
 		isOpenAIServiceTierApi(model.api) &&
-		model.identity.class === "openai"
+		isOpenAIModelId(model.id)
 	);
 }
 
@@ -194,9 +185,10 @@ function isOpenAIServiceTierModel(model: ServiceTierModel): boolean {
 export function serviceTierFamily(model: ServiceTierModel): ServiceTierFamily | undefined {
 	const provider = model.provider;
 	if (provider === "openrouter") {
-		if (model.identity.class === "anthropic") return "anthropic";
-		if (model.identity.class === "gemini") return "google";
-		if (model.identity.class === "openai") return "openai";
+		const id = model.id.toLowerCase();
+		if (id.startsWith("anthropic/")) return "anthropic";
+		if (id.startsWith("google/")) return "google";
+		if (id.startsWith("openai/")) return "openai";
 		return undefined;
 	}
 	if (provider === "openai" || provider === "openai-codex") return "openai";
@@ -212,7 +204,7 @@ export function serviceTierFamily(model: ServiceTierModel): ServiceTierFamily | 
  */
 export function resolveModelServiceTier(
 	tiers: ServiceTierByFamily | null | undefined,
-	model: ServiceTierModel,
+	model: Pick<Model, "provider" | "api" | "id">,
 ): ServiceTier | undefined {
 	if (!tiers) return undefined;
 	const family = serviceTierFamily(model);
@@ -259,7 +251,7 @@ export function shouldSendServiceTier(
  */
 export function realizesPriorityServiceTier(
 	serviceTier: ServiceTier | null | undefined,
-	model: ServiceTierModel,
+	model: Pick<Model, "provider" | "api" | "id">,
 ): boolean {
 	if (serviceTier !== "priority") return false;
 	if (model.provider === "anthropic") return true;
@@ -285,7 +277,7 @@ export function realizesPriorityServiceTier(
  */
 export function getPriorityPremiumRequests(
 	serviceTier: ServiceTier | null | undefined,
-	model: ServiceTierModel,
+	model: Pick<Model, "provider" | "api" | "id">,
 ): number {
 	if (!realizesPriorityServiceTier(serviceTier, model)) return 0;
 	const provider = model.provider;
@@ -428,11 +420,6 @@ export interface StreamOptions {
 	 * Side-channel and advisor requests must leave it unset.
 	 */
 	anthropicCacheRefresh?: boolean;
-	/**
-	 * Anthropic preserved-thinking behavior when a signed block no longer matches
-	 * its conversation prefix. Binding-capable models default to `"drop_block"`.
-	 */
-	anthropicPrefixMismatchBehavior?: "drop_block" | "error";
 	/** @internal Marks a replay-only Anthropic request that must use non-streaming `max_tokens: 0`. */
 	anthropicCacheRefreshRequest?: boolean;
 	/**
@@ -506,8 +493,6 @@ export interface StreamOptions {
 	 * internal chain state (`statefulResponses` / lastResponseId) for this request.
 	 */
 	previousResponseId?: string;
-	/** Persist Responses for later previous_response_id continuation. */
-	store?: boolean;
 	/** OpenAI `parallel_tool_calls`. */
 	parallelToolCalls?: boolean;
 	/** OpenAI deterministic-sampling `seed`. */
@@ -657,35 +642,6 @@ export interface SimpleStreamOptions extends Omit<StreamOptions, "apiKey"> {
 	/** Cursor exec handlers for local tool execution */
 	cursorExecHandlers?: CursorExecHandlers;
 	/**
-	 * Cursor auto mode: when true, passes `"auto"` as the model id to Cursor's
-	 * backend, letting Cursor select the model per-turn instead of omp's role
-	 * system. Ignored by non-Cursor providers.
-	 */
-	cursorAutoMode?: boolean;
-	/**
-	 * Cursor tool passthrough: when true, tool calls from Cursor's backend are
-	 * surfaced as OpenAI `tool_calls` in the response without local execution.
-	 * The caller executes tools and replays results as `role: "tool"` messages
-	 * on the next request. Ignored by non-Cursor providers.
-	 */
-	cursorToolPassthrough?: boolean;
-	/** Comma-separated tool names to exclude from the model's tool set (Cursor only). */
-	cursorExcludeTools?: string;
-	/** Signal local CLI mode to Cursor's backend (Cursor only). */
-	cursorLocalCliMode?: boolean;
-	/** Statsig experiment overrides for feature flag testing (Cursor only). */
-	cursorDevExperimentOverrides?: string;
-	/** Capability flag: client supports inline images (Cursor only). */
-	cursorClientSupportsInlineImages?: boolean;
-	/** Capability flag: client supports routed model updates (Cursor only). */
-	cursorClientSupportsRoutedModelUpdate?: boolean;
-	/** Capability flag: client supports prompt context usage RPC (Cursor only). */
-	cursorClientSupportsPromptContextUsageRpc?: boolean;
-	/** Unique run identifier for session tracking (Cursor only). */
-	cursorRunId?: string;
-	/** Agent session identifier for session tracking (Cursor only). */
-	cursorAgentSessionId?: string;
-	/**
 	 * Optional rewrite of Cursor exec-channel tool results. May return a Promise.
 	 *
 	 * The Agent reserves the original result in its buffer before awaiting this
@@ -694,8 +650,6 @@ export interface SimpleStreamOptions extends Omit<StreamOptions, "apiKey"> {
 	 * A rejecting transformer is swallowed and the reserved payload stands in.
 	 */
 	cursorOnToolResult?: CursorToolResultHandler;
-	/** Cursor hands unhandled MCP calls to an external executor instead of reporting them as missing. */
-	cursorExternalToolExecutor?: boolean;
 	/**
 	 * Amazon Bedrock Guardrail settings forwarded through transports that do not
 	 * dispatch directly to the Bedrock provider. Model-level values take
@@ -919,23 +873,7 @@ export interface OpenAIResponsesHistoryPayload {
 	items: Array<Record<string, unknown>>;
 }
 
-/** Anthropic-only controls attached to a mid-conversation system message. */
-export interface AnthropicMessagePayload {
-	type: "anthropicMessage";
-	clearAt?: "never" | "next_user_message";
-	effort?: "low" | "medium" | "high" | "xhigh" | "max";
-	toolChanges?: Array<{ type: "tool_addition" | "tool_removal"; name: string }>;
-}
-
-export type ProviderPayload = OpenAIResponsesHistoryPayload | AnthropicMessagePayload;
-
-/** Provider-reported rewrite applied to request content before inference. */
-export interface ProviderInputTransformation {
-	type: string;
-	path?: string;
-	reason?: string;
-	[key: string]: unknown;
-}
+export type ProviderPayload = OpenAIResponsesHistoryPayload;
 
 export interface UserMessage {
 	role: "user";
@@ -944,8 +882,6 @@ export interface UserMessage {
 	synthetic?: boolean;
 	/** True when injected mid-turn as a steer; consumed by the agent's pre-LLM transform to wrap it for emphasis. Never rendered. */
 	steering?: boolean;
-	/** Timestamp of a client-side history rewrite represented by this message. */
-	historyRewriteAt?: number;
 	/** Who initiated this message for billing/attribution semantics. */
 	attribution?: MessageAttribution;
 	/** Provider-specific opaque payload used to reconstruct transport-native history. */
@@ -1056,8 +992,6 @@ export interface AssistantMessage {
 	 * server's actual state.
 	 */
 	disabledFeatures?: string[];
-	/** Provider-reported input rewrites such as dropped bound-thinking blocks. */
-	inputTransformations?: ProviderInputTransformation[];
 	/** Provider-specific opaque payload used to reconstruct transport-native history. */
 	providerPayload?: ProviderPayload;
 	timestamp: number; // Unix timestamp in milliseconds
@@ -1134,7 +1068,8 @@ export interface CursorMcpCall {
 
 export interface CursorTodoSnapshotItem {
 	content: string;
-	status: "pending" | "in_progress" | "completed" | "abandoned";
+	status: "pending" | "in_progress" | "completed" | "abandoned" | "blocked";
+	blocker?: string;
 }
 
 /**
@@ -1333,8 +1268,6 @@ export interface Tool<TParameters extends TSchema = TSchema> {
 	parameters: TParameters;
 	/** If true, tool is strictly typed and validated against the parameters schema before execution */
 	strict?: boolean;
-	/** Withhold this Anthropic tool until a `tool_addition` message references it. */
-	deferLoading?: boolean;
 	/**
 	 * Optional grammar constraint for OpenAI custom-tool emission.
 	 * When set, providers that support grammar-constrained tools (currently only
@@ -1383,12 +1316,6 @@ export type AssistantMessageEvent =
 	| { type: "toolcall_start"; contentIndex: number; partial: AssistantMessage }
 	| { type: "toolcall_delta"; contentIndex: number; delta: string; partial: AssistantMessage }
 	| { type: "toolcall_end"; contentIndex: number; toolCall: ToolCall; partial: AssistantMessage }
-	/**
-	 * Explicit Cursor auto-routing checkpoint. Auth-gateway SSE encoders must
-	 * wait for this (not repeated `partial.model` observations) before flushing
-	 * `message_start` / OpenAI envelopes under `x-cursor-auto-mode`.
-	 */
-	| { type: "routed_model"; contentIndex?: undefined; model: string; partial: AssistantMessage }
 	| {
 			type: "done";
 			contentIndex?: undefined;

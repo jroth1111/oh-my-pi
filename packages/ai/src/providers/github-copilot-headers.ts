@@ -1,8 +1,4 @@
-import {
-	COPILOT_CAPI_IDENTITY_HEADERS,
-	getGitHubCopilotBaseUrl,
-	parseGitHubCopilotApiKey,
-} from "@oh-my-pi/pi-catalog/wire/github-copilot";
+import { getGitHubCopilotBaseUrl, parseGitHubCopilotApiKey } from "@oh-my-pi/pi-catalog/wire/github-copilot";
 import type { Message } from "../types";
 /**
  * Infer whether the current request to Copilot is user-initiated or agent-initiated.
@@ -125,9 +121,8 @@ export function buildCopilotDynamicHeaders(params: {
 	const initiator =
 		params.initiatorOverride ?? getCopilotInitiatorOverride(params.headers) ?? inferCopilotInitiator(params.messages);
 	const headers: Record<string, string> = {
-		...COPILOT_CAPI_IDENTITY_HEADERS,
 		"X-Initiator": initiator,
-		"X-Interaction-Type": `conversation-${initiator}`,
+		"Openai-Intent": "conversation-edits",
 	};
 
 	if (params.hasImages) {

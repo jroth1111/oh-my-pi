@@ -1,10 +1,4 @@
 import type { KnownProvider } from "@oh-my-pi/pi-catalog";
-import { authProviders } from "@oh-my-pi/pi-catalog/compat/auth";
-import type { AuthProviderId, LoginProviderId } from "@oh-my-pi/pi-catalog/compat/auth-ids";
-import { amazonBedrockTransport } from "./amazon-bedrock";
-import { bedrockMantleTransport } from "./bedrock-mantle";
-import { buildProviderDefinition, type ProviderTransport } from "./build";
-import { cloudflareAiGatewayTransport } from "./cloudflare-ai-gateway";
 import { aiandProvider } from "./aiand";
 import { aimlApiProvider } from "./aimlapi";
 import { alibabaCodingPlanProvider } from "./alibaba-coding-plan";
@@ -33,7 +27,6 @@ import { googleProvider } from "./google";
 import { googleAntigravityProvider } from "./google-antigravity";
 import { googleGeminiCliProvider } from "./google-gemini-cli";
 import { googleVertexProvider } from "./google-vertex";
-import { grokbotProvider } from "./grokbot";
 import { groqProvider } from "./groq";
 import { huggingfaceProvider } from "./huggingface";
 import { kagiProvider } from "./kagi";
@@ -70,17 +63,29 @@ import { syntheticProvider } from "./synthetic";
 import { tavilyProvider } from "./tavily";
 import { togetherProvider } from "./together";
 import type { ProviderDefinition } from "./types";
+import { umansProvider } from "./umans";
+import { veniceProvider } from "./venice";
+import { vercelAiGatewayProvider } from "./vercel-ai-gateway";
+import { vllmProvider } from "./vllm";
+import { waferServerlessProvider } from "./wafer-serverless";
+import { xaiProvider } from "./xai";
+import { xaiOauthProvider } from "./xai-oauth";
+import { xiaomiProvider } from "./xiaomi";
+import { xiaomiTokenPlanAmsProvider } from "./xiaomi-token-plan-ams";
+import { xiaomiTokenPlanCnProvider } from "./xiaomi-token-plan-cn";
+import { xiaomiTokenPlanSgpProvider } from "./xiaomi-token-plan-sgp";
+import { yoloAutoProvider } from "./yolo-auto";
+import { zaiCodingPlanProvider, zaiProvider } from "./zai";
+import { zenmuxProvider } from "./zenmux";
+import { zhipuCodingPlanProvider } from "./zhipu-coding-plan";
 
 /**
- * TypeScript-side request/model shaping for providers whose transport needs
- * code beside the KDL auth policy. Keyed by provider id; every other provider
- * is fully described by `rules/auth/<id>.kdl`.
+ * The single per-provider list. Adding a provider = create `./providers/<id>.ts`
+ * and add its export here. Every legacy structure (`KnownProvider`/`OAuthProvider`
+ * unions, descriptors, env map, login list, refresh/login dispatch, CLI callback
+ * maps) is derived from this registry. Order matches the interactive `/login`
+ * list for the loginable providers; non-login model providers are appended.
  */
-const TRANSPORTS: Record<string, ProviderTransport> = {
-	"amazon-bedrock": amazonBedrockTransport,
-	"bedrock-mantle": bedrockMantleTransport,
-	"cloudflare-ai-gateway": cloudflareAiGatewayTransport,
-};
 const ALL = [
 	azureProvider,
 	openaiCodexProvider,
@@ -155,7 +160,6 @@ const ALL = [
 	openaiProvider,
 	googleProvider,
 	googleVertexProvider,
-	grokbotProvider,
 	groqProvider,
 	mistralProvider,
 	minimaxProvider,
@@ -164,30 +168,21 @@ const ALL = [
 	gmiCloudProvider,
 ];
 
-/**
- * The single per-provider list, derived from the compiled auth stratum
- * (`@oh-my-pi/pi-catalog` `rules/auth/*.kdl`) in `/login` display order.
- * Adding a provider = one new `auth/<id>.kdl` (plus a `TRANSPORTS` entry when
- * it shapes requests in code). Every legacy structure (`OAuthProvider` union,
- * env map, login list, refresh/login dispatch, CLI callback maps) derives
- * from this registry.
- */
-export const PROVIDER_REGISTRY: readonly ProviderDefinition[] = authProviders().map(policy =>
-	buildProviderDefinition(policy, TRANSPORTS[policy.id]),
-);
+export type RegistryDef = (typeof ALL)[number];
+export const PROVIDER_REGISTRY: readonly ProviderDefinition[] = ALL;
 
-const BY_ID: Record<string, ProviderDefinition> = Object.fromEntries(PROVIDER_REGISTRY.map(p => [p.id, p]));
+const BY_ID = new Map<string, ProviderDefinition>(ALL.map(p => [p.id, p] as [string, ProviderDefinition]));
 
 export function getProviderDefinition(id: string): ProviderDefinition | undefined {
-	return BY_ID[id];
+	return BY_ID.get(id);
 }
 
-/** Compile-time completeness: every catalog chat-model provider must have an auth policy. */
-type _MissingCatalogProviders = Exclude<KnownProvider, AuthProviderId>;
+/** Compile-time completeness: every catalog chat-model provider must have a registry definition. */
+type _MissingCatalogProviders = Exclude<KnownProvider, RegistryDef["id"]>;
 type _CheckRegistryComplete = _MissingCatalogProviders extends never
 	? true
-	: ["auth rules are missing catalog providers", _MissingCatalogProviders];
+	: ["registry is missing catalog providers", _MissingCatalogProviders];
 true satisfies _CheckRegistryComplete;
 
-/** Loginable providers (those whose auth policy declares a `login` flow). */
-export type OAuthProviderUnion = LoginProviderId;
+/** Loginable providers (those carrying a `login` flow). */
+export type OAuthProviderUnion = Extract<RegistryDef, { login: object }>["id"];

@@ -79,12 +79,16 @@ export type TodoStatus = "pending" | "in_progress" | "completed" | "abandoned" |
 export type TodoItem = {
 	content: string;
 	status: TodoStatus;
+	id?: string;
 	details?: string;
-	notes?: string[];
+	notes?: string | string[];
+	blocker?: string;
+	droppedBy?: "user";
 };
 
 export type TodoPhase = {
 	name: string;
+	id?: string;
 	tasks: TodoItem[];
 };
 

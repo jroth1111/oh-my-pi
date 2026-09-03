@@ -34,6 +34,6 @@ export function createExtensionModelQuery(
 				matchPreferences: getModelMatchPreferences(settings),
 			}).model,
 		family: (model: Model<Api>): string =>
-			model.identity.class === "unknown" ? model.provider.toLowerCase() : model.identity.class,
+			model.identity && model.identity.class !== "unknown" ? model.identity.class : model.provider.toLowerCase(),
 	};
 }

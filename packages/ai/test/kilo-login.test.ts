@@ -1,9 +1,6 @@
 import { describe, expect, it, vi } from "bun:test";
-import { getProviderDefinition } from "@oh-my-pi/pi-ai/registry";
+import { loginKilo } from "@oh-my-pi/pi-ai/registry/kilo";
 import type { FetchImpl } from "@oh-my-pi/pi-ai/types";
-
-const loginKilo = getProviderDefinition("kilo")?.login;
-if (!loginKilo) throw new Error("Kilo login is not registered");
 
 describe("kilo oauth login", () => {
 	it("returns OAuth credentials when device authorization is approved", async () => {
@@ -31,7 +28,6 @@ describe("kilo oauth login", () => {
 
 		const onAuth = vi.fn();
 		const credentials = await loginKilo({ onAuth, fetch: fetchMock });
-		if (typeof credentials === "string") throw new Error("Expected Kilo OAuth credentials");
 
 		expect(onAuth).toHaveBeenCalledWith({
 			url: "https://kilo.ai/verify",

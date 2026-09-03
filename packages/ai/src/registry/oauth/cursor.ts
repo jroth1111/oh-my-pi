@@ -1,6 +1,6 @@
 import * as AIError from "../../error";
 import { generatePKCE } from "./pkce";
-import type { OAuthController, OAuthCredentials } from "./types";
+import type { OAuthCredentials } from "./types";
 
 const CURSOR_LOGIN_URL = "https://cursor.com/loginDeepControl";
 const CURSOR_POLL_URL = "https://api2.cursor.sh/auth/poll";
@@ -106,13 +106,6 @@ export async function loginCursor(
 	};
 }
 
-export async function loginCursorHook(callbacks: OAuthController): Promise<OAuthCredentials> {
-	return loginCursor(
-		url => callbacks.onAuth?.({ url }),
-		callbacks.onProgress ? () => callbacks.onProgress?.("Waiting for browser authentication...") : undefined,
-	);
-}
-
 export async function refreshCursorToken(apiKeyOrRefreshToken: string): Promise<OAuthCredentials> {
 	const response = await fetch(CURSOR_REFRESH_URL, {
 		method: "POST",
@@ -143,10 +136,6 @@ export async function refreshCursorToken(apiKeyOrRefreshToken: string): Promise<
 		refresh: data.refreshToken || apiKeyOrRefreshToken,
 		expires: expiresAt,
 	};
-}
-
-export async function refreshCursorHook(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-	return refreshCursorToken(credentials.refresh);
 }
 
 function decodeCursorAccessTokenPayload(token: string): unknown | undefined {

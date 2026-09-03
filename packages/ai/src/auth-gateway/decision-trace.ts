@@ -3,7 +3,6 @@ export type RouteDecisionDisposition = "dispatched" | "skipped" | "not_reached";
 export type RouteSkipReason =
 	| "capability_mismatch"
 	| "credential_unavailable"
-	| "credential_lookup_failed"
 	| "quota_cutoff"
 	| "provider_cooldown"
 	| "circuit_open"
@@ -14,7 +13,6 @@ export type RouteSkipReason =
 const SKIP_REASONS: Record<RouteSkipReason, true> = {
 	capability_mismatch: true,
 	credential_unavailable: true,
-	credential_lookup_failed: true,
 	quota_cutoff: true,
 	provider_cooldown: true,
 	circuit_open: true,
@@ -78,6 +76,11 @@ export class RouteDecisionTraceLog {
 	list(nowMs: number = Date.now()): readonly RouteDecisionTrace[] {
 		this.#evict(nowMs);
 		return this.#traces;
+	}
+
+	get(requestId: string, nowMs: number = Date.now()): readonly RouteDecisionTrace[] {
+		this.#evict(nowMs);
+		return this.#traces.filter(trace => trace.requestId === requestId);
 	}
 
 	#evict(nowMs: number): void {

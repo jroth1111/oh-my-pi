@@ -1,10 +1,10 @@
-import { reviewedCollapseTable } from "../compat/collapse";
-import { classifyModel } from "../compat/taxonomy";
 import { fetchAntigravityDiscoveryModels } from "../discovery/antigravity";
 import { fetchGeminiModels } from "../discovery/gemini";
 import { fetchGeminiCliQuotaModels } from "../discovery/gemini-cli";
+import { isGeminiModelId } from "../identity/family";
 import type { ModelManagerOptions } from "../model-manager";
 import type { FetchImpl } from "../types";
+import { GEMINI_CLI_VARIANT_COLLAPSE_TABLE } from "../variant-collapse";
 
 export interface GoogleModelManagerConfig {
 	apiKey?: string;
@@ -34,7 +34,6 @@ export interface GoogleGeminiCliModelManagerConfig {
 }
 
 const CLOUD_CODE_ASSIST_ENDPOINT = "https://cloudcode-pa.googleapis.com";
-const GEMINI_37_FLASH_CACHE_MIGRATION_MODEL_IDS = ["gemini-3.7-flash"] as const;
 
 function toDiscoveryFetch(fetchImpl: FetchImpl | undefined): typeof fetch | undefined {
 	if (!fetchImpl) {
@@ -52,7 +51,6 @@ export function googleModelManagerOptions(
 	const apiKey = config?.apiKey;
 	return {
 		providerId: "google",
-		dropCachedModelIdsOnStaticMismatch: GEMINI_37_FLASH_CACHE_MIGRATION_MODEL_IDS,
 		...(apiKey
 			? { fetchDynamicModels: () => fetchGeminiModels({ apiKey, fetch: toDiscoveryFetch(config?.fetch) }) }
 			: undefined),
@@ -60,10 +58,7 @@ export function googleModelManagerOptions(
 }
 
 export function googleVertexModelManagerOptions(_config?: GoogleVertexModelManagerConfig): ModelManagerOptions {
-	return {
-		providerId: "google-vertex",
-		dropCachedModelIdsOnStaticMismatch: GEMINI_37_FLASH_CACHE_MIGRATION_MODEL_IDS,
-	};
+	return { providerId: "google-vertex" };
 }
 
 export function googleAntigravityModelManagerOptions(
@@ -96,14 +91,10 @@ export function googleGeminiCliModelManagerOptions(
 			? {
 					fetchDynamicModels: async () => {
 						const fetcher = toDiscoveryFetch(config?.fetch);
-						const collapseTable = reviewedCollapseTable("google-gemini-cli");
-						if (collapseTable === undefined) {
-							throw new Error("missing reviewed collapse table for google-gemini-cli");
-						}
 						const models = await fetchAntigravityDiscoveryModels({
 							token,
 							fetcher,
-							collapseTable: collapseTable,
+							collapseTable: GEMINI_CLI_VARIANT_COLLAPSE_TABLE,
 						});
 						// Antigravity's fetchAvailableModels is unreachable for
 						// credentials without Antigravity entitlement (Code Assist
@@ -113,7 +104,7 @@ export function googleGeminiCliModelManagerOptions(
 							return fetchGeminiCliQuotaModels({ token, projectId: config?.projectId, endpoint, fetcher });
 						}
 						return models
-							.filter(m => classifyModel("google-gemini-cli", m.id, { lenient: true }).class === "gemini")
+							.filter(m => isGeminiModelId(m.id))
 							.map(m => ({
 								...m,
 								provider: "google-gemini-cli" as const,

@@ -469,6 +469,7 @@ describe("mergeIsolatedChanges", () => {
 		vi.spyOn(vcs, "requireGit").mockReturnValue({} as natives.VcsGitRepo);
 		vi.spyOn(worktreeModule, "mergeTaskBranches").mockResolvedValue({
 			merged: [],
+			processed: [],
 			failed: ["omp/task/Partial"],
 			conflict: "omp/task/Partial: conflict",
 			partialCommitsLanded: true,

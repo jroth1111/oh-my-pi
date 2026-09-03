@@ -1,7 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { streamBedrock } from "@oh-my-pi/pi-ai/providers/amazon-bedrock";
 import { crc32 } from "@oh-my-pi/pi-ai/providers/aws-eventstream";
-import { setBedrockProviderModule } from "@oh-my-pi/pi-ai/providers/register-builtins";
 import { streamSimple } from "@oh-my-pi/pi-ai/stream";
 import type { Context, FetchImpl, Model } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
@@ -139,13 +138,15 @@ describe("issue #6276 — Amazon Bedrock guardrails", () => {
 		});
 	});
 	it("maps transport guardrails into the Bedrock provider options", async () => {
-		setBedrockProviderModule({ streamBedrock });
+		const controller = new AbortController();
+		controller.abort();
 		const { promise, resolve } = Promise.withResolvers<GuardrailPayload>();
 		const stream = streamSimple(model(), context, {
 			guardrailIdentifier: "arn:aws:bedrock:eu-west-1:123456789012:guardrail/abcd1234",
 			guardrailVersion: "7",
 			guardrailTrace: "enabled_full",
 			providerOptions: { bearerToken: "test-token" },
+			signal: controller.signal,
 			fetch: async () => new Response(new Uint8Array(), { status: 200 }),
 			onPayload: payload => {
 				resolve(payload as GuardrailPayload);

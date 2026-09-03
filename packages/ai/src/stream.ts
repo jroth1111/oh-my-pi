@@ -10,7 +10,6 @@ import {
 	defaultSupportedEffort,
 	mapEffortToAnthropicAdaptiveEffort,
 	mapEffortToGoogleThinkingLevel,
-	minimumSupportedEffort,
 	requireSupportedEffort,
 	resolveWireModelId,
 } from "@oh-my-pi/pi-catalog/model-thinking";
@@ -34,7 +33,6 @@ import type { GoogleOptions } from "./providers/google";
 import { getVertexAccessToken } from "./providers/google-auth";
 import type { GoogleGeminiCliOptions } from "./providers/google-gemini-cli";
 import type { GoogleVertexOptions } from "./providers/google-vertex";
-import type { GrokbotOptions } from "./providers/grokbot";
 import { isKimiModel, streamKimi } from "./providers/kimi";
 import type { OllamaChatOptions } from "./providers/ollama";
 import type { OpenAICompletionsOptions } from "./providers/openai-completions";
@@ -56,7 +54,6 @@ import {
 	streamGoogle,
 	streamGoogleGeminiCli,
 	streamGoogleVertex,
-	streamGrokBot,
 	streamOllama,
 	streamOpenAICodexResponses,
 	streamOpenAICompletions,
@@ -148,21 +145,11 @@ function isOfficialOpenAIApiUrl(baseUrl: string | undefined): boolean {
 	}
 }
 
-const OFFICIAL_CODEX_URL = new URL(CODEX_BASE_URL);
-
 /** Strict official-Codex endpoint check; exact origin or a path boundary after {@link CODEX_BASE_URL}. */
 export function isOfficialCodexApiUrl(baseUrl: string | undefined): boolean {
 	if (!baseUrl) return true;
-	try {
-		const candidate = new URL(baseUrl);
-		const candidatePath = candidate.pathname.replace(/\/+$/, "");
-		return (
-			candidate.origin === OFFICIAL_CODEX_URL.origin &&
-			(candidatePath === OFFICIAL_CODEX_URL.pathname || candidatePath.startsWith(`${OFFICIAL_CODEX_URL.pathname}/`))
-		);
-	} catch {
-		return false;
-	}
+	const lower = baseUrl.toLowerCase().replace(/\/+$/, "");
+	return lower === CODEX_BASE_URL || lower.startsWith(`${CODEX_BASE_URL}/`);
 }
 
 /**
@@ -1042,9 +1029,6 @@ function streamDispatch<TApi extends Api>(
 		case "devin-agent":
 			return streamDevin(providerModel as Model<"devin-agent">, context, providerOptions as DevinOptions);
 
-		case "grokbot-sand":
-			return streamGrokBot(providerModel as Model<"grokbot-sand">, context, providerOptions as GrokbotOptions);
-
 		default:
 			throw new AIError.ConfigurationError(`Unhandled API: ${api}`);
 	}
@@ -1612,7 +1596,7 @@ function streamSimpleRequest<TApi extends Api>(
 				const nativeOptions =
 					model.api === "bedrock-converse-stream"
 						? {
-								...opts,
+								...(opts ?? {}),
 								guardrailIdentifier: model.guardrailIdentifier ?? opts?.guardrailIdentifier,
 								guardrailVersion: model.guardrailVersion ?? opts?.guardrailVersion,
 								guardrailTrace: model.guardrailTrace ?? opts?.guardrailTrace,
@@ -1997,15 +1981,6 @@ function mapOptionsForApi<TApi extends Api>(
 		fallbacks: options?.fallbacks,
 		acceptEmptyResponse: options?.acceptEmptyResponse,
 		anthropicCacheRefreshRequest: options?.anthropicCacheRefreshRequest,
-		anthropicPrefixMismatchBehavior: options?.anthropicPrefixMismatchBehavior,
-		cursorExcludeTools: options?.cursorExcludeTools,
-		cursorLocalCliMode: options?.cursorLocalCliMode,
-		cursorDevExperimentOverrides: options?.cursorDevExperimentOverrides,
-		cursorClientSupportsInlineImages: options?.cursorClientSupportsInlineImages,
-		cursorClientSupportsRoutedModelUpdate: options?.cursorClientSupportsRoutedModelUpdate,
-		cursorClientSupportsPromptContextUsageRpc: options?.cursorClientSupportsPromptContextUsageRpc,
-		cursorRunId: options?.cursorRunId,
-		cursorAgentSessionId: options?.cursorAgentSessionId,
 		...simpleProviderOptions,
 	};
 
@@ -2136,7 +2111,7 @@ function mapOptionsForApi<TApi extends Api>(
 			}
 			if (maxTokens <= budgetInfo.budget) {
 				const adjustedBudget = Math.max(0, maxTokens - MIN_OUTPUT_TOKENS);
-				thinkingBudgets = { ...thinkingBudgets, [budgetInfo.level]: adjustedBudget };
+				thinkingBudgets = { ...(thinkingBudgets ?? {}), [budgetInfo.level]: adjustedBudget };
 			}
 			return castApi<"bedrock-converse-stream">({ ...bedrockBase, maxTokens, thinkingBudgets });
 		}
@@ -2423,24 +2398,7 @@ function mapOptionsForApi<TApi extends Api>(
 				...base,
 				execHandlers,
 				onToolResult,
-				toolChoice: options?.toolChoice,
-				cursorToolPassthrough: options?.cursorToolPassthrough,
-				cursorExcludeTools: options?.cursorExcludeTools,
-				cursorLocalCliMode: options?.cursorLocalCliMode,
-				cursorDevExperimentOverrides: options?.cursorDevExperimentOverrides,
-				cursorClientSupportsInlineImages: options?.cursorClientSupportsInlineImages,
-				cursorClientSupportsRoutedModelUpdate: options?.cursorClientSupportsRoutedModelUpdate,
-				cursorClientSupportsPromptContextUsageRpc: options?.cursorClientSupportsPromptContextUsageRpc,
-				cursorRunId: options?.cursorRunId,
-				cursorAgentSessionId: options?.cursorAgentSessionId,
-				// Auto mode sends the "default" wire id; otherwise the provider
-				// resolves the wire id from the model's own requestModelId.
-				// Also pin synthetic catalog `auto` so streamSimple without the
-				// gateway header still hits the Cursor router contract.
-				wireModelId:
-					options?.cursorAutoMode || model.id === "auto" || model.requestModelId === "auto"
-						? "default"
-						: undefined,
+				wireModelId: resolveWireModelId(cursorModel, effort),
 			});
 		}
 
@@ -2461,28 +2419,6 @@ function mapOptionsForApi<TApi extends Api>(
 				chatModelUid: resolveWireModelId(devinModel, effort),
 			});
 		}
-		case "grokbot-sand": {
-			const grokbotModel = model as Model<"grokbot-sand">;
-			const allowed = grokbotModel.sandParameterIds ?? [];
-			const acceptsEffort = allowed.includes("effort") || allowed.includes("reasoning");
-			const disableThinking = Boolean(options?.disableReasoning || options?.forceReasoningOff);
-			let effort: Effort | undefined;
-			if (acceptsEffort && grokbotModel.reasoning && grokbotModel.thinking) {
-				if (disableThinking) {
-					// Omission would leave the server default (often high); floor instead.
-					effort = minimumSupportedEffort(grokbotModel) ?? defaultSupportedEffort(grokbotModel);
-				} else if (options?.reasoning) {
-					effort = requireSupportedEffort(grokbotModel, options.reasoning);
-				}
-			}
-			return castApi<"grokbot-sand">({
-				...base,
-				conversationId: options?.sessionId,
-				stopSequences: options?.stopSequences,
-				effort,
-				...(allowed.includes("thinking") ? { thinking: !disableThinking && Boolean(effort) } : {}),
-			});
-		}
 		default:
 			throw new AIError.ConfigurationError(`Unhandled API in mapOptionsForApi: ${model.api}`);
 	}
@@ -2501,8 +2437,20 @@ function getGoogleBudget(
 	}
 
 	// See https://ai.google.dev/gemini-api/docs/thinking#set-budget
-	const resolvedBudget = model.thinking?.effortBudgets?.[effort];
-	if (resolvedBudget !== undefined) return resolvedBudget;
+	if (model.id.includes("2.5-")) {
+		switch (effort) {
+			case "minimal":
+				return 128;
+			case "low":
+				return 2048;
+			case "medium":
+				return 8192;
+			case "high":
+			case "xhigh":
+			case "max":
+				return model.id.includes("2.5-flash") ? 24576 : 32768;
+		}
+	}
 
 	// Unknown model - use dynamic
 	return -1;

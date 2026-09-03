@@ -92,23 +92,11 @@ export function resolveModelCacheProviderId(providerId: string, options: ModelCa
 			return `${providerId}:models-v3:${Bun.hash(scope).toString(36)}`;
 		}
 		case "github-copilot": {
-			// Copilot model specs bake in the plan-specific endpoint (personal vs
-			// Business/Enterprise) resolved from the credential. Discovery writes an
-			// authoritative cache, so `online-if-uncached` serves it for the full
-			// TTL without re-probing. Keying the namespace on the credential means
-			// switching `COPILOT_GITHUB_TOKEN` to a different account misses the
-			// prior endpoint's cache and re-runs discovery instead of hitting the
-			// stale host and 403ing (PR #8510 review).
 			const baseUrl = options.baseUrl ?? PERSONAL_GITHUB_COPILOT_BASE_URL;
 			const scope = `${options.apiKey ?? ""}\u0000${baseUrl}`;
 			return `github-copilot:models-v1:${Bun.hash(scope).toString(36)}`;
 		}
 		case "grokbot": {
-			// AvailableModels is renewer-scoped and marked authoritative. Discovery
-			// also sends namespace + client-version headers (`grokbotClientHeaders`)
-			// from env *or* secrets/grokbot.env, so resolve identity through the
-			// shared helper that mirrors loadGrokbotConfig — unless the caller
-			// already passed a fully resolved identity (no second secrets read).
 			const baseUrl = options.baseUrl ?? GROKBOT_BACKEND;
 			const ns = options.namespace?.trim();
 			const ver = options.clientVersion?.trim();
@@ -126,8 +114,6 @@ export function resolveModelCacheProviderId(providerId: string, options: ModelCa
 		case "openrouter":
 			return "openrouter:pseudo-api";
 		case "vllm": {
-			// v2: qwen3.8 rows cached before the reasoning/template-effort upgrade
-			// carry `reasoning: false` and must be refetched.
 			const baseUrl = options.baseUrl ?? getDefaultModelDiscoveryBaseUrl(providerId)!;
 			return `vllm:models-v2:${Bun.hash(baseUrl).toString(36)}`;
 		}

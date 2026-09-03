@@ -17,14 +17,11 @@ import { getGitLabDuoModels } from "@oh-my-pi/pi-ai/providers/gitlab-duo";
 import { getProviderDefinition } from "@oh-my-pi/pi-ai/registry";
 import { $env } from "@oh-my-pi/pi-utils";
 import { buildModel } from "../src/build";
-import { isRetiredProvider } from "../src/compat/behavior";
-import { collapseVariants } from "../src/compat/collapse";
-import { resolveModelPolicy } from "../src/compat/resolve";
 import { ANTIGRAVITY_PRIMARY_ENDPOINT, fetchAntigravityDiscoveryModels } from "../src/discovery/antigravity";
 import { buildGitLabDuoWorkflowFallbackModel } from "../src/discovery/gitlab-duo-workflow";
-import { resolveGrokbotDiscoveryIdentityAsync } from "../src/discovery/grokbot-auth";
 import { createModelManager } from "../src/model-manager";
 import prevModelsJson from "../src/models.json" with { type: "json" };
+import { resolveOpenAIDaybreakStandardCost } from "../src/openai-pricing";
 import { toModelSpec } from "../src/provider-models/bundled-references";
 import {
 	allowsUnauthenticatedCatalogDiscovery,
@@ -33,10 +30,8 @@ import {
 	isCatalogDescriptor,
 } from "../src/provider-models/descriptor-types";
 import { PROVIDER_DESCRIPTORS } from "../src/provider-models/descriptors";
-import { buildGrokbotStaticSeed } from "../src/provider-models/grokbot";
 import { filterModelsDevCatalogRows } from "../src/provider-models/models-dev-policies";
 import {
-	ABLITERATION_STATIC_MODELS,
 	AIAND_STATIC_MODELS,
 	ALIBABA_TOKEN_PLAN_STATIC_MODELS,
 	ANTHROPIC_CURATED_FALLBACK_MODELS,
@@ -56,7 +51,6 @@ import {
 	mapModelsDevToModels,
 	OPENAI_DAYBREAK_CURATED_FALLBACK_MODELS,
 	projectOpenAIProReasoningAliases,
-	resolveZaiApi,
 	SAKANA_FUGU_STATIC_MODELS,
 	stripFireworksDeepSeekThinkingToggle,
 	YOLO_AUTO_STATIC_MODELS,
@@ -68,7 +62,7 @@ import {
 } from "../src/provider-models/special";
 import type { Api, Model, ModelSpec } from "../src/types";
 import { cleanModelName } from "../src/utils";
-import { mergeCopilotApiHeaders } from "../src/wire/github-copilot";
+import { collapseEffortVariantsAcrossProviders } from "../src/variant-collapse";
 import {
 	applyAntigravityPricingFallback,
 	applyCanonicalLimitFallback,
@@ -90,6 +84,7 @@ const packageRoot = path.join(import.meta.dir, "..");
  * and never written to models.json.
  */
 const DISCOVERY_ONLY_PROVIDERS = new Set(["ollama", "vllm", "lm-studio", "litellm"]);
+const RETIRED_PROVIDERS = new Set(["wafer-pass", "wandb"]);
 /**
  * Credential-scoped catalogs (Devin's Cascade roster is gated per account/team
  * via `allowed_model_uids`). Fetching them during generation would bake one
@@ -102,39 +97,6 @@ const DISCOVERY_ONLY_PROVIDERS = new Set(["ollama", "vllm", "lm-studio", "litell
  * fallback-only policy below).
  */
 const CREDENTIAL_SCOPED_PROVIDERS = new Set(["devin"]);
-
-/**
- * Restores unfetched rows from a previous generated catalog while pruning
- * providers whose snapshots are no longer valid.
- */
-export function mergePreviousSnapshotModels(
-	models: readonly ModelSpec[],
-	previousModels: Readonly<Record<string, Readonly<Record<string, Model<Api>>>>>,
-	excludedProviders: ReadonlySet<string>,
-): ModelSpec[] {
-	const merged = [...models];
-	const fetchedKeys = new Set(models.map(model => `${model.provider}/${model.id}`));
-	for (const provider in previousModels) {
-		const providerModels = previousModels[provider];
-		for (const id in providerModels) {
-			const model = toModelSpec(providerModels[id]);
-			if (
-				!fetchedKeys.has(`${model.provider}/${model.id}`) &&
-				!DISCOVERY_ONLY_PROVIDERS.has(model.provider) &&
-				!CREDENTIAL_SCOPED_PROVIDERS.has(model.provider) &&
-				// Yolo-Auto / Grok Bot documented static seeds are the complete
-				// offline fallback; never resurrect retired ids from the previous snapshot.
-				model.provider !== "yolo-auto" &&
-				model.provider !== "grokbot" &&
-				!isRetiredProvider(model.provider) &&
-				!excludedProviders.has(model.provider)
-			) {
-				merged.push(model);
-			}
-		}
-	}
-	return merged;
-}
 
 async function resolveProviderApiKey(providerId: string, catalog: CatalogDiscoveryConfig): Promise<string | undefined> {
 	for (const envVar of catalog.envVars ?? []) {
@@ -190,11 +152,7 @@ async function fetchProviderModelsFromCatalog(
 		const discoveryConfig = { apiKey };
 		const preparedConfig =
 			getProviderDefinition(descriptor.providerId)?.prepareModelDiscovery?.(discoveryConfig) ?? discoveryConfig;
-		const managerConfig =
-			descriptor.providerId === "grokbot"
-				? { ...preparedConfig, ...(await resolveGrokbotDiscoveryIdentityAsync()) }
-				: preparedConfig;
-		const managerOptions = descriptor.createModelManagerOptions(managerConfig);
+		const managerOptions = descriptor.createModelManagerOptions(preparedConfig);
 		const manager = createModelManager(managerOptions);
 		const result = await manager.refresh("online");
 		// `stale: true` means the dynamic fetch failed and the manager fell back
@@ -270,11 +228,7 @@ function applyGlobalModelsDevFallback(
 		if (
 			providerScopedKeys.has(`${model.provider}/${model.id}`) ||
 			model.provider === "devin" ||
-			model.provider === "baseten" ||
-			// Meta's first-party rows come from the reviewed seed; a same-id
-			// gateway row would overwrite their display names.
-			model.provider === "meta"
-			resolveModelPolicy(model).catalog.credentialScopedCatalog === true
+			model.provider === "baseten"
 		) {
 			return model;
 		}
@@ -364,9 +318,7 @@ function applyCodexPricingFallback(models: readonly ModelSpec[]): ModelSpec[] {
 			return model;
 		}
 
-		// Daybreak standard pricing is rule-owned (`providers/openai-codex.kdl`
-		// cost-patch); only same-id openai mirrors remain generator-applied.
-		const openAICost = openAIModels.get(model.id);
+		const openAICost = openAIModels.get(model.id) ?? resolveOpenAIDaybreakStandardCost(model.id);
 		if (!openAICost) {
 			return model;
 		}
@@ -568,11 +520,8 @@ async function generateModels() {
 	const gitLabDuoModels = getGitLabDuoModels().map(model => toModelSpec(model));
 	// Combine models. stencil.so has priority unless a provider's successful endpoint
 	// discovery is authoritative; those endpoint snapshots replace stencil.so rows.
-	// Meta's reviewed first-party seed goes first: it carries the documented
-	// Responses capabilities and display names, and keeps first-run selection
-	// independent of credentials or live discovery.
 	let allModels = applyGlobalModelsDevFallback(
-		[...META_MUSE_STATIC_MODELS, ...bundledModelsDevModels, ...catalogProviderModels, ...gitLabDuoModels],
+		[...bundledModelsDevModels, ...catalogProviderModels, ...gitLabDuoModels],
 		modelsDevModels,
 	);
 
@@ -589,12 +538,6 @@ async function generateModels() {
 	// persisted `modelRoles.default = "xai-oauth/<id>"` is honored before the
 	// async refresh fires (interactive boot does not await refresh).
 	allModels.push(...buildXaiOAuthStaticSeed());
-	// Grok Bot — tiny offline seed (sand routers + Auto + grok-4.6). Live
-	// AvailableModels is authoritative when renewer is present; previous-snapshot
-	// grokbot rows are excluded below so retired alias forests do not resurrect.
-	if (!authoritativeCatalogProviders.has("grokbot")) {
-		allModels.push(...buildGrokbotStaticSeed());
-	}
 	// Daybreak is separately provisioned and absent from stencil.so. Keep its
 	// documented aliases and current Cyber snapshot in every generated bundle.
 	allModels.push(...OPENAI_DAYBREAK_CURATED_FALLBACK_MODELS);
@@ -621,26 +564,29 @@ async function generateModels() {
 		contextWindow: 1_000_000,
 		maxTokens: 131_072,
 	} as ModelSpec<"anthropic-messages">);
-	// GLM-5.3-Flash is absent from `/v1/models`-derived upstream metadata.
-	// It is the first natively multimodal GLM coding SKU — its id carries no
-	// `v` marker — so the seed declares image input directly instead of
-	// inheriting the text-only default. Its API route is model-specific because
-	// Z.AI serves this SKU on the native endpoint rather than the Anthropic
-	// coding endpoint. Use the documented list price from
+	// GLM-5.3-Flash ships on the same coding-plan endpoints and is likewise
+	// absent from `/v1/models`-derived upstream metadata. It is the first
+	// natively multimodal GLM coding SKU — its id carries no `v` marker, and
+	// base64 image blocks are accepted on `https://api.z.ai/api/anthropic` —
+	// so the seed declares image input directly instead of inheriting the
+	// text-only default. Use the documented list price from
 	// https://docs.z.ai/guides/overview/pricing rather than the 50%-off launch
 	// promotion, which expires on 2026-09-09.
-	const zaiGlm53FlashApi = resolveZaiApi("glm-5.3-flash");
 	allModels.push({
 		id: "glm-5.3-flash",
 		name: "GLM-5.3-Flash",
-		...zaiGlm53FlashApi,
+		api: "anthropic-messages",
 		provider: "zai",
+		baseUrl: "https://api.z.ai/api/anthropic",
 		reasoning: true,
 		input: ["text", "image"],
 		cost: { input: 0.15, output: 0.5, cacheRead: 0.03, cacheWrite: 0 },
 		contextWindow: 1_000_000,
 		maxTokens: 131_072,
-	} satisfies ModelSpec<Api>);
+	} as ModelSpec<"anthropic-messages">);
+	// Seed Meta's documented Muse model so first-run selection does not depend on
+	// credentials or live discovery.
+	allModels.push(...META_MUSE_STATIC_MODELS);
 	// Mantle's catalog endpoint is account/API-key scoped. Keep the generated
 	// bundle deterministic; authenticated runtime discovery may replace this seed.
 	allModels.push(...BEDROCK_MANTLE_STATIC_MODELS);
@@ -655,12 +601,6 @@ async function generateModels() {
 	// authoritative and replaces the seed.
 	if (!authoritativeCatalogProviders.has("aiand")) {
 		allModels.push(...AIAND_STATIC_MODELS);
-	}
-	// Seed Abliteration's documented catalog so the provider is usable when
-	// generation has no ABLITERATION_API_KEY. A live `/v1/models` snapshot is
-	// authoritative and replaces the seed.
-	if (!authoritativeCatalogProviders.has("abliteration")) {
-		allModels.push(...ABLITERATION_STATIC_MODELS);
 	}
 	// Seed Yolo-Auto's documented catalog so the provider is usable when
 	// generation has no YOLO_AUTO_API_KEY. A live `/v1/models` snapshot is
@@ -734,27 +674,32 @@ async function generateModels() {
 	// or authoritative stencil.so sources keep that upstream list exactly, so
 	// retired entries from the previous snapshot do not reappear during regeneration.
 	// Discovery-only providers (local inference servers) — never bundle static models.
-	const previousSnapshotExcludedProviders = new Set([
-		...authoritativeCatalogProviders,
-		...authoritativeSpecialDiscoveryProviders,
-		...modelsDevSnapshotExcludedProviders,
-	]);
+	const fetchedKeys = new Set(allModels.map(model => `${model.provider}/${model.id}`));
 
 	// Previous-snapshot entries may carry an older ThinkingConfig vocabulary;
 	// applyGeneratedModelPolicies re-bakes `thinking` for every model, so the
 	// inbound shape is irrelevant beyond identity/pricing/compat fields.
-	allModels = mergePreviousSnapshotModels(
-		allModels,
-		prevModelsJson as unknown as Record<string, Record<string, Model<Api>>>,
-		previousSnapshotExcludedProviders,
-	);
+	for (const models of Object.values(prevModelsJson as unknown as Record<string, Record<string, Model<Api>>>)) {
+		for (const bundledModel of Object.values(models)) {
+			const model = toModelSpec(bundledModel);
+			if (
+				!fetchedKeys.has(`${model.provider}/${model.id}`) &&
+				!DISCOVERY_ONLY_PROVIDERS.has(model.provider) &&
+				!CREDENTIAL_SCOPED_PROVIDERS.has(model.provider) &&
+				// Yolo-Auto's documented static seed is the complete fallback
+				// catalog; never resurrect retired ids from the previous snapshot.
+				model.provider !== "yolo-auto" &&
+				!RETIRED_PROVIDERS.has(model.provider) &&
+				!authoritativeCatalogProviders.has(model.provider) &&
+				!authoritativeSpecialDiscoveryProviders.has(model.provider) &&
+				!modelsDevSnapshotExcludedProviders.has(model.provider)
+			) {
+				allModels.push(model);
+			}
+		}
+	}
 
 	allModels = applyGlobalModelsDevFallback(allModels, modelsDevModels);
-	// Previous-snapshot fallbacks can retain a retired client fingerprint. Force
-	// every bundled Copilot model onto the same identity used by live discovery.
-	allModels = allModels.map(model =>
-		model.provider === "github-copilot" ? { ...model, headers: mergeCopilotApiHeaders(model.headers) } : model,
-	);
 	// Seed QwenCloud's documented Token Plan models when credentialed
 	// discovery is unavailable. A successful `/models` response is authoritative
 	// for the subscribed edition and must not be widened by the fallback.
@@ -788,7 +733,7 @@ async function generateModels() {
 	// Collapse effort-tier variants AFTER the policy re-bake: live-discovery
 	// entries are already collapsed (rebake skips them); this pass folds
 	// previous-snapshot raw members into their logical families.
-	allModels = collapseVariants(allModels);
+	allModels = collapseEffortVariantsAcrossProviders(allModels);
 	// Fill remaining null endpoint limits from each model's canonical-family
 	// reference. Runs last so canonical ids and explicit policy limits are final.
 	applyCanonicalLimitFallback(allModels);
@@ -803,7 +748,7 @@ async function generateModels() {
 	// Group by provider and sort each provider's models
 	const providers: Record<string, Record<string, ModelSpec>> = {};
 	for (const model of allModels) {
-		if (DISCOVERY_ONLY_PROVIDERS.has(model.provider) || isRetiredProvider(model.provider)) continue;
+		if (DISCOVERY_ONLY_PROVIDERS.has(model.provider) || RETIRED_PROVIDERS.has(model.provider)) continue;
 		if (!providers[model.provider]) {
 			providers[model.provider] = {};
 		}
@@ -866,6 +811,5 @@ function canonicalizeModelCompat(model: ModelSpec<Api>): void {
 	}
 }
 
-if (import.meta.main) {
-	generateModels().catch(console.error);
-}
+// Run the generator
+generateModels().catch(console.error);

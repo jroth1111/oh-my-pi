@@ -1,212 +1,14 @@
+# Changelog
+
 ## [Unreleased]
 
-## [18.1.5] - 2026-09-03
 ### Fixed
 
-- Cursor tool passthrough merges authoritative `mcpArgs` into a prior `toolCallStarted` announcement instead of only marking the empty block resolved.
-- Auth-gateway Cursor auto SSE waits for an explicit `routed_model` checkpoint (from `InteractionUpdate.routedModel` or conversation checkpoint extraction) before flushing `message_start` / OpenAI envelopes — repeated `partial.model` observations no longer count as routing complete.
-- Auth-gateway non-streaming responses only rewrite the echoed `model` id under Cursor auto routing; otherwise they retain the client's requested id (including provider-qualified forms like `cursor/gpt-5`).
-- Cursor tool passthrough excludes native todo tools (`todo` / `update_todos` / `read_todos`) from the allowlist and interaction path the same way as `connect_scm`.
-- Auth-gateway Chat Completions keeps provider-qualified request model ids (e.g. `cursor/gpt-5`) stable across SSE chunks unless Cursor auto routing is active.
-- Cursor tool passthrough ends the turn only after a real exec synthesis/deferral — approval-only `mcpArgs` probes no longer set `toolUse` when a prior `toolCallStarted` announcement is already present.
-- Cursor tool passthrough synthesizes `writeShellStdinArgs` and `redactedReadArgs` for the caller, and excludes server-only `connect_scm` / native todo tools from the allowlist / interaction path.
-- Cursor SSE deferral treats the discovered `default` wire id as auto intent; routing resolve requires an explicit `routed_model` signal (not a second `partial.model` observation).
-- Auth-gateway SSE only buffers `auto`/`default` model envelopes when Cursor auto mode is set, so literal provider ids like OpenRouter `auto` still stream immediately.
-- Cursor tool passthrough restricts `x-cursor-agent-allowed-tools` to a named forced `toolChoice` (advertising that name alone even when absent from declared tools).
-- Cursor tool passthrough sends `x-cursor-agent-allowed-tools: __none__` when `toolChoice` is `"none"`, even if tools are declared.
-- Cursor consumes `InteractionUpdate.routedModel` into `output.model` when the backend advertises routed-model updates.
-- Cursor tool passthrough synthesizes and defers `backgroundShellSpawnArgs` the same way as other bash exec variants.
-- Cursor `streamSimple` / pi-native capability and session options (`cursorClientSupportsInlineImages`, routed-model / prompt-context RPC flags, `cursorRunId`, `cursorAgentSessionId`) now populate `AgentRunRequest` protobuf fields instead of being dropped before the wire.
-- Unknown Cursor `interaction_query` variants are no longer auto-approved; only the verified unnamed WebFetch field (9) still gets an `approved {}` fallback.
-- Cursor auto-mode Anthropic SSE now buffers content until the routed model is known, so `message_start` is not permanently stamped with `auto`/`default`/the pre-route placeholder.
-- Cursor auto-mode OpenAI Chat Completions and Responses SSE similarly defer the initial role / `response.created` envelopes until routing resolves.
-- Cursor auto-mode Responses SSE also buffers early `text`/`thinking`/`toolcall` events until routing lands, so content cannot force `response.created` with the pre-route placeholder.
-- Cursor tool passthrough always sends `x-cursor-agent-allowed-tools` (including `__none__` when the caller declares no tools) so Cursor does not keep its unrestricted native set.
-- Cursor auto-mode Chat Completions rebuilds buffered deltas with the routed model id; same-id auto routing releases deferral via an explicit `routed_model` signal.
-- Cursor tool passthrough surfaces empty-pattern `grepArgs` and approves declared MCP approval probes so the external caller receives the invocation.
-- Auth-gateway CORS preflights allow the Cursor control headers (`x-cursor-auto-mode`, `x-cursor-tool-passthrough`, `x-cursor-agent-exclude-tools`, `local-cli-mode`, `x-dev-experiment-overrides`).
-- Cursor `DEBUG_CURSOR` interaction logs go through the central logger instead of `console.error`.
-- Cursor tool passthrough synthesizes and defers `fetchArgs`, `listMcpResourcesExecArgs`, and `readMcpResourceExecArgs` the same way as other exec variants.
-- Cursor passthrough ignores server-hosted `web_fetch` interaction announcements (while retaining deferrable `fetchArgs`) and rejects unsupported `toolChoice: "required"` / `"any"` and forced server-only tools instead of silently weakening the allowlist.
-### Fixed
-
-- Fixed auth-gateway decision traces accepting `credential_lookup_failed` as a skipped reason when `getApiKey` throws.
-### Fixed
-
-- Prefer healthy API-key siblings before leasing a cooldown probe, and acquire API-key probes under the ranking block scope that caused the cooldown.
-- Preserve Retry-After provenance across broker snapshots, retain in-memory reconciliation deadlines for new backoff maps, and commit when prelude buffering hits the cap.
-- Require probe leases for blocked API-key selections, avoid double-forwarding the commit chunk, and skip settlement waits on failed stream release.
-- Persist Retry-After provenance in SQLite credential blocks, compare OAuth orgId on equality, and observe remaining SSE frames in the commit chunk.
-- Fixed OpenAI Responses continuation pairing a caller-supplied `previous_response_id` with an internally computed delta from a different stored response, and restricted stale-baseline recovery to internally owned chain ids so a stale caller id can no longer silently drop prior context.
-- Auth gateway observes Responses SSE through a StreamCommitGate: metadata-only preludes stay failover-eligible, the first output event or 4 MiB cap commits, and post-commit terminals (`response.completed`/`response.failed`/`response.incomplete`/`response.error`) end failover eligibility instead of being misread as output.
-- Settle probes from canonical stream results, reuse request-owned probe leases on auth retry, and observe post-commit SSE terminals.
-- Require probe leases on allow-blocked paths, forward successful terminal-only SSE preludes, return 429 while credentials cool down, and carry Retry-After provenance on durable blocks when the store round-trips it.
-- Fixed quota probes honoring global Retry-After when selection uses a chat/spark scope, and workspace deactivation attributing rotated bearers via fingerprint history.
-- Fixed quota-probe leases releasing on abort/5xx/fallback via `clearQuotaProbe`, and settling only on successful stream completion.
-
-- Fixed deactivated_workspace fan-out tests for org-scoped identities, and treated empty previousResponseId as present rather than falling through to internal chaining.
-- Fixed quota-probe leases still applying on the allowBlocked OAuth pass for Retry-After blocks, workspace deactivation fan-out matching only organization-qualified identity keys, and Chat→Responses `json_schema.description` preservation.
-### Fixed
-
-- Preserve the SSE chunk that crosses the StreamCommitGate prelude byte cap instead of dropping it on commit.
-- Renew turn reservations while SSE chunks arrive so long streams outlive the idle TTL, and skip cooldown-blocked API keys when healthy rows are already reserved.
-
-- Reserve stored API-key rows before returning them, and flush metadata-only held SSE preludes at EOF.
-- Cancel the upstream stream before awaiting settlement on client disconnect so turn reservations are not held while the model finishes.
-- Lease quota probes against the block scope that actually caused the cooldown (global Retry-After wins over chat/spark).
-
-- Await canonical stream settlement before EOF can settle quota probes.
-- Fixed format-endpoint streams marking failed/aborted `events.result()` outcomes on the commit gate before EOF can settle a quota probe.
-
-- Fixed releasing turn reservations on post-getApiKey aborts, settling foreign-format probing successes, and gating pi-native probe settlement on stream stopReason.
-- Fixed quota-probe settlement ignoring failed terminals, and reacquiring turn reservations after prepare/broker identity bumps.
-- Fixed OpenAI Responses strict-tool retries reapplying explicit `store` / continuation requirements, and forwarded successful terminal-only Responses SSE preambles.
-### Fixed
-
-- Release failed/cancelled streams without awaiting pending settlement so turn and probe locks cannot stall.
-- Parse Responses text.format and store into gateway options, and reapply store on strict-tool retries.
-- Settle quota probes only after canonical success evidence, and release API-key turn reservations when credential helpers fail.
-- Reserve stored API-key selections for turn exclusivity, run no-status message heuristics before default provider failure, and assert virtual-route dispatch behavior.
-- Fixed virtual route dispatch resolving `compiled.targets[0]`, and reacquiring turn reservations after broker prepare/incarnation bump.
-
-- Fixed suffix fallback edges, rejected ambiguous cross-branch target reuse, distinguished failed terminals for probe settlement, and released reservations on abort.
-- Fixed nested route-graph fallback edges retaining their entry target via `fallbackByTarget` so unentered branches cannot steal failover.
-- Fixed caller-owned Responses continuations forcing `store: true`, and settled successful pi-native streaming probes without a commit gate.
-### Fixed
-
-- Bump credential incarnation when a stored API-key row is replaced (or an OAuth row becomes an API key) so prior turn reservations cannot suppress the new key.
-- Settle gateway quota probes only on committed output or successful terminals, release pi-native reservations when abort wins lookup, lease probes against the active block scope, and skip cooldown-blocked API keys when healthy rows are reserved.
-
-- Require a quota probe lease on the allow-blocked OAuth fallback pass.
-- Add parent fallback edges from every nested child target to the later sibling entry.
-- Preserve JSON-schema descriptions when flattening Chat Completions response_format for Responses, and store in-memory Codex reconciliation deadlines.
-
-- Renew turn reservations while streams are active; release API-key holds when secret resolution fails.
-- Fixed API-key turn reservations releasing when credential-helper resolution fails, and renewing the hold as SSE chunks arrive so long streams outlive the idle TTL.
-
-- Fixed rejecting ambiguous cross-branch model reuse under a single fallback node.
-- Fixed pi-native virtual routes dispatching compiled.targets[0], suffix fallback edges per sibling, and a parse→wire Responses options contract test.
-- Fixed nested fallback edges scoped per source target, turn reservations for selected API-key rows, and rejection of unsupported Codex `previous_response_id` over the gateway.
-### Fixed
-- Fixed strict-tools Responses retries preserving caller `store`/`previous_response_id`, denied allowBlocked bypass of foreign turn reservations, and reacquired reservations after broker prepare.
-
-- Gateway error classifications now carry a failure owner and retry/failover disposition (`credential_permanent`, `provider_transient`, `policy_terminal`, …); provider status codes stay authoritative over message wording, and context-overflow detection reuses the central classifier.
-- Gateway requests now forward `previous_response_id`, `parallel_tool_calls`, `logit_bias`, `user`, and `response_format` to providers instead of dropping them; Responses requests map `response_format` JSON-schema to the flat `text.format` shape and never send Chat-Completions-only `seed`.
-- Auth gateway observes Responses SSE through a StreamCommitGate: metadata-only preludes stay failover-eligible, the first output event or 4 MiB cap commits, and post-commit terminals (`response.completed`/`response.failed`/`response.incomplete`/`response.error`) end failover eligibility instead of being misread as output.
-- Auth gateway virtual routes now fail over to a backup model when the primary is unavailable, as long as the response stream has not been committed.
-
-- Fixed Retry-After provenance hydration from persisted blocks, releasing turn reservations on fallback, and OpenAI model-does-not-exist 404 classification.
-- Fixed clearing quota probes before fallback/sibling retries, per-target sibling-credential attempt budget, and stream-commit contract coverage for pre-commit failures.
-### Fixed
-
-- Forward OpenRouter Responses `previous_response_id` / `parallel_tool_calls` and Chat Completions `parallel_tool_calls` through the API mapper.
-- Delay non-Responses stream commit until meaningful assistant events, and flush held SSE prelude frames when a probing stream ends without commit.
-- Keep the leased credential id for anonymous cooldown-probe cleanup when concurrent reorders shift selection indices.
-- Delay pi-native stream commit until text/thinking/tool deltas; keep Responses structural item/part events pre-commit.
-- Forward `previous_response_id` onto Azure Responses wire params and Chat Completions seed/logit_bias/user/response_format through the API mapper.
-- Treat Anthropic message_start as stream metadata; restore Cloudflare and MCP OAuth notes to their released sections.
-
-- Authoritative HTTP status beats free-text aborted wording; Responses file_id refs are rejected on incompatible targets.
+- Quota probes require a requestId; balance routes pick the initial target via rr/weighted strategy.
+- Fixed auth-gateway credential disable returning success before a remote broker disable completed; the handler now awaits the remote path when present.
 
 ### Added
 
-- Added `/login abliteration` with API key validation against `/v1/models`, supporting the `ABLITERATION_API_KEY` and `ABLIT_KEY` environment variables.
-
-### Changed
-- Gateway error classifications now carry a failure owner and retry/failover disposition (`credential_permanent`, `provider_transient`, `policy_terminal`, …); provider status codes stay authoritative over message wording, and context-overflow detection reuses the central classifier.
-- Gateway requests now forward `previous_response_id`, `parallel_tool_calls`, `logit_bias`, `user`, and `response_format` to providers instead of dropping them; Responses requests map `response_format` JSON-schema to the flat `text.format` shape and never send Chat-Completions-only `seed`.
-- Auth gateway observes Responses SSE through a StreamCommitGate: metadata-only preludes stay failover-eligible, the first output event or 4 MiB cap commits, and post-commit terminals (`response.completed`/`response.failed`/`response.incomplete`/`response.error`) end failover eligibility instead of being misread as output.
-
-- Modernized provider authentication and token refresh across the catalog, with shared support for API-key, authorization-code, and device-code sign-in flows and clearer sign-in progress messages for OpenRouter, Kimi, and xAI.
-
-### Fixed
-
-- GitHub Copilot now uses the official Copilot CLI identity and OAuth application for requests and new sign-ins, restoring access to client-gated models while preserving existing credentials.
-- GitHub Copilot now reports `model_not_supported` responses immediately instead of repeatedly retrying unsupported models.
-- Improved account recovery after Google rate limits are lifted earlier than the reported reset time.
-- Fixed unmetered autocomplete models being reported as exhausted when quota is limited.
-- Fixed Gemini 3 cross-model sessions in Cloud Code Assist when replaying tool calls without a thought signature.
-- Fixed Cursor models behind an authentication gateway incorrectly retrying valid client-declared tool calls.
-- Fixed reasoning from models that prefill `<think>` (including DeepSeek-R1 and hosted Qwen3-Thinking) being shown in the response instead of as a separate thinking block.
-
-## [18.1.3] - 2026-09-02
-
-### Fixed
-
-- Fixed Gemini 3 sessions on Antigravity/Cloud Code Assist and Vertex AI getting permanently stuck on `400 INVALID_ARGUMENT` after a turn with parallel tool calls ([#9638](https://github.com/can1357/oh-my-pi/issues/9638)).
-- Preserved Anthropic thinking now survives side requests, tool-description drift, turn-scoped reminders, and recoverable prefix mismatches without corrupting the conversation prefix.
-- Fixed Anthropic-compatible endpoints backed by Amazon Bedrock permanently rejecting a session once an unsigned thinking block entered its history. The transport now recognizes Bedrock's `ValidationException … thinking.signature: Field required` as the same unsigned-thinking rejection it already heals for other signing proxies, so it demotes the unsigned block to text, retries once, and remembers the endpoint for the rest of the session instead of failing every turn and walking the model fallback chain.
-- Fixed the DeepSeek DSML markup healer leaking orphan `</｜DSML｜parameter>`/`</｜DSML｜invoke>` close tags into visible text, which poisoned long-session history and reinforced the model's XML-protocol mimicry until tool calls stopped dispatching ([#10556](https://github.com/can1357/oh-my-pi/issues/10556)).
-- Fixed repeated parallel tool-call batches bypassing the configured loop guard.
-- Fixed Cursor tool-schema composition failures by projecting unsupported keywords only for confirmed Fable models; Grok and other Cursor models retain canonical schemas.
-- Fixed API-key account rotation to honor provider-reported quota reset windows, including overlapping exhausted windows ([#10325](https://github.com/can1357/oh-my-pi/pull/10325) by [@usr-bin-roygbiv](https://github.com/usr-bin-roygbiv)).
-
-## [18.1.2] - 2026-09-01
-
-### Added
-
-- Added thinking controls for Amazon Bedrock models.
-- Added dynamic mid-conversation updates for Anthropic system prompts, tools, and reasoning effort.
-- Added deferred tool loading and prompt caching for Anthropic models.
-- Added configurable handling for invalid Anthropic thinking blocks through `anthropicPrefixMismatchBehavior`.
-
-### Fixed
-
-- Fixed compatibility issues with Anthropic thinking and prompt-cache breakpoints across deployments, preserving valid reasoning context while preventing invalid-signature errors.
-- Fixed incorrect operating-system information reported in request headers on non-Linux systems.
-- Fixed Google Antigravity quota handling so requests rotate to another account with available usage instead of unnecessarily switching models.
-- Fixed Anthropic authentication for newer models by updating the Claude Code request fingerprint.
-
-## [18.1.0] - 2026-09-01
-
-### Added
-
-- Grok Bot **product sand wire** for Anthropic-labeled models + tools: `GROKBOT_ANTHROPIC_TOOLS_WIRE=auto` (default) rewrites to `sand-automation` + `generalPurpose`, maps omp tools to PascalCase field-2 names (`bash`→`Shell`, `read`→`Read`) with `{ jsonSchema: … }` envelopes, field-9 host allowlists, and `automationId`. Parent-chat profile (`parent-chat` / `sand-default`) injects `SendToUser`; responses promote `SendToUser` toolCallPart streams to assistant text. Probe: `scripts/grokbot-automation-tools-probe.mjs`; matrix gate: `--mode opus-tools`.
-- Grok Bot discovery synthesizes **legacySlug variant rows** (`requestModelId` + variant `sandParameterIds`) from AvailableModels variants.
-
-### Fixed
-
-- `/grokbot` reports the configured provider base URL (proxy override) instead of always showing the default sand host.
-- Grok Bot connect trailer errors surface `ERROR_PROVIDER_ERROR` / HTTP status / detail instead of opaque `Error` / `internal error` messages.
-- Grok Bot sends complete sand parameter sets (`thinking` / `context` / `effort` / `fast`) when AvailableModels advertises them, matching Cursor variant wire (Anthropic defaults `fast:false`; context follows `sandMaxMode`).
-- Grok Bot context tiers follow discovered AvailableModels variant defaults instead of hard-coded `300k` / `1m` when upstream advertises different values.
-- Grok Bot product wire prefers `write` over `edit` for the shared sand `Write` tool so advertised schema and dispatch stay aligned.
-- Grok Bot product wire aliases (Shell/Read/Write) stay off `customWireName` so later OpenAI Responses replay does not treat them as custom tools.
-- Grok Bot Anthropic sand tools routing uses catalog taxonomy identity (`classifyModel` class anthropic), not model-id string prefixes.
-- Grok Bot product-wire turns rewrite replayed history tool names (`bash`/`read`/`write`) to Shell/Read/Write to match advertised schemas.
-- Grok Bot bare-wire routing follows catalog `sandParameterIds` / `sandMaxMode` instead of a hard-coded model-id set.
-- Grok Bot preserves empty-string grammar `rawToolCallArgs` on history replay instead of dropping the raw oneof field.
-- `/grokbot` reports Renewer present when the credential comes from `providers.grokbot.apiKey` or a runtime API-key override.
-- Grok Bot pairs tool-result wire names with the historical assistant call id when tools/`edit.mode` change after the call.
-- Grok Bot rejects completed tool calls whose arguments are a JSON array instead of an object.
-- Grok Bot honors `acceptEmptyResponse` so passive/zero-output callers can accept trailer-only completions.
-- Grok Bot rejects trailer-only or thinking-only streams with no text or tool call instead of emitting an empty successful stop.
-- Grok Bot floors effort to the model's minimum supported tier when reasoning is disabled, instead of omitting the parameter (server default high).
-- Grok Bot sends `fast: true` by default when a model advertises the `fast` parameter (explicit `false` is preserved).
-- Grok Bot keeps JSON-shaped grammar tool output as `{ input: rawText }` instead of JSON-decoding it into structured arguments.
-- Grok Bot merges request headers case-insensitively so reserved names like `Authorization` / `Content-Type` are replaced rather than comma-joined.
-- Grok Bot Connect end-stream `unauthenticated` errors clear the JWT cache and surface as HTTP 401 for credential retry.
-- Grok Bot marks every grammar/customFormat tool call (including hashline/sloppy without a renamed wire id) so previews and history replay use raw args.
-- Grok Bot tool-result replay maps grammar tools to their wire name (`customWireName`) so call/result names stay paired.
-- Grok Bot protobuf decoding rejects nested stream-response fields with incorrect wire types instead of coercing them to empty values.
-- Grok Bot sends discovered `minimal` / `max` effort values on the wire instead of collapsing them to `low` / `xhigh` (aliases only via `thinking.effortMap`).
-- Grok Bot protobuf decoding rejects known InferenceStreamResponse fields with the wrong wire type instead of emitting empty parts.
-- Grok Bot protobuf decoding rejects illegal field number zero instead of treating malformed frames as empty successful messages.
-- Grok Bot inference requests include `model.headers` (merged under provider-owned auth/client headers) so reverse-proxy API keys are sent.
-- Grok Bot token minting forwards the same caller/model headers so reverse-proxy gateways accept renewal before inference.
-- Grok Bot grammar/customFormat tools (`apply_patch`, hashline, sloppy) accept raw non-JSON args as `{ input }` and preserve `customWireName`.
-- Grok Bot streams update `ToolCall.arguments` (and the streamed partial buffer) on every tool chunk so live previews are not empty until completion.
-- Grok Bot assistant-history replay sends grammar calls as wire name + `rawToolCallArgs` instead of internal name + Struct args.
-- Grok Bot rejects completed tool calls with malformed JSON arguments and correlates tool chunks by id or index.
-- Grok Bot streams that end with `ToolCallPart.isComplete: false` now fail as incomplete streams instead of parsing partial JSON as `{}` and emitting a successful `toolUse`.
-- `/grokbot` status truncation uses shared `TRUNCATE_LENGTHS.TITLE` from `@oh-my-pi/pi-tui` instead of a provider-local width constant.
-- Grok Bot stream requests keep reverse-proxy path prefixes on the configured backend when joining `InferenceService/Stream`.
-- `/grokbot` status sanitizes namespace, client version, and secrets path with `replaceTabs`/`truncateToWidth`/`shortenPath` before TUI display.
-- `/login grokbot` host-install prompt names the resolved agent secrets path (`getAgentDir()` / profile / `PI_CODING_AGENT_DIR` / XDG), not a hardcoded `~/.omp/agent` or unsupported `OMP_AGENT_DIR`.
-- Grok Bot Connect streams surface input-token-limit frames as context-overflow errors (for compaction), reject malformed trailers/protobuf frames, and no longer store routed model ids in `upstreamProvider`.
-- Grok Bot checksum encoding no longer wraps 32-bit shifts; JWT mint cache is scoped per renewal/backend/namespace; request `apiKey` wins over ambient secrets; incomplete Connect streams and caller aborts surface correctly.
-- Grok Bot provider (`grokbot` / `grokbot-sand`): separate from the Cursor provider (`cursor` / AgentService) and from xAI / Grok CLI (`xai`, `xai-oauth`), including independent usage allowances (using one does not consume Cursor or xAI quota). Speaks `InferenceService/Stream` via renewal-credential minting. Default `sand-default` is sent as a bare sand router slug (no grok rewrite / maxMode / effort stamp). Live picker models come from `AiService/AvailableModels` (sand client); each model only gets its own `parameterDefinitions` on the wire. Stream rejects malformed Connect trailers and protobuf frames instead of treating them as successful completions. `/login grokbot` shows a host-install prompt to run inside the Grok Bot system (writes `secrets/grokbot.env`; does not use Cursor or xAI login). JWT mint cache is keyed by renewer+backend; explicit `apiKey` wins over ambient secrets; catalog cost stays $0 (renewer-billed).
-- Added compatibility opt-outs for Anthropic proxies that reject optional `context_management` and OpenAI Responses proxies with incomplete reasoning-summary streams ([#10358](https://github.com/can1357/oh-my-pi/pull/10358) by [@jubueche](https://github.com/jubueche)).
 - Added API-key authentication for ClinePass through the official `CLINE_API_KEY` variable, including account-route validation and rolling quota-window reporting in `omp usage` ([#7863](https://github.com/can1357/oh-my-pi/pull/7863) by [@will-bogusz](https://github.com/will-bogusz)).
 - ClinePass login now validates the API key against the `/users/me` account identity route instead of a probe chat completion, so roster churn cannot break sign-in and validation no longer consumes subscription quota ([#7863](https://github.com/can1357/oh-my-pi/pull/7863) by [@will-bogusz](https://github.com/will-bogusz)).
 - ClinePass failures now surface actionable messages: subscription-window and free-tier limit markers classify as usage limits (fail fast, rotate sibling credentials), while not-subscribed, organization-account, and roster-rotation `model not found` responses are rewritten with recovery guidance ([#7863](https://github.com/can1357/oh-my-pi/pull/7863) by [@will-bogusz](https://github.com/will-bogusz)).
@@ -215,83 +17,22 @@
 - Devin router models (`compat.modelRouter`, e.g. `adaptive`) now resolve through `AssignModel` before chatting: the provider sends the current user prompt with the turn's cascade id, then issues `GetChatMessage` with the assigned model uid and its assignment JWT. The router uid is never sent as `chatModelUid`, and a missing assignment fails the turn instead of silently degrading ([#8590](https://github.com/can1357/oh-my-pi/pull/8590) by [@will-bogusz](https://github.com/will-bogusz)).
 - Devin responses surface credit metering on `usage.credits` (`cost`, `committedCost`, `acuCost`) and the concrete routed model on `upstreamModel` (assigned uid, replaced by the response's `actualModelUid` when reported) ([#8590](https://github.com/can1357/oh-my-pi/pull/8590) by [@will-bogusz](https://github.com/will-bogusz)).
 - Devin accounts report plan and credit usage in `/usage` through a new `devin` usage provider backed by `SeatManagementService/GetUserStatus`: prompt/flow/flex credit balances against the plan period, daily and weekly quota percent windows with their reset timestamps, plan tier, overage balance, and account/org identity. Credit-billed plans (no dated quota window) surface credits only ([#8590](https://github.com/can1357/oh-my-pi/pull/8590) by [@will-bogusz](https://github.com/will-bogusz)).
-- Added an optional `completeSimple` callback that observes every result, including results from internal thinking-loop retries.
-- Added compatibility options for Anthropic-compatible proxies that reject `context_management` and OpenAI Responses proxies that provide incomplete reasoning-summary streams.
-- Added ClinePass API-key authentication via the official `CLINE_API_KEY` environment variable, with account validation, actionable subscription and quota errors, support for eligible ClinePass model rosters, and rolling quota-window reporting in `omp usage`.
-- Added Devin router-model support, including assignment of the concrete model before each request, routed-model metadata, credit usage reporting, and plan, quota-window, and account details through `omp usage`.
 
 ### Changed
-- Gateway error classifications now carry a failure owner and retry/failover disposition (`credential_permanent`, `provider_transient`, `policy_terminal`, …); provider status codes stay authoritative over message wording, and context-overflow detection reuses the central classifier.
-- Gateway requests now forward `previous_response_id`, `parallel_tool_calls`, `logit_bias`, `user`, and `response_format` to providers instead of dropping them; Responses requests map `response_format` JSON-schema to the flat `text.format` shape and never send Chat-Completions-only `seed`.
-- Auth gateway observes Responses SSE through a StreamCommitGate: metadata-only preludes stay failover-eligible, the first output event or 4 MiB cap commits, and post-commit terminals (`response.completed`/`response.failed`/`response.incomplete`/`response.error`) end failover eligibility instead of being misread as output.
 
-- Provider behavior is now driven by each model's resolved compatibility, identity, thinking, and behavior policies rather than model-name matching, improving support for model-specific request formatting, vision, reasoning, routing, pricing, and quota handling.
-- Devin integrations now use the current released CLI identity and support parallel tool calls when the model declares that capability.
-
-### Fixed
-
-- Fixed OpenAI remote-compaction replay for persisted sessions, allowing sessions with previously stored compaction items to resume successfully.
-- Fixed Cursor Fable requests failing when advertised tools used JSON Schema composition keywords.
-- Fixed Z.AI (GLM Coding Plan) browser sign-in by using the registered CLI callback address.
-- Fixed OpenAI Codex/Responses tool results being lost when composite call identifiers could not be paired with the corresponding assistant call.
-- Fixed native OpenAI Responses history replay becoming stuck on malformed or truncated function-call arguments; invalid history items are now discarded so the session can recover.
-- Provider request builders now read resolved model policy (`model.compat`, `model.identity`, `model.thinking`, behavior rules) for every model-conditional decision — Harmony escaping, vision stripping, thinking transports and ladders, Claude Code instruction injection, Google beta headers and thought-signature handling, Cloudflare gateway routing, Codex service-tier pricing, and quota metering — instead of matching model names.
 - Updated Devin auth, assignment, chat, and usage requests to the current released CLI identity, version `3000.6.2` ([#8590](https://github.com/can1357/oh-my-pi/pull/8590) by [@will-bogusz](https://github.com/will-bogusz)).
 - Devin auth, model assignment, and chat requests now send the native Devin CLI identity (`ideName: devin-cli`, `ideType: chisel`, `extensionName: chisel`, mapped `os`) instead of the Windsurf IDE identity; `ideType: chisel` is what the backend requires for router assignment ([#8590](https://github.com/can1357/oh-my-pi/pull/8590) by [@will-bogusz](https://github.com/will-bogusz)).
-- Aligned the Devin Connect-RPC adapter's `GetChatMessage` request with the wire format captured from the Devin CLI and Devin Desktop via mitmproxy. The adapter previously impersonated Windsurf and sent fields the real Devin clients never transmit.
-  - Removed the `GetUserJwt` preflight RPC: the session token is now placed directly in `Metadata.apiKey` (field 3), eliminating an extra HTTP round-trip per chat request.
-  - Added `authorization: Basic <token>-<token>` HTTP header, suppressed the default `User-Agent`, and set `Accept-Encoding: identity` to match the CLI transport.
-  - Switched from gzip-compressed Connect frames (flag `0x01`) to raw uncompressed frames (flag `0x00`), matching the CLI. Removed `connect-content-encoding` and `connect-accept-encoding` headers.
-  - Added attestation field 31 (`f`, derived from `getInstallId()`). Updated `CompletionConfiguration` defaults to `maxTokens=128000`, `maxNewlines=400`, `temperature=1.0`, `topK=40`, `topP=0.95` (all still overridable via `StreamOptions`/`model.maxTokens`). Removed hardcoded stop patterns (only caller-specified ones are sent), `firstTemperature`, and `fimEotProbThreshold`.
-  - Removed extra request fields absent from CLI traffic: `executionId`, `toolChoice`, `systemPromptCacheOptions`, `disableParallelToolCalls`.
-
-- Devin `GetChatMessage` requests now match the CLI Connect transport: uncompressed frames (flag `0x00`), `authorization: Basic <token>-<token>`, empty `User-Agent`, and `Accept-Encoding: identity`, while keeping the post-#8590 CLI metadata identity, `GetUserJwt`, and `AssignModel` handshake ([#8534](https://github.com/can1357/oh-my-pi/pull/8534)).
-
 - Devin parallel tool calls follow `compat.supportsParallelToolCalls` instead of being disabled unconditionally, so natively discovered configs that support parallelism can use it ([#8590](https://github.com/can1357/oh-my-pi/pull/8590) by [@will-bogusz](https://github.com/will-bogusz)).
-- Gateway error classifications now carry a failure owner and retry/failover disposition (`credential_permanent`, `provider_transient`, `policy_terminal`, …); provider status codes stay authoritative over message wording, structurally flagged content blocks stay non-retryable, and context-overflow detection reuses the central classifier.
-- Gateway disposition mapping now keeps ordinary RPM/`Too many requests` 429s in the provider lane, requires structural evidence for `gateway_terminal`, and only treats opaque or billing-worded 402s as `credential_quota`.
 
 ### Fixed
 
-- Gateway error classifications now carry a failure owner and retry/failover disposition (`credential_permanent`, `provider_transient`, `policy_terminal`, …); provider status codes stay authoritative over message wording, and context-overflow detection reuses the central classifier.
-- Gateway requests now forward `previous_response_id`, `parallel_tool_calls`, `logit_bias`, `user`, and `response_format` to providers instead of dropping them; Responses requests map `response_format` JSON-schema to the flat `text.format` shape and never send Chat-Completions-only `seed`.
-- Fixed OpenAI Responses continuation pairing a caller-supplied `previous_response_id` with an internally computed delta from a different stored response, and restricted stale-baseline recovery to internally owned chain ids so a stale caller id can no longer silently drop prior context.
-
-### Fixed
-
-- Fixed Cloudflare AI Gateway onboarding and routing so gateway account and endpoint configuration is preserved correctly while gateway credentials are not sent as upstream OpenAI authorization headers.
-
-
-### Fixed
-
-- Fixed Cloudflare AI Gateway onboarding and routing so gateway account and endpoint configuration is preserved correctly while gateway credentials are not sent as upstream OpenAI authorization headers.
-
-
-### Fixed
-
-- Gateway error classifications now carry a failure owner and retry/failover disposition (`credential_permanent`, `provider_transient`, `policy_terminal`, …); provider status codes stay authoritative over message wording, and context-overflow detection reuses the central classifier.
-- Gateway requests now forward `previous_response_id`, `parallel_tool_calls`, `logit_bias`, `user`, and `response_format` to providers instead of dropping them; Responses requests map `response_format` JSON-schema to the flat `text.format` shape and never send Chat-Completions-only `seed`.
-- Fixed OpenAI Responses continuation pairing a caller-supplied `previous_response_id` with an internally computed delta from a different stored response, and restricted stale-baseline recovery to internally owned chain ids so a stale caller id can no longer silently drop prior context.
-- Auth gateway observes Responses SSE through a StreamCommitGate: metadata-only preludes stay failover-eligible, the first output event or 4 MiB cap commits, and post-commit terminals (`response.completed`/`response.failed`/`response.incomplete`/`response.error`) end failover eligibility instead of being misread as output.
-
-### Fixed
-
-- Fixed Cloudflare AI Gateway onboarding and routing so gateway account and endpoint configuration is preserved correctly while gateway credentials are not sent as upstream OpenAI authorization headers.
-- Gateway error classifications now carry a failure owner and retry/failover disposition (`credential_permanent`, `provider_transient`, `policy_terminal`, …); provider status codes stay authoritative over message wording, and context-overflow detection reuses the central classifier.
-- Gateway requests now forward `previous_response_id`, `parallel_tool_calls`, `logit_bias`, `user`, and `response_format` to providers instead of dropping them; Responses requests map `response_format` JSON-schema to the flat `text.format` shape and never send Chat-Completions-only `seed`.
-- Fixed OpenAI Responses continuation pairing a caller-supplied `previous_response_id` with an internally computed delta from a different stored response, and restricted stale-baseline recovery to internally owned chain ids so a stale caller id can no longer silently drop prior context.
-- Auth gateway observes Responses SSE through a StreamCommitGate: metadata-only preludes stay failover-eligible, the first output event or 4 MiB cap commits, and post-commit terminals (`response.completed`/`response.failed`/`response.incomplete`/`response.error`) end failover eligibility instead of being misread as output.
-- Auth gateway virtual routes now fail over to a backup model when the primary is unavailable, as long as the response stream has not been committed.
-- Auth gateway can load virtual routes from a JSON/JSON5 file.
-- Auth gateway `GET /v1/routes` lists registered virtual routes.
-- Auth gateway `GET /v1/routes/:id` returns a registered virtual route.
-- Auth gateway `PUT /v1/routes/:id` registers or replaces a virtual route.
-
-
-### Fixed
-
-- Gateway error classifications now carry a failure owner and retry/failover disposition (`credential_permanent`, `provider_transient`, `policy_terminal`, …); provider status codes stay authoritative over message wording, and context-overflow detection reuses the central classifier.
-- Gateway requests now forward `previous_response_id`, `parallel_tool_calls`, `logit_bias`, `user`, and `response_format` to providers instead of dropping them; Responses requests map `response_format` JSON-schema to the flat `text.format` shape and never send Chat-Completions-only `seed`.
+- Fixed `mapOptionsForApi` dropping OpenAI Responses/Completions continuation fields (`previousResponseId`, `parallelToolCalls`, `seed`, `logitBias`, `user`, `responseFormat`) so gateway-parsed options reach provider `buildParams()`.
+- Fixed auth-gateway target health ignoring `owner: "model"` failures and double-counting non-streaming provider failures before fallback, so circuits open at the intended three-failure threshold.
+- Fixed auth-gateway `siblingsExhausted` sticking across `fallback_target` moves (and raised the attempt cap) so each fallback target gets its own sibling-credential retry.
+- Fixed committed SSE streams leaking turn reservations when `reader.read()` rejects.
+- Fixed gateway classification treating Codex `cyber_policy` / Trusted Access HTTP 403 denials (including structured `code: "cyber_policy"`) as retryable credential failures; they are now `policy_terminal`.
+- Fixed auth-gateway preferred-later failover so retries stay inside the disposition's compiled fallback list instead of any unused route target (e.g. no small-model retry on `context_overflow`).
+- Fixed auth gateway missing-credential handling to skip a useless same-target sibling retry and fail over immediately via compiled `credential_transient` fallbacks when other targets exist.
 - Fixed OpenAI Responses continuation pairing a caller-supplied `previous_response_id` with an internally computed delta from a different stored response, and restricted stale-baseline recovery to internally owned chain ids so a stale caller id can no longer silently drop prior context.
 - Auth gateway observes Responses SSE through a StreamCommitGate: metadata-only preludes stay failover-eligible, the first output event or 4 MiB cap commits, and post-commit terminals (`response.completed`/`response.failed`/`response.incomplete`/`response.error`) end failover eligibility instead of being misread as output.
 - Auth gateway virtual routes now fail over to a backup model when the primary is unavailable, as long as the response stream has not been committed.
@@ -300,6 +41,18 @@
 - Auth gateway `GET /v1/routes/:id` returns a registered virtual route.
 - Auth gateway `PUT /v1/routes/:id` registers or replaces a virtual route.
 - Auth gateway `DELETE /v1/routes/:id` unregisters a virtual route.
+- Auth gateway retries a sibling credential on quota errors before falling over to another model.
+- Auth gateway `GET /v1/executions/:id` returns redacted decision traces for an execution.
+- Auth gateway `GET /v1/health/routes` lists virtual route ids, generations, and targets without credentials.
+- Auth gateway `GET /v1/credentials` lists credential ids without tokens; `POST /v1/credentials/:id/disable` and `POST /v1/credentials/:id/pin` manage stored accounts.
+- Auth gateway `POST /v1beta/models/generateContent` and `POST /v1beta/models/streamGenerateContent` accept Gemini v1beta generateContent requests.
+- Auth gateway `POST /v1/messages/count_tokens` estimates Anthropic input tokens.
+- Auth gateway `POST /backend-api/codex/responses` and `POST /backend-api/responses` alias Codex clients onto OpenAI Responses.
+- Auth gateway `POST /v1/grok/chat/completions` aliases xAI clients onto OpenAI chat completions.
+- Auth gateway `POST /v1/realtime` and `POST /v1/audio/speech` return 501 after auth.
+- Auth gateway skips targets whose provider health circuit is open.
+- Auth gateway remembers prompt-cache affinity after a successful non-error stream.
+- Auth gateway prefers the remembered prompt-cache model on the first dispatch of a matching request.
 
 ## [18.0.11] - 2026-08-29
 
@@ -313,13 +66,14 @@
 - Fixed Z.AI browser sign-in to report an occupied callback port before opening the browser.
 
 ## [18.0.9] - 2026-08-28
+
 ### Fixed
 
 - Improved OAuth sign-in flows, including a fallback message when the browser cannot automatically close the OAuth success tab.
+- Fixed Cloudflare AI Gateway onboarding and routing so gateway account and endpoint configuration is preserved correctly while gateway credentials are not sent as upstream OpenAI authorization headers.
 - Fixed Codex OAuth quota handling so chat and Spark usage remain independent, legacy shared quota limits continue to work, and incomplete usage reports are not incorrectly treated as unlimited.
-
-### Fixed
-
+- Gateway error classifications now carry a failure owner and retry/failover disposition (`credential_permanent`, `provider_transient`, `policy_terminal`, …); provider status codes stay authoritative over message wording, and context-overflow detection reuses the central classifier.
+- Gateway requests now forward `previous_response_id`, `parallel_tool_calls`, `logit_bias`, `user`, and `response_format` to providers instead of dropping them; Responses requests map `response_format` JSON-schema to the flat `text.format` shape and never send Chat-Completions-only `seed`.
 
 ## [18.0.8] - 2026-08-27
 
@@ -538,8 +292,6 @@
 
 - Fixed `omp usage invalidate` to discard stale OAuth and API-key usage snapshots, then force a cache-bypassing, per-provider serialized refresh with a broker request budget sized for the full unfiltered account batch, so upgraded subscriptions do not silently retain pre-change quota data.
 - Fixed quota reporting and Cookie capture guidance for China (Beijing) Alibaba Token Plan credentials ([#8509](https://github.com/can1357/oh-my-pi/issues/8509)).
-
-- Fixed `omp usage invalidate` to discard stale OAuth and API-key usage snapshots, then force a cache-bypassing, per-provider serialized refresh so upgraded subscriptions do not silently retain pre-change quota data.
 
 ## [17.3.3] - 2026-08-14
 
@@ -2317,7 +2069,7 @@
 - Fixed Anthropic-compatible proxies that omit `usage`/`delta` objects from `message_start`/`message_delta`/`content_block_*` envelopes crashing the turn with an unretryable `TypeError`; the missing payloads now degrade to logged envelope anomalies like every other malformed-frame case.
 - Fixed `applyPromptCaching` placing `cache_control` on `thinking`/`redacted_thinking` blocks — Anthropic rejects that with a 400. A thinking-only assistant turn inside the trailing cache window (e.g. followed by the synthetic `Continue.` pad) no longer receives a breakpoint.
 - Fixed consecutive `assistant` params reaching the wire when an empty user/developer turn between two assistant turns was dropped by the converter (e.g. an empty "nudge" submission after a length-truncated reply); Anthropic 400s on non-alternating assistant turns, and the broken triple replayed on every subsequent request. A `user: "Continue."` separator is now inserted, mirroring the trailing-prefill fallback.
-- Fixed adaptive-display classification misparsing bare dated Opus ids: `claude-opus-4-20250514` (Opus 4.0) parsed as minor `20250514` ≥ 4.7, which silently dropped the `interleaved-thinking-2025-05-14` beta for API-key Opus 4.0 requests.
+- Fixed `supportsAdaptiveThinkingDisplay` misparsing bare dated Opus ids: `claude-opus-4-20250514` (Opus 4.0) parsed as minor `20250514` ≥ 4.7, which silently dropped the `interleaved-thinking-2025-05-14` beta for API-key Opus 4.0 requests.
 - Fixed `output_config.effort` shipping without the `effort-2025-11-24` beta on thinking-off requests against adaptive-only Claude models (the effort:"low" pin), and the mid-conversation `system` role shipping without `mid-conversation-system-2026-04-07` on API-key and OAuth-utility requests; both betas are now added whenever the request can carry the corresponding field.
 - Fixed GitHub Copilot anthropic-messages requests going out with no `Content-Type` and no `anthropic-version` header — the copilot branch builds its headers from scratch and Bun's fetch does not default `Content-Type` for string bodies. Both headers are now pinned to match every other branch.
 - Fixed Anthropic client/provider retry multiplication: with the first-event watchdog disabled (`PI_STREAM_FIRST_EVENT_TIMEOUT_MS=0`), the client's internal `maxRetries: 5` reactivated and stacked with the provider loop's 3 retries — up to 24 wire attempts with double backoff. The provider now pins per-request `maxRetries: 0` unconditionally.
@@ -2334,3 +2086,4 @@
 
 - Removed the dead `iterateUntilAbort` helper (superseded by `iterateWithIdleTimeout`); it leaked the upstream iterator when the consumer abandoned mid-yield and had no production call sites.
 
+Older entries are archived in [packages/ai/CHANGELOG.md@c821261d1018](https://github.com/can1357/oh-my-pi/blob/c821261d10180d60bd96c1b7334227691c9e14f6/packages/ai/CHANGELOG.md).

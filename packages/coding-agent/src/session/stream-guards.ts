@@ -435,7 +435,7 @@ export class LoopGuards {
 			this.#host.settings.get("model.loopGuard.enabled") === true &&
 			this.#host.settings.get("model.loopGuard.toolCallReminder") === true &&
 			model !== undefined &&
-			model.identity.class === "gemini"
+			model.identity?.class === "gemini"
 		);
 	}
 

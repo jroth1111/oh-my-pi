@@ -1,22 +1,17 @@
 import { describe, expect, it } from "bun:test";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
-import type { Api, Model, ModelSpec, Provider } from "@oh-my-pi/pi-catalog/types";
+import type { Api, ModelSpec, Provider } from "@oh-my-pi/pi-catalog/types";
 import {
 	applyAntigravityPricingFallback,
-	applyCanonicalLimitFallback,
 	applyGeneratedModelPolicies,
 	applyOllamaCloudOutputCap,
 	linkOpenAIPromotionTargets,
 } from "../scripts/generated-policies";
-import { buildModel } from "../src/build";
-import { resolveModelPolicy } from "../src/compat/resolve";
-import { buildGrokbotStaticSeed } from "../src/provider-models/grokbot";
 
 function createSpec<TApi extends Api>(overrides: {
 	id: string;
 	api: TApi;
 	provider: Provider;
-	baseUrl?: string;
 	reasoning?: boolean;
 	contextWindow?: number;
 	maxTokens?: number;
@@ -31,7 +26,7 @@ function createSpec<TApi extends Api>(overrides: {
 		name: overrides.id,
 		api: overrides.api,
 		provider: overrides.provider,
-		baseUrl: overrides.baseUrl ?? "https://example.com",
+		baseUrl: "https://example.com",
 		reasoning: overrides.reasoning ?? true,
 		compat: overrides.compat,
 		thinking: overrides.thinking,
@@ -42,15 +37,6 @@ function createSpec<TApi extends Api>(overrides: {
 		priority: overrides.priority,
 		applyPatchToolType: overrides.applyPatchToolType,
 	};
-}
-
-/** Production generation seam: apply the generated policies, then build. */
-function buildGenerated<TApi extends Api>(spec: ModelSpec<TApi>): Model<TApi> {
-	const specs: ModelSpec<Api>[] = [spec];
-	applyGeneratedModelPolicies(specs);
-	const first = specs[0];
-	if (!first) throw new Error("policy pass dropped the spec");
-	return buildModel(first as ModelSpec<TApi>);
 }
 
 describe("generated model policies", () => {
@@ -88,51 +74,23 @@ describe("generated model policies", () => {
 		];
 
 		applyGeneratedModelPolicies(models);
-		const built = models.map(model => buildGenerated(model));
 
-		expect(built[0]?.thinking).toEqual({
+		expect(models[0]?.thinking).toEqual({
 			mode: "anthropic-budget-effort",
 			efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.XHigh],
 		});
-		expect(built[0]?.cost.cacheRead).toBe(0.5);
-		expect(built[0]?.cost.cacheWrite).toBe(6.25);
-		expect(built[1]?.thinking).toEqual({
+		expect(models[0]?.cost.cacheRead).toBe(0.5);
+		expect(models[0]?.cost.cacheWrite).toBe(6.25);
+		expect(models[1]?.thinking).toEqual({
 			mode: "anthropic-adaptive",
 			efforts: [Effort.Low, Effort.Medium, Effort.High, Effort.Max],
 		});
-		expect(built[1]?.cost.cacheRead).toBe(0.5);
-		expect(built[1]?.cost.cacheWrite).toBe(6.25);
-		expect(built[1]?.contextWindow).toBe(1000000);
-		expect(built[2]?.contextWindow).toBe(272000);
-		expect(built[3]?.contextWindow).toBe(272000);
-		expect(built[3]?.priority).toBe(1);
-	});
-
-	it("projects Cursor tool schemas only for Anthropic Fable variants", () => {
-		const fableModels = [
-			"claude-fable-5-high",
-			"claude-fable-5-low",
-			"claude-fable-5-max",
-			"claude-fable-5-medium",
-			"claude-fable-5-xhigh",
-		].map(id => buildGenerated(createSpec({ id, api: "cursor-agent", provider: "cursor" })));
-		const grok = buildGenerated(createSpec({ id: "cursor-grok-4.6", api: "cursor-agent", provider: "cursor" }));
-		const otherCursorAnthropic = buildGenerated(
-			createSpec({ id: "claude-opus-4-7-high", api: "cursor-agent", provider: "cursor" }),
-		);
-
-		for (const model of fableModels) {
-			expect(model.requiresCursorToolSchemaProjection).toBe(true);
-		}
-		expect(grok.requiresCursorToolSchemaProjection).toBeUndefined();
-		expect(otherCursorAnthropic.requiresCursorToolSchemaProjection).toBeUndefined();
-
-		const rebuiltGrok = buildModel({
-			...fableModels[0],
-			id: "cursor-grok-4.6",
-			name: "cursor-grok-4.6",
-		});
-		expect(rebuiltGrok.requiresCursorToolSchemaProjection).toBeUndefined();
+		expect(models[1]?.cost.cacheRead).toBe(0.5);
+		expect(models[1]?.cost.cacheWrite).toBe(6.25);
+		expect(models[1]?.contextWindow).toBe(1000000);
+		expect(models[2]?.contextWindow).toBe(272000);
+		expect(models[3]?.contextWindow).toBe(272000);
+		expect(models[3]?.priority).toBe(1);
 	});
 
 	it("preserves OpenRouter's mandatory provider-authored effort ladder", () => {
@@ -189,7 +147,7 @@ describe("generated model policies", () => {
 	});
 
 	it("applies GPT-5.6 off and long-context pricing through request-model aliases", () => {
-		const models = [
+		const models: ModelSpec<Api>[] = [
 			createSpec({ id: "gpt-5.6", api: "openai-responses", provider: "openai" }),
 			createSpec({ id: "gpt-5.6-luna", api: "openai-responses", provider: "openai" }),
 			{
@@ -201,7 +159,9 @@ describe("generated model policies", () => {
 				requestModelId: "gpt-5.6-terra",
 			},
 			createSpec({ id: "gpt-5.6", api: "openai-responses", provider: "openrouter" }),
-		].map(model => buildGenerated(model));
+		];
+
+		applyGeneratedModelPolicies(models);
 
 		for (const model of models.slice(0, 4)) {
 			expect(model.compat).toMatchObject({ reasoningDisableMode: "none-effort" });
@@ -211,12 +171,12 @@ describe("generated model policies", () => {
 		expect(models[1]?.cost.longContext).toMatchObject({ input: 0.4, output: 1.8 });
 		expect(models[2]?.cost.longContext).toMatchObject({ input: 10, output: 45 });
 		expect(models[3]?.cost.longContext).toMatchObject({ input: 4, output: 18 });
-		expect(models[4]?.compat).not.toMatchObject({ reasoningDisableMode: "none-effort" });
+		expect(models[4]?.compat).toBeUndefined();
 		expect(models[4]?.cost.longContext).toBeUndefined();
 	});
 
 	it("floors GPT-5.6 Codex-transport context windows at 1M (openai/codex#38917)", () => {
-		const models = [
+		const models: ModelSpec<Api>[] = [
 			// Codex discovery/registry still reports the stale 272000 for these.
 			createSpec({
 				id: "gpt-5.6-luna",
@@ -246,7 +206,9 @@ describe("generated model policies", () => {
 				provider: "openai-codex",
 				contextWindow: 272000,
 			}),
-		].map(model => buildGenerated(model));
+		];
+
+		applyGeneratedModelPolicies(models);
 
 		expect(models[0]?.contextWindow).toBe(1_000_000);
 		expect(models[1]?.contextWindow).toBe(1_000_000);
@@ -256,12 +218,14 @@ describe("generated model policies", () => {
 	});
 
 	it("applies GPT-5.6 long-context pricing to Codex-transport SKUs (openai/codex#32486)", () => {
-		const models = [
+		const models: ModelSpec<Api>[] = [
 			createSpec({ id: "gpt-5.6-sol", api: "openai-codex-responses", provider: "openai-codex" }),
 			createSpec({ id: "gpt-5.6-luna", api: "openai-codex-responses", provider: "openai-codex" }),
 			// Third-party carriers of the same id must not inherit the tier.
 			createSpec({ id: "gpt-5.6-sol", api: "openai-completions", provider: "openrouter" }),
-		].map(model => buildGenerated(model));
+		];
+
+		applyGeneratedModelPolicies(models);
 
 		expect(models[0]?.cost.longContext).toMatchObject({ inputThreshold: 272_000, input: 10, output: 45 });
 		expect(models[1]?.cost.longContext).toMatchObject({ inputThreshold: 272_000, input: 0.4, output: 1.8 });
@@ -269,19 +233,20 @@ describe("generated model policies", () => {
 	});
 
 	it("pins Claude Mythos 5 first-party Anthropic catalog metadata", () => {
-		const model = buildGenerated(
+		const models: ModelSpec<Api>[] = [
 			createSpec({
 				id: "claude-mythos-5",
 				api: "anthropic-messages",
 				provider: "anthropic",
-				baseUrl: "https://api.anthropic.com",
 			}),
-		);
+		];
 
-		expect(model?.contextWindow).toBe(1_000_000);
-		expect(model?.maxTokens).toBe(128_000);
-		expect(model?.cost).toEqual({ input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 });
-		expect(model?.thinking).toEqual({
+		applyGeneratedModelPolicies(models);
+
+		expect(models[0]?.contextWindow).toBe(1_000_000);
+		expect(models[0]?.maxTokens).toBe(128_000);
+		expect(models[0]?.cost).toEqual({ input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 });
+		expect(models[0]?.thinking).toEqual({
 			mode: "anthropic-adaptive",
 			efforts: [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max],
 			supportsDisplay: true,
@@ -337,7 +302,9 @@ describe("generated model policies", () => {
 				contextWindow: 200_000,
 				maxTokens: 8192,
 			}),
-		].map(model => buildGenerated(model));
+		];
+
+		applyGeneratedModelPolicies(models);
 
 		expect(models[0]?.contextWindow).toBe(1_000_000);
 		expect(models[0]?.maxTokens).toBe(131_072);
@@ -359,7 +326,9 @@ describe("generated model policies", () => {
 				contextWindow: 200_000,
 				maxTokens: 8192,
 			}),
-		].map(model => buildGenerated(model));
+		];
+
+		applyGeneratedModelPolicies(models);
 
 		// Context pinning — same 1M tier as glm-5.2 on both GLM coding-plan hosts.
 		for (const model of models) {
@@ -391,7 +360,9 @@ describe("generated model policies", () => {
 				contextWindow: 200_000,
 				maxTokens: 8192,
 			}),
-		].map(model => buildGenerated(model));
+		];
+
+		applyGeneratedModelPolicies(models);
 
 		for (const model of models) {
 			expect(model.contextWindow).toBe(1_000_000);
@@ -407,7 +378,6 @@ describe("generated model policies", () => {
 	});
 
 	it("bakes verified Cursor image families into the offline catalog", () => {
-		// Rule-owned (`providers/cursor.kdl` input-modalities): baked at build time.
 		const verifiedIds = [
 			"kimi-k3-high",
 			"kimi-k3-low",
@@ -421,8 +391,10 @@ describe("generated model policies", () => {
 		];
 		const unverifiedIds = ["cursor-grok-5", "composer-2.50", "k3-256k"];
 		const models = [...verifiedIds, ...unverifiedIds].map(id =>
-			buildGenerated(createSpec({ id, api: "cursor-agent", provider: "cursor" })),
+			createSpec({ id, api: "cursor-agent", provider: "cursor" }),
 		);
+
+		applyGeneratedModelPolicies(models);
 
 		for (const model of models.slice(0, verifiedIds.length)) {
 			expect(model.input).toEqual(["text", "image"]);
@@ -462,7 +434,9 @@ describe("generated model policies", () => {
 				contextWindow: 512_000,
 				maxTokens: 128_000,
 			}),
-		].map(model => buildGenerated(model));
+		];
+
+		applyGeneratedModelPolicies(models);
 
 		expect(models[0]?.contextWindow).toBe(1_000_000);
 		expect(models[0]?.maxTokens).toBe(128_000);
@@ -534,19 +508,21 @@ describe("generated model policies", () => {
 	});
 
 	it("marks OpenCode Go MiMo models as not supporting tool_choice", () => {
-		const models = [
+		const models: ModelSpec<"openai-completions">[] = [
 			createSpec({
 				id: "mimo-v2.5-pro",
 				api: "openai-completions",
 				provider: "opencode-go",
 			}),
-		].map(model => buildGenerated(model));
+		];
+
+		applyGeneratedModelPolicies(models);
 
 		expect(models[0]?.compat?.supportsToolChoice).toBe(false);
 	});
 
 	it("sets OpenCode Go DeepSeek V4 tool-call request compat for both OpenAI APIs", () => {
-		const models = [
+		const models: ModelSpec<Api>[] = [
 			createSpec({
 				id: "deepseek-v4-flash",
 				api: "openai-responses",
@@ -557,26 +533,30 @@ describe("generated model policies", () => {
 				api: "openai-completions",
 				provider: "opencode-go",
 			}),
-		].map(model => buildGenerated(model));
+		];
+
+		applyGeneratedModelPolicies(models);
 
 		for (const model of models) {
 			expect(model.compat).toMatchObject({
 				supportsToolChoice: false,
+				maxTokensField: "max_tokens",
 				reasoningContentField: "reasoning_content",
 				requiresReasoningContentForToolCalls: true,
 			});
 		}
-		expect(models[1]?.compat).toMatchObject({ maxTokensField: "max_tokens" });
 	});
 
 	it("marks OpenCode Go Kimi K2.7 Code as not supporting forced tool_choice", () => {
-		const models = [
+		const models: ModelSpec<"openai-completions">[] = [
 			createSpec({
 				id: "kimi-k2.7-code",
 				api: "openai-completions",
 				provider: "opencode-go",
 			}),
-		].map(model => buildGenerated(model));
+		];
+
+		applyGeneratedModelPolicies(models);
 
 		expect(models[0]?.compat?.supportsForcedToolChoice).toBe(false);
 	});
@@ -627,17 +607,33 @@ describe("generated model policies", () => {
 	});
 
 	it("sets freeform apply_patch metadata for first-party GPT-5 Responses models", () => {
-		const models = [
+		const models: ModelSpec<Api>[] = [
 			createSpec({ id: "gpt-5.4", api: "openai-responses", provider: "openai" }),
 			createSpec({ id: "gpt-5.3-codex-spark", api: "openai-codex-responses", provider: "openai-codex" }),
-		].map(model => buildGenerated(model));
+			createSpec({
+				id: "gpt-5.3-codex-spark",
+				api: "openai-responses",
+				provider: "opencode",
+				applyPatchToolType: "freeform",
+			}),
+			createSpec({
+				id: "gpt-5.4",
+				api: "openai-completions",
+				provider: "litellm",
+				applyPatchToolType: "freeform",
+			}),
+		];
+
+		applyGeneratedModelPolicies(models);
 
 		expect(models[0]?.applyPatchToolType).toBe("freeform");
 		expect(models[1]?.applyPatchToolType).toBe("freeform");
+		expect(models[2]?.applyPatchToolType).toBeUndefined();
+		expect(models[3]?.applyPatchToolType).toBeUndefined();
 	});
 
 	it("strips paid xAI Responses effort dials for off-allowlist reasoners", () => {
-		const models = [
+		const models: ModelSpec<"openai-responses">[] = [
 			createSpec({
 				id: "grok-code-fast-1",
 				api: "openai-responses",
@@ -656,18 +652,21 @@ describe("generated model policies", () => {
 				provider: "openrouter",
 				thinking: { mode: "effort", efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High] },
 			}),
-		].map(model => buildGenerated(model));
+		];
+
+		applyGeneratedModelPolicies(models);
 
 		expect(models[0]?.thinking).toBeUndefined();
 		expect(models[0]?.compat).toMatchObject({
 			supportsReasoningEffort: false,
 			omitReasoningEffort: true,
 		});
+		expect(models[0]?.compat).not.toHaveProperty("reasoningEffortMap");
 		expect(models[1]?.thinking?.efforts).toEqual([Effort.Minimal, Effort.Low, Effort.Medium, Effort.High]);
 		expect(models[1]?.compat?.supportsReasoningEffort).toBe(true);
 		// Non-xAI hosts are outside this policy — no baked no-dial compat.
 		expect(models[2]?.thinking).toBeDefined();
-		expect(models[2]?.compat?.supportsReasoningEffort).toBe(true);
+		expect(models[2]?.compat?.supportsReasoningEffort).toBeUndefined();
 	});
 });
 
@@ -827,159 +826,5 @@ describe("applyAntigravityPricingFallback", () => {
 		expect(result[2]?.cost).toEqual(zeroCost);
 		// Already-billable antigravity rows keep their own pricing.
 		expect(result[3]?.cost).toEqual(pricedCost);
-	});
-});
-
-describe("Grok Bot generated thinking policy", () => {
-	it("preserves seed/live ladders and does not invent one for routers", () => {
-		const models = [
-			createSpec({
-				id: "sand-default",
-				api: "grokbot-sand",
-				provider: "grokbot",
-				reasoning: true,
-				thinking: undefined,
-			}),
-			createSpec({
-				id: "grok-4.6",
-				api: "grokbot-sand",
-				provider: "grokbot",
-				thinking: {
-					mode: "effort",
-					efforts: [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh],
-				},
-			}),
-		];
-
-		applyGeneratedModelPolicies(models);
-
-		expect(models[0]?.thinking).toBeUndefined();
-		expect(models[1]?.thinking).toEqual({
-			mode: "effort",
-			efforts: [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh],
-		});
-	});
-
-	it("derives grok-4.6 seed effort ladder and sand params from provider KDL via buildModel", () => {
-		const [seed] = buildGrokbotStaticSeed().filter(m => m.id === "grok-4.6");
-		expect(seed?.thinking).toBeUndefined();
-		expect(seed?.sandParameterIds).toBeUndefined();
-		const built = buildModel(seed!);
-		expect(built.thinking).toEqual({
-			mode: "effort",
-			efforts: [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh],
-		});
-		expect(built.sandParameterIds).toEqual(["effort", "fast"]);
-		const router = buildModel(buildGrokbotStaticSeed().find(m => m.id === "sand-default")!);
-		expect(router.thinking).toBeUndefined();
-		expect(router.sandParameterIds).toBeUndefined();
-	});
-
-	it("does not overwrite live AvailableModels sandParameterIds with KDL", () => {
-		const live = buildModel({
-			id: "grok-4.6",
-			name: "Grok 4.6",
-			api: "grokbot-sand",
-			provider: "grokbot",
-			baseUrl: "https://api2.cursor.sh",
-			reasoning: true,
-			input: ["text", "image"],
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-			contextWindow: 200_000,
-			maxTokens: null,
-			sandParameterIds: ["effort"],
-		});
-		expect(live.sandParameterIds).toEqual(["effort"]);
-	});
-
-	it("does not backfill grok-4.6 KDL ladder when live discovery marked unrecognized efforts", () => {
-		const live = buildModel({
-			id: "grok-4.6",
-			name: "Grok 4.6",
-			api: "grokbot-sand",
-			provider: "grokbot",
-			baseUrl: "https://api2.cursor.sh",
-			reasoning: true,
-			thinking: { mode: "effort", efforts: [] },
-			input: ["text"],
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-			contextWindow: null,
-			maxTokens: null,
-		});
-		expect(live.thinking).toBeUndefined();
-	});
-
-	it("keeps grokbot offline seeds free of canonical maxTokens fallback before buildModel", () => {
-		const models = buildGrokbotStaticSeed().map(seed => ({ ...seed }));
-		applyCanonicalLimitFallback(models);
-		for (const model of models) {
-			expect(model.maxTokens).toBeNull();
-		}
-		const built = buildModel(models.find(m => m.id === "sand-default")!);
-		expect(built.maxTokens).toBeNull();
-		expect(built.contextWindow).toBe(200_000);
-	});
-
-	it("marks grokbot credential-scoped catalog via provider KDL", () => {
-		const [seed] = buildGrokbotStaticSeed();
-		expect(resolveModelPolicy(seed).catalog.credentialScopedCatalog).toBe(true);
-	});
-
-	it("forces supportsTools false for grok-4.5 via provider KDL", () => {
-		const live = buildModel({
-			id: "grok-4.5",
-			name: "Grok 4.5",
-			api: "grokbot-sand",
-			provider: "grokbot",
-			baseUrl: "https://api2.cursor.sh",
-			reasoning: true,
-			input: ["text"],
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-			contextWindow: null,
-			maxTokens: null,
-		});
-		expect(live.supportsTools).toBe(false);
-		const grok46 = buildModel({
-			id: "grok-4.6",
-			name: "Grok 4.6",
-			api: "grokbot-sand",
-			provider: "grokbot",
-			baseUrl: "https://api2.cursor.sh",
-			reasoning: true,
-			input: ["text"],
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-			contextWindow: null,
-			maxTokens: null,
-		});
-		expect(grok46.supportsTools).toBeUndefined();
-	});
-
-	it("applies reviewed context-window-floor to known routers when discovery left limits unset", () => {
-		const router = buildModel({
-			id: "sand-default",
-			name: "sand-default (routed)",
-			api: "grokbot-sand",
-			provider: "grokbot",
-			baseUrl: "https://api2.cursor.sh",
-			reasoning: true,
-			input: ["text", "image"],
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-			contextWindow: null,
-			maxTokens: null,
-		});
-		expect(router.contextWindow).toBe(200_000);
-		const unknown = buildModel({
-			id: "some-live-model",
-			name: "Some Live Model",
-			api: "grokbot-sand",
-			provider: "grokbot",
-			baseUrl: "https://api2.cursor.sh",
-			reasoning: false,
-			input: ["text"],
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-			contextWindow: null,
-			maxTokens: null,
-		});
-		expect(unknown.contextWindow).toBeNull();
 	});
 });

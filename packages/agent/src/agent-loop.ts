@@ -417,8 +417,6 @@ function snapshotAssistantMessageEvent(
 				toolCall: snapshotAssistantContentBlock(event.toolCall) as AssistantToolCallBlock,
 				partial: partialSnapshot ?? snapshotAssistantMessage(event.partial),
 			};
-		case "routed_model":
-			return { ...event, partial: partialSnapshot ?? snapshotAssistantMessage(event.partial) };
 		case "done":
 			return { ...event, message: snapshotAssistantMessage(event.message) };
 		case "error":
@@ -770,7 +768,7 @@ function createDetailedCapture(config: AgentLoopConfig): {
 	const wired: AgentLoopConfig = {
 		...config,
 		telemetry: {
-			...config.telemetry,
+			...(config.telemetry ?? {}),
 			onRunEnd: (summary, coverage) => {
 				captured = { summary, coverage };
 				userHook?.(summary, coverage);
@@ -1923,7 +1921,6 @@ async function streamAssistantResponse(
 						case "toolcall_start":
 						case "toolcall_delta":
 						case "toolcall_end":
-						case "routed_model":
 							if (partialMessage) {
 								if (event.type === "toolcall_end") {
 									completedToolCallIds.add(event.toolCall.id);

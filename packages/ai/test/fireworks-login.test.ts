@@ -11,17 +11,13 @@
  */
 import { describe, expect, it } from "bun:test";
 
-import { getProviderDefinition } from "@oh-my-pi/pi-ai/registry";
-import type { OAuthController } from "@oh-my-pi/pi-ai/registry/oauth/types";
+import { loginFireworks } from "@oh-my-pi/pi-ai/registry/fireworks";
 import type { FetchImpl } from "@oh-my-pi/pi-catalog/types";
-
-const loginFireworks = getProviderDefinition("fireworks")?.login;
-if (!loginFireworks) throw new Error("Fireworks login is not registered");
 
 const CONTROL_PLANE_HOST = "api.fireworks.ai";
 const CONTROL_PLANE_PATH = "/v1/accounts/fireworks/models";
 
-function makeController(fetchImpl: FetchImpl): OAuthController {
+function makeController(fetchImpl: FetchImpl): Parameters<typeof loginFireworks>[0] {
 	return {
 		fetch: fetchImpl,
 		onPrompt: async () => "fw_TESTKEY",

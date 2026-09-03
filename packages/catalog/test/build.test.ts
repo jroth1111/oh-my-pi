@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { isOfficialAnthropicApiUrl } from "@oh-my-pi/pi-catalog/compat/anthropic";
-import { resolveModelPolicy } from "@oh-my-pi/pi-catalog/compat/resolve";
+import { buildOpenAICompat, buildOpenAIResponsesCompat } from "@oh-my-pi/pi-catalog/compat/openai";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { readModelCache, writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { resolveProviderModels } from "@oh-my-pi/pi-catalog/model-manager";
@@ -25,22 +25,6 @@ function completionsSpec(overrides: Partial<ModelSpec<"openai-completions">> = {
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 128_000,
 		maxTokens: 8_192,
-		...overrides,
-	};
-}
-
-function responsesSpec(overrides: Partial<ModelSpec<"openai-responses">> = {}): ModelSpec<"openai-responses"> {
-	return {
-		id: "some-model",
-		name: "Some Model",
-		api: "openai-responses",
-		provider: "custom",
-		baseUrl: "https://api.example.com/v1",
-		reasoning: false,
-		input: ["text"],
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: null,
-		maxTokens: null,
 		...overrides,
 	};
 }
@@ -300,19 +284,19 @@ describe("xAI Responses reasoning-effort suppression", () => {
 	});
 
 	it("omits the effort dial for a custom grok-build spec (off the allowlist)", () => {
-		const compat = resolveModelPolicy(grokResponsesSpec("grok-build")).compat;
+		const compat = buildOpenAIResponsesCompat(grokResponsesSpec("grok-build"));
 		expect(compat.supportsReasoningEffort).toBe(false);
 		expect(compat.omitReasoningEffort).toBe(true);
 		expect(buildModel(grokResponsesSpec("grok-build")).thinking).toBeUndefined();
 	});
 
 	it("keeps the effort dial for a custom grok-4.3 spec (on the allowlist)", () => {
-		expect(resolveModelPolicy(grokResponsesSpec("grok-4.3")).compat.supportsReasoningEffort).toBe(true);
+		expect(buildOpenAIResponsesCompat(grokResponsesSpec("grok-4.3")).supportsReasoningEffort).toBe(true);
 	});
 
 	it("applies the same Responses dialect to paid xai and xai-oauth", () => {
-		const paid = resolveModelPolicy(grokResponsesSpec("grok-4.3", "xai")).compat;
-		const oauth = resolveModelPolicy(grokResponsesSpec("grok-4.3", "xai-oauth")).compat;
+		const paid = buildOpenAIResponsesCompat(grokResponsesSpec("grok-4.3", "xai"));
+		const oauth = buildOpenAIResponsesCompat(grokResponsesSpec("grok-4.3", "xai-oauth"));
 		expect(paid.promptCacheSessionHeader).toBe("x-grok-conv-id");
 		expect(oauth.promptCacheSessionHeader).toBe("x-grok-conv-id");
 		expect(paid.includeEncryptedReasoning).toBe(true);
@@ -326,7 +310,7 @@ describe("xAI Responses reasoning-effort suppression", () => {
 		expect(paid.reasoningEffortMap).toEqual({ minimal: "low", xhigh: "high", max: "high" });
 		expect(oauth.reasoningEffortMap).toEqual({ minimal: "low", xhigh: "high", max: "high" });
 		expect(
-			resolveModelPolicy(grokResponsesSpec("grok-4.20-multi-agent-0309", "xai")).compat.reasoningEffortMap,
+			buildOpenAIResponsesCompat(grokResponsesSpec("grok-4.20-multi-agent-0309", "xai")).reasoningEffortMap,
 		).toEqual({ minimal: "low" });
 		expect(paid.supportsPenaltyAndStopParams).toBe(false);
 		expect(oauth.supportsPenaltyAndStopParams).toBe(false);
@@ -335,17 +319,17 @@ describe("xAI Responses reasoning-effort suppression", () => {
 	});
 
 	it("suppresses penalty params on every first-party xAI Responses model", () => {
-		const reasoning = resolveModelPolicy(grokResponsesSpec("grok-4.5", "xai")).compat;
-		const nonReasoning = resolveModelPolicy({
+		const reasoning = buildOpenAIResponsesCompat(grokResponsesSpec("grok-4.5", "xai"));
+		const nonReasoning = buildOpenAIResponsesCompat({
 			...grokResponsesSpec("grok-2", "xai"),
 			reasoning: false,
-		}).compat;
+		});
 		expect(reasoning.supportsPenaltyAndStopParams).toBe(false);
 		expect(nonReasoning.supportsPenaltyAndStopParams).toBe(false);
 	});
 
 	it("omits effort for paid xai models off the Grok allowlist", () => {
-		const compat = resolveModelPolicy(grokResponsesSpec("grok-code-fast-1", "xai")).compat;
+		const compat = buildOpenAIResponsesCompat(grokResponsesSpec("grok-code-fast-1", "xai"));
 		expect(compat.supportsReasoningEffort).toBe(false);
 		expect(compat.omitReasoningEffort).toBe(true);
 		expect(buildModel(grokResponsesSpec("grok-code-fast-1", "xai")).thinking).toBeUndefined();
@@ -371,82 +355,81 @@ describe("xAI Responses reasoning-effort suppression", () => {
 	});
 
 	it("lets an explicit compat.supportsReasoningEffort override the allowlist default", () => {
-		const compat = resolveModelPolicy({
+		const compat = buildOpenAIResponsesCompat({
 			...grokResponsesSpec("grok-build"),
 			compat: { supportsReasoningEffort: true },
-		}).compat;
+		});
 		expect(compat.supportsReasoningEffort).toBe(true);
 	});
 
 	it("does not suppress effort for a non-xAI provider with a grok-like id", () => {
-		const compat = resolveModelPolicy({
+		const compat = buildOpenAIResponsesCompat({
 			...grokResponsesSpec("grok-build"),
 			provider: "openai",
 			baseUrl: "https://api.openai.com/v1",
-		}).compat;
+		});
 		expect(compat.supportsReasoningEffort).toBe(true);
 	});
 });
 
 describe("openai-completions wire-quirk compat detection", () => {
 	it("derives wireModelIdMode from provider/host", () => {
-		expect(resolveModelPolicy(completionsSpec({ provider: "firepass" })).compat.wireModelIdMode).toBe("firepass");
+		expect(buildOpenAICompat(completionsSpec({ provider: "firepass" })).wireModelIdMode).toBe("firepass");
 		expect(
-			resolveModelPolicy(
-				completionsSpec({ provider: "fireworks", baseUrl: "https://api.fireworks.ai/inference/v1" }),
-			).compat.wireModelIdMode,
+			buildOpenAICompat(completionsSpec({ provider: "fireworks", baseUrl: "https://api.fireworks.ai/inference/v1" }))
+				.wireModelIdMode,
 		).toBe("fireworks");
 		// Fireworks "Fast" variants route through the router namespace (like Fire Pass).
 		expect(
-			resolveModelPolicy(
+			buildOpenAICompat(
 				completionsSpec({
 					provider: "fireworks",
 					id: "kimi-k2.6-fast",
 					baseUrl: "https://api.fireworks.ai/inference/v1",
 				}),
-			).compat.wireModelIdMode,
+			).wireModelIdMode,
 		).toBe("firepass");
 		expect(
-			resolveModelPolicy(completionsSpec({ provider: "openrouter", baseUrl: "https://openrouter.ai/api/v1" })).compat
+			buildOpenAICompat(completionsSpec({ provider: "openrouter", baseUrl: "https://openrouter.ai/api/v1" }))
 				.wireModelIdMode,
 		).toBe("openrouter");
-		expect(resolveModelPolicy(completionsSpec()).compat.wireModelIdMode).toBe("raw");
+		expect(buildOpenAICompat(completionsSpec()).wireModelIdMode).toBe("raw");
 	});
 
 	it("strips DeepSeek special tokens only for deepseek ids on nvidia/deepseek providers", () => {
 		expect(
-			resolveModelPolicy(
+			buildOpenAICompat(
 				completionsSpec({
 					provider: "nvidia",
 					id: "deepseek-ai/deepseek-v3.1",
 					baseUrl: "https://integrate.api.nvidia.com/v1",
 				}),
-			).compat.stripDeepseekSpecialTokens,
+			).stripDeepseekSpecialTokens,
 		).toBe(true);
 		expect(
-			resolveModelPolicy(
+			buildOpenAICompat(
 				completionsSpec({ provider: "deepseek", id: "deepseek-chat", baseUrl: "https://api.deepseek.com/v1" }),
-			).compat.stripDeepseekSpecialTokens,
+			).stripDeepseekSpecialTokens,
 		).toBe(true);
 		// DeepSeek id behind another host must NOT strip (only nvidia/deepseek hosts emit the raw tokens).
 		expect(
-			resolveModelPolicy(
+			buildOpenAICompat(
 				completionsSpec({
 					provider: "openrouter",
 					id: "deepseek/deepseek-v3.1",
 					baseUrl: "https://openrouter.ai/api/v1",
 				}),
-			).compat.stripDeepseekSpecialTokens,
+			).stripDeepseekSpecialTokens,
 		).toBe(false);
 		// Non-deepseek id on nvidia must NOT strip.
 		expect(
-			resolveModelPolicy(
+			buildOpenAICompat(
 				completionsSpec({
 					provider: "nvidia",
 					id: "meta/llama-3.1",
 					baseUrl: "https://integrate.api.nvidia.com/v1",
 				}),
-			).compat.stripDeepseekSpecialTokens,
+			).stripDeepseekSpecialTokens,
 		).toBe(false);
 	});
 
@@ -458,68 +441,67 @@ describe("openai-completions wire-quirk compat detection", () => {
 		} as const;
 
 		expect(
-			resolveModelPolicy(
+			buildOpenAICompat(
 				completionsSpec({
 					...deepseekReasoning,
 					provider: "opencode-zen",
 					baseUrl: "https://opencode.ai/zen/v1",
 				}),
-			).compat.supportsForcedToolChoice,
+			).supportsForcedToolChoice,
 		).toBe(false);
 		expect(
-			resolveModelPolicy(
+			buildOpenAICompat(
 				completionsSpec({
 					...deepseekReasoning,
 					provider: "custom",
 					baseUrl: "https://opencode.ai/zen/go/v1",
 				}),
-			).compat.supportsForcedToolChoice,
+			).supportsForcedToolChoice,
 		).toBe(false);
 		expect(
-			resolveModelPolicy(
+			buildOpenAICompat(
 				completionsSpec({
 					...deepseekReasoning,
 					provider: "nvidia",
 					baseUrl: "https://integrate.api.nvidia.com/v1",
 				}),
-			).compat.supportsForcedToolChoice,
+			).supportsForcedToolChoice,
 		).toBe(true);
 		expect(
-			resolveModelPolicy(
+			buildOpenAICompat(
 				completionsSpec({
 					...deepseekReasoning,
 					provider: "opencode-zen",
 					baseUrl: "https://opencode.ai/zen/v1",
 					reasoning: false,
 				}),
-			).compat.supportsForcedToolChoice,
+			).supportsForcedToolChoice,
 		).toBe(true);
 	});
 	it("downgrades forced tool choice for OpenCode gateways on Responses API", () => {
 		expect(
-			resolveModelPolicy(
-				responsesSpec({
-					id: "muse-spark-1.2-contributor",
-					provider: "opencode-go",
-					name: "Muse Spark",
-					baseUrl: "https://opencode.ai/zen/go/v1",
-				}),
-			).compat.supportsForcedToolChoice,
+			buildOpenAIResponsesCompat({
+				id: "muse-spark-1.2-contributor",
+				provider: "opencode-go",
+				name: "Muse Spark",
+				baseUrl: "https://opencode.ai/zen/go/v1",
+			}).supportsForcedToolChoice,
 		).toBe(false);
 		expect(
-			resolveModelPolicy(
-				responsesSpec({
-					id: "muse-spark-1.2",
-					provider: "opencode-zen",
-					name: "Muse Spark",
-					baseUrl: "https://opencode.ai/zen/v1",
-				}),
-			).compat.supportsForcedToolChoice,
+			buildOpenAIResponsesCompat({
+				id: "muse-spark-1.2",
+				provider: "opencode-zen",
+				name: "Muse Spark",
+				baseUrl: "https://opencode.ai/zen/v1",
+			}).supportsForcedToolChoice,
 		).toBe(false);
 		expect(
-			resolveModelPolicy(
-				responsesSpec({ id: "gpt-5", provider: "openai", name: "GPT-5", baseUrl: "https://api.openai.com/v1" }),
-			).compat.supportsForcedToolChoice,
+			buildOpenAIResponsesCompat({
+				id: "gpt-5",
+				provider: "openai",
+				name: "GPT-5",
+				baseUrl: "https://api.openai.com/v1",
+			}).supportsForcedToolChoice,
 		).toBe(true);
 	});
 
@@ -527,36 +509,32 @@ describe("openai-completions wire-quirk compat detection", () => {
 		// Mistral/Devstral reject a user message directly after a tool result; the chat
 		// builder bridges it with a synthetic assistant turn, keyed on the Mistral host.
 		expect(
-			resolveModelPolicy(
+			buildOpenAICompat(
 				completionsSpec({ provider: "mistral", id: "devstral-latest", baseUrl: "https://api.mistral.ai/v1" }),
-			).compat.requiresAssistantAfterToolResult,
+			).requiresAssistantAfterToolResult,
 		).toBe(true);
 		// URL-only match (custom provider fronting Mistral).
 		expect(
-			resolveModelPolicy(
+			buildOpenAICompat(
 				completionsSpec({
 					provider: "custom",
 					id: "mistral-large",
 					baseUrl: "https://proxy.example/mistral.ai/v1",
 				}),
-			).compat.requiresAssistantAfterToolResult,
+			).requiresAssistantAfterToolResult,
 		).toBe(true);
 		// Non-Mistral hosts must not insert the bridge.
-		expect(resolveModelPolicy(completionsSpec()).compat.requiresAssistantAfterToolResult).toBe(false);
+		expect(buildOpenAICompat(completionsSpec()).requiresAssistantAfterToolResult).toBe(false);
 		expect(
-			resolveModelPolicy(completionsSpec({ provider: "openai", id: "gpt-5", baseUrl: "https://api.openai.com/v1" }))
-				.compat.requiresAssistantAfterToolResult,
+			buildOpenAICompat(completionsSpec({ provider: "openai", id: "gpt-5", baseUrl: "https://api.openai.com/v1" }))
+				.requiresAssistantAfterToolResult,
 		).toBe(false);
 	});
 
 	it("flags cumulative reasoning deltas for MiniMax provider or id", () => {
-		expect(resolveModelPolicy(completionsSpec({ provider: "minimax" })).compat.reasoningDeltasMayBeCumulative).toBe(
-			true,
-		);
-		expect(resolveModelPolicy(completionsSpec({ id: "MiniMax-M2" })).compat.reasoningDeltasMayBeCumulative).toBe(
-			true,
-		);
-		expect(resolveModelPolicy(completionsSpec()).compat.reasoningDeltasMayBeCumulative).toBe(false);
+		expect(buildOpenAICompat(completionsSpec({ provider: "minimax" })).reasoningDeltasMayBeCumulative).toBe(true);
+		expect(buildOpenAICompat(completionsSpec({ id: "MiniMax-M2" })).reasoningDeltasMayBeCumulative).toBe(true);
+		expect(buildOpenAICompat(completionsSpec()).reasoningDeltasMayBeCumulative).toBe(false);
 	});
 
 	it("extends the reasoning stream idle floor to Kimi K2.6 and K2.7 Code, not other reasoning models", () => {
@@ -565,42 +543,38 @@ describe("openai-completions wire-quirk compat detection", () => {
 			baseUrl: "https://api.moonshot.ai/v1",
 			reasoning: true,
 		} as const;
+		expect(buildOpenAICompat(completionsSpec({ ...kimiOverrides, id: "kimi-k2.6" })).streamIdleTimeoutMs).toBe(
+			300_000,
+		);
+		expect(buildOpenAICompat(completionsSpec({ ...kimiOverrides, id: "kimi-k2.7-code" })).streamIdleTimeoutMs).toBe(
+			300_000,
+		);
 		expect(
-			resolveModelPolicy(completionsSpec({ ...kimiOverrides, id: "kimi-k2.6" })).compat.streamIdleTimeoutMs,
-		).toBe(300_000);
-		expect(
-			resolveModelPolicy(completionsSpec({ ...kimiOverrides, id: "kimi-k2.7-code" })).compat.streamIdleTimeoutMs,
-		).toBe(300_000);
-		expect(
-			resolveModelPolicy(completionsSpec({ ...kimiOverrides, id: "kimi-k2.7-code-highspeed" })).compat
-				.streamIdleTimeoutMs,
+			buildOpenAICompat(completionsSpec({ ...kimiOverrides, id: "kimi-k2.7-code-highspeed" })).streamIdleTimeoutMs,
 		).toBe(300_000);
 		// K2.7 Code on non-native OpenAI-compatible hosts keeps their default.
 		expect(
-			resolveModelPolicy(completionsSpec({ id: "kimi-k2.7-code", reasoning: true })).compat.streamIdleTimeoutMs,
+			buildOpenAICompat(completionsSpec({ id: "kimi-k2.7-code", reasoning: true })).streamIdleTimeoutMs,
 		).toBeUndefined();
 		// A non-Kimi reasoning model on a generic host keeps the runtime default.
 		expect(
-			resolveModelPolicy(completionsSpec({ id: "some-reasoner", reasoning: true })).compat.streamIdleTimeoutMs,
+			buildOpenAICompat(completionsSpec({ id: "some-reasoner", reasoning: true })).streamIdleTimeoutMs,
 		).toBeUndefined();
 	});
 
 	it("maps the remaining provider-keyed wire quirks", () => {
-		expect(resolveModelPolicy(completionsSpec({ provider: "ollama" })).compat.emptyLengthFinishIsContextError).toBe(
-			true,
-		);
-		expect(resolveModelPolicy(completionsSpec()).compat.emptyLengthFinishIsContextError).toBe(false);
+		expect(buildOpenAICompat(completionsSpec({ provider: "ollama" })).emptyLengthFinishIsContextError).toBe(true);
+		expect(buildOpenAICompat(completionsSpec()).emptyLengthFinishIsContextError).toBe(false);
 		expect(
-			resolveModelPolicy(completionsSpec({ provider: "openai", baseUrl: "https://api.openai.com/v1" })).compat
+			buildOpenAICompat(completionsSpec({ provider: "openai", baseUrl: "https://api.openai.com/v1" }))
 				.usesOpenAIToolCallIdLimit,
 		).toBe(true);
-		expect(resolveModelPolicy(completionsSpec()).compat.usesOpenAIToolCallIdLimit).toBe(false);
+		expect(buildOpenAICompat(completionsSpec()).usesOpenAIToolCallIdLimit).toBe(false);
 		expect(
-			resolveModelPolicy(
-				completionsSpec({ provider: "fireworks", baseUrl: "https://api.fireworks.ai/inference/v1" }),
-			).compat.dropThinkingWhenReasoningEffort,
+			buildOpenAICompat(completionsSpec({ provider: "fireworks", baseUrl: "https://api.fireworks.ai/inference/v1" }))
+				.dropThinkingWhenReasoningEffort,
 		).toBe(true);
-		expect(resolveModelPolicy(completionsSpec()).compat.dropThinkingWhenReasoningEffort).toBe(false);
+		expect(buildOpenAICompat(completionsSpec()).dropThinkingWhenReasoningEffort).toBe(false);
 	});
 
 	it("floors the stream timeout for a loopback litellm proxy without enabling reasoning replay (#4786)", () => {
@@ -610,25 +584,25 @@ describe("openai-completions wire-quirk compat detection", () => {
 		// field is never forwarded to an unrelated cloud upstream) must NOT also
 		// strip the widened stream-timeout floor, or the turn aborts and
 		// retry-loops during a slow reprocess.
-		const loopback = resolveModelPolicy(
+		const loopback = buildOpenAICompat(
 			completionsSpec({ provider: "litellm", id: "qwen3", baseUrl: "http://127.0.0.1:4000/v1" }),
-		).compat;
+		);
 		expect(loopback.streamIdleTimeoutMs).toBe(300_000);
 		expect(loopback.replayReasoningContent).toBe(false);
 
 		// A litellm proxy on a remote baseUrl gets neither: no local upstream to
 		// wait on, and replay would risk a 400 on the cloud upstream.
-		const remote = resolveModelPolicy(
+		const remote = buildOpenAICompat(
 			completionsSpec({ provider: "litellm", id: "qwen3", baseUrl: "https://litellm.example.com/v1" }),
-		).compat;
+		);
 		expect(remote.streamIdleTimeoutMs).toBeUndefined();
 		expect(remote.replayReasoningContent).toBe(false);
 
 		// A first-party local backend (llama.cpp) still gets both the floor and
 		// the reasoning replay it needs for KV-cache reuse.
-		const native = resolveModelPolicy(
+		const native = buildOpenAICompat(
 			completionsSpec({ provider: "llama.cpp", id: "qwen3", baseUrl: "http://127.0.0.1:8080/v1" }),
-		).compat;
+		);
 		expect(native.streamIdleTimeoutMs).toBe(300_000);
 		expect(native.replayReasoningContent).toBe(true);
 	});
@@ -638,54 +612,45 @@ describe("openai-completions wire-quirk compat detection", () => {
 		// the provider-local healer stays off; every other OpenAI-compatible host
 		// keeps the default "thinking" healer, and Kimi/DSML keep their grammars.
 		expect(
-			resolveModelPolicy(completionsSpec({ provider: "openai", baseUrl: "https://api.openai.com/v1" })).compat
+			buildOpenAICompat(completionsSpec({ provider: "openai", baseUrl: "https://api.openai.com/v1" }))
 				.streamMarkupHealingPattern,
 		).toBeUndefined();
 		expect(
-			resolveModelPolicy(completionsSpec({ provider: "openrouter", baseUrl: "https://openrouter.ai/api/v1" })).compat
+			buildOpenAICompat(completionsSpec({ provider: "openrouter", baseUrl: "https://openrouter.ai/api/v1" }))
 				.streamMarkupHealingPattern,
 		).toBe("thinking");
 		// A lookalike host under the openai provider id is NOT the official endpoint.
 		expect(
-			resolveModelPolicy(completionsSpec({ provider: "openai", baseUrl: "https://api.openai.com.evil/v1" })).compat
+			buildOpenAICompat(completionsSpec({ provider: "openai", baseUrl: "https://api.openai.com.evil/v1" }))
 				.streamMarkupHealingPattern,
 		).toBe("thinking");
 		expect(
-			resolveModelPolicy(
+			buildOpenAICompat(
 				completionsSpec({ provider: "moonshot", id: "kimi-k2", baseUrl: "https://api.moonshot.ai/v1" }),
-			).compat.streamMarkupHealingPattern,
+			).streamMarkupHealingPattern,
 		).toBe("kimi");
 	});
 
 	it("derives Responses obfuscation opt-out and wire mode per surface", () => {
 		expect(
-			resolveModelPolicy(
-				responsesSpec({ id: "gpt-5", provider: "openai", name: "GPT 5", baseUrl: "https://api.openai.com/v1" }),
-			).compat.supportsObfuscationOptOut,
+			buildOpenAIResponsesCompat({
+				id: "gpt-5",
+				provider: "openai",
+				name: "GPT 5",
+				baseUrl: "https://api.openai.com/v1",
+			}).supportsObfuscationOptOut,
 		).toBe(true);
 		// Azure mirrors the schema but is NOT the OpenAI host: no obfuscation opt-out.
 		expect(
-			resolveModelPolicy({
-				id: "gpt-5",
-				name: "gpt-5",
-				api: "azure-openai-responses",
-				provider: "azure",
-				baseUrl: "",
-				reasoning: false,
-				input: ["text"],
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-				contextWindow: null,
-				maxTokens: null,
-			}).compat.supportsObfuscationOptOut,
+			buildOpenAIResponsesCompat({ id: "gpt-5", provider: "azure", name: "gpt-5", baseUrl: "" })
+				.supportsObfuscationOptOut,
 		).toBe(false);
-		const openrouterResponses = resolveModelPolicy(
-			responsesSpec({
-				id: "anthropic/claude-sonnet-4",
-				provider: "openrouter",
-				name: "Claude Sonnet 4",
-				baseUrl: "https://openrouter.ai/api/v1",
-			}),
-		).compat;
+		const openrouterResponses = buildOpenAIResponsesCompat({
+			id: "anthropic/claude-sonnet-4",
+			provider: "openrouter",
+			name: "Claude Sonnet 4",
+			baseUrl: "https://openrouter.ai/api/v1",
+		});
 		expect(openrouterResponses.supportsObfuscationOptOut).toBe(false);
 		expect(openrouterResponses.wireModelIdMode).toBe("openrouter");
 	});
@@ -693,17 +658,15 @@ describe("openai-completions wire-quirk compat detection", () => {
 
 describe("OpenAI explicit prompt-cache breakpoint compat", () => {
 	it("enables the 30-minute breakpoint contract for GPT-5.6+ on the official API", () => {
-		const completions = resolveModelPolicy(
+		const completions = buildOpenAICompat(
 			completionsSpec({ id: "gpt-5.6", provider: "openai", baseUrl: "https://api.openai.com/v1" }),
-		).compat;
-		const responses = resolveModelPolicy(
-			responsesSpec({
-				id: "gpt-5.6-mini",
-				provider: "openai",
-				name: "GPT 5.6 Mini",
-				baseUrl: "https://api.openai.com/v1",
-			}),
-		).compat;
+		);
+		const responses = buildOpenAIResponsesCompat({
+			id: "gpt-5.6-mini",
+			provider: "openai",
+			name: "GPT 5.6 Mini",
+			baseUrl: "https://api.openai.com/v1",
+		});
 
 		expect(completions.supportsPromptCacheBreakpoints).toBe(true);
 		expect(completions.promptCacheBreakpointTtl).toBe("30m");
@@ -711,65 +674,60 @@ describe("OpenAI explicit prompt-cache breakpoint compat", () => {
 		expect(responses.promptCacheBreakpointTtl).toBe("30m");
 
 		expect(
-			resolveModelPolicy(
+			buildOpenAICompat(
 				completionsSpec({ id: "gpt-5.6-preview", provider: "openai", baseUrl: "https://api.openai.com/v1" }),
-			).compat.supportsPromptCacheBreakpoints,
+			).supportsPromptCacheBreakpoints,
 		).toBe(true);
 		expect(
-			resolveModelPolicy(
-				completionsSpec({ id: "gpt-5.7", provider: "openai", baseUrl: "https://api.openai.com/v1" }),
-			).compat.supportsPromptCacheBreakpoints,
+			buildOpenAICompat(completionsSpec({ id: "gpt-5.7", provider: "openai", baseUrl: "https://api.openai.com/v1" }))
+				.supportsPromptCacheBreakpoints,
 		).toBe(true);
 		expect(
-			resolveModelPolicy(
-				responsesSpec({
-					id: "gpt-6.1-mini",
-					provider: "openai",
-					name: "GPT 6.1 Mini",
-					baseUrl: "https://api.openai.com/v1",
-				}),
-			).compat.supportsPromptCacheBreakpoints,
+			buildOpenAIResponsesCompat({
+				id: "gpt-6.1-mini",
+				provider: "openai",
+				name: "GPT 6.1 Mini",
+				baseUrl: "https://api.openai.com/v1",
+			}).supportsPromptCacheBreakpoints,
 		).toBe(true);
 
 		expect(
-			resolveModelPolicy(
-				completionsSpec({ id: "gpt-5.5", provider: "openai", baseUrl: "https://api.openai.com/v1" }),
-			).compat.supportsPromptCacheBreakpoints,
+			buildOpenAICompat(completionsSpec({ id: "gpt-5.5", provider: "openai", baseUrl: "https://api.openai.com/v1" }))
+				.supportsPromptCacheBreakpoints,
 		).toBe(false);
 		expect(
-			resolveModelPolicy(
-				responsesSpec({
-					id: "gpt-5.6",
-					provider: "openrouter",
-					name: "GPT 5.6 through OpenRouter",
-					baseUrl: "https://openrouter.ai/api/v1",
-				}),
-			).compat.supportsPromptCacheBreakpoints,
+			buildOpenAIResponsesCompat({
+				id: "gpt-5.6",
+				provider: "openrouter",
+				name: "GPT 5.6 through OpenRouter",
+				baseUrl: "https://openrouter.ai/api/v1",
+			}).supportsPromptCacheBreakpoints,
 		).toBe(false);
 		expect(
-			resolveModelPolicy(
-				responsesSpec({ id: "gpt-4.1", provider: "openai", name: "GPT 4.1", baseUrl: "https://api.openai.com/v1" }),
-			).compat.supportsPromptCacheBreakpoints,
+			buildOpenAIResponsesCompat({
+				id: "gpt-4.1",
+				provider: "openai",
+				name: "GPT 4.1",
+				baseUrl: "https://api.openai.com/v1",
+			}).supportsPromptCacheBreakpoints,
 		).toBe(false);
 		expect(
-			resolveModelPolicy(
-				responsesSpec({
-					id: "gpt-5.6",
-					provider: "openai",
-					name: "GPT 5.6",
-					baseUrl: "https://api.openai.com.evil/v1",
-				}),
-			).compat.supportsPromptCacheBreakpoints,
+			buildOpenAIResponsesCompat({
+				id: "gpt-5.6",
+				provider: "openai",
+				name: "GPT 5.6",
+				baseUrl: "https://api.openai.com.evil/v1",
+			}).supportsPromptCacheBreakpoints,
 		).toBe(false);
 	});
 
 	it("keeps custom endpoint support opt-in", () => {
-		const compat = resolveModelPolicy(
+		const compat = buildOpenAICompat(
 			completionsSpec({
 				id: "gpt-5.6",
 				compat: { supportsPromptCacheBreakpoints: true, promptCacheBreakpointTtl: "30m" },
 			}),
-		).compat;
+		);
 
 		expect(compat.supportsPromptCacheBreakpoints).toBe(true);
 		expect(compat.promptCacheBreakpointTtl).toBe("30m");

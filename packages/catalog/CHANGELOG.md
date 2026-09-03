@@ -2,128 +2,8 @@
 
 ## [Unreleased]
 
-## [18.1.5] - 2026-09-03
-
 ### Added
 
-- Added the Abliteration (abliteration.ai) provider, including its documented abliterated-model catalog and live model discovery.
-- Added the GLM 5.3 Promo 50 model.
-- Added computer-use capability metadata to model configurations.
-- Added declarative provider authentication policies covering login, refresh, environment-key, and credential behavior, with generated compatibility data and typed accessors.
-
-### Changed
-
-- Gemini 3.8 Flash now supports reasoning modes and image inputs.
-- Updated the GitHub Copilot API version to 2026-08-01.
-- Reduced input pricing for the minimax/minimax-m2 model.
-- Renamed Meta Model API contributor SKUs to use the Muse Spark 1.x (C) naming.
-
-### Fixed
-
-- GitHub Copilot model discovery now respects the Copilot CLI identity, ensuring eligible enterprise and experimental models are available.
-- Fixed startup failures when discovering Bedrock-style Mistral Mixtral models.
-- Fixed Muse Spark 1.3 contributor models on OpenCode gateways so they use the correct Responses API route.
-- Updated Meta and OpenCode Muse Spark 1.3 model metadata and capabilities, including context windows, reasoning levels, image input, pricing, and model naming; media-only Muse SKUs are no longer presented as chat models.
-
-## [18.1.4] - 2026-09-02
-
-### Changed
-
-- Enabled Cursor tool schema projection for supported models
-
-### Fixed
-
-- Antigravity and Gemini CLI now collapse every Gemini Flash generation from 3.6 on (`gemini-3.8-flash-low/-medium/-high` and the `-tiered` alias, and future revisions) into one routed `gemini-<rev>-flash` entry via a revision-templated `variant-family`, instead of surfacing raw per-level ids until a per-revision rule lands.
-
-## [18.1.3] - 2026-09-02
-
-### Added
-
-- Added support for Claude Fable 5.1
-
-### Changed
-
-- Updated pricing and context limits for various Claude models
-
-### Fixed
-
-- Claude Sonnet 5 no longer advertises unsupported mid-conversation system messages.
-- Custom GLM 5.2 models on `alibaba-coding-plan` (and other blanket-GLM hosts) no longer crash startup with `AmbiguousOverlapError` ([#10553](https://github.com/can1357/oh-my-pi/issues/10553)).
-- Gemini 3.7 Flash no longer offers the `minimal` thinking effort on direct google-level hosts (`google`, `google-vertex`, `opencode-zen`), which reject `thinkingLevel: MINIMAL` with a 400; budget and reasoning-effort resellers keep the tier ([#10543](https://github.com/can1357/oh-my-pi/issues/10543)).
-- Fixed Alibaba Token Plan discovery for `qwen3.8-flash` to include its context limits, reasoning support, and image input.
-- Z.AI GLM-5.3-Flash now uses the native API instead of failing through the unsupported Anthropic-compatible route ([#10539](https://github.com/can1357/oh-my-pi/issues/10539)).
-
-## [18.1.2] - 2026-09-01
-
-### Added
-
-- Added support for turn-scoped system messages, changing tools during a conversation, and setting effort on individual messages.
-- Added support for Claude Fable 5.1 models, with improved thinking-prefix handling across supported Claude models.
-- Added DeepSeek V4 Flash Vision Exp, Mercury 2.5 Preview, and Xiaomi MiMo V2.5 Pro UltraSpeed models.
-
-### Changed
-
-- Updated model pricing and context-window limits.
-
-## [18.1.0] - 2026-09-01
-
-### Added
-
-- Grok Bot AvailableModels discovery emits separate catalog rows for variant **`legacySlug`** values with `requestModelId` pointing at the canonical model and variant `sandParameterIds`.
-- Grok Bot (`grokbot`) catalog — model aliases (`sand-default`, `grok-4.5`, …) with image input and reasoning on `sand-default`; cost is $0 by design (renewer-billed). Distinct from `cursor` and `xai` / Grok CLI catalogs.
-- Grok Bot (`grokbot`) catalog — sand InferenceService model aliases (`sand-default`, `grok-4.5`, …) with image input; distinct from `cursor` and `xai` / Grok CLI catalogs. Catalog cost is intentionally $0 (sand usage meters on the renewer account). Reasoning seeds advertise sand effort including `xhigh`.
-- Grok Bot (`grokbot`) catalog — live models from sand `AiService/AvailableModels` (authoritative when renewer present), plus sand router slugs (`sand-default`, `sand-cua`, `sand-automation`). Aliases stay on the canonical row (`idAliases`); cost is $0 by design (renewer-billed). Distinct from `cursor` and `xai` / Grok CLI catalogs.
-
-### Fixed
-
-- Grok Bot offline seeds stay neutral for image input and output caps so live AvailableModels rows are not enriched on merge.
-- Grok Bot bundled catalog no longer fabricates output caps from canonical or stencil.so fallbacks; reviewed limits stay KDL-owned.
-- Grok Bot synthetic sand routers stay text-only when unioned without an AvailableModels capability row.
-- Grok Bot AvailableModels trims whitespace from model ids before catalog storage and alias filtering.
-- Grok Bot AvailableModels preserves variant default sand parameter values (including `context` tiers) on catalog rows.
-- Grok Bot AvailableModels leaves native tool support unset; KDL forces `supportsTools: false` for grok-4.5 (sand HTTP 422 with tools).
-- Grok Bot legacy max/non-max variant rows recompute `contextWindow` for their own sandMaxMode.
-- Grok Bot live discovery reasoning is authoritative on merge (static seed reasoning is not OR-upgraded).
-- Grok Bot live models with unrecognized-only effort vocabularies keep no thinking ladder after `buildModel` (KDL no longer backfills).
-- Grok Bot offline `sandParameterIds` for `grok-4.6` come from provider KDL (`sand-parameter-ids`) via `buildModel`, not TypeScript seed tables.
-- Grok Bot thinking fallback suppression uses KDL `preserve-authored-thinking` in `buildModel` (no provider/API TypeScript branch).
-- Grok Bot AvailableModels leaves context windows unset when omitted; reviewed floors come from KDL for known routers/seeds.
-- Grok Bot AvailableModels leaves output caps unset instead of inventing a 64K `maxTokens` (wire omits `modelConfig.maxTokens` until a reviewed limit exists).
-- Grok Bot offline `grok-4.6` effort ladder comes from provider KDL via `buildModel`, not a TypeScript per-id seed branch.
-- Grok Bot AvailableModels does not invent low/medium/high/xhigh when upstream effort values are all unrecognized.
-- Grok Bot AvailableModels aliases include `variants[].legacySlug` so saved legacy selectors still resolve.
-- Grok Bot prefers every environment renewal credential (`GROKBOT_*` / `SAND_INFERENCE_*`) over secrets-file fallbacks when minting.
-- Restored unrelated bundled catalog rows dropped during an earlier Grok Bot `models.json` regen (kept parent catalog; only added Grok Bot).
-- Grok Bot AvailableModels discovery sends `connect-protocol-version: 1` like other Connect unary clients.
-- Grok Bot AvailableModels requires explicit `supportsImages: true` before advertising image input (omitted proto3 false stays text-only).
-- Grok Bot AvailableModels treats omitted `supportsNonMaxMode` like `false` so max-only rows keep `sandMaxMode`.
-- Grok Bot JWT mint cache is scoped by caller/proxy headers so tenant header changes do not reuse another token.
-- Grok Bot AvailableModels discovery and token minting merge configured headers case-insensitively so reserved names are not comma-joined on the wire.
-- Grok Bot AvailableModels discovery clears the JWT mint cache on HTTP 401 so the next refresh can mint a replacement token.
-- Grok Bot AvailableModels discovery orders effort ladders least→most via shared `THINKING_EFFORTS` (so `minimal` precedes `low` when both are advertised).
-- Grok Bot AvailableModels discovery returns `null` (no cache write) when HTTP 200 bodies omit a `models` array, instead of caching a routers-only catalog from proxy error envelopes.
-- Grok Bot catalog refresh resolves namespace/client-version identity asynchronously once and passes it through cache scoping without synchronous secrets-file rereads.
-- Token minting for Grok Bot forwards caller/model proxy headers under provider-owned client headers so reverse-proxy gateways accept `/sand-box/inference-credential`.
-- Grok Bot AvailableModels discovery forwards the same configured provider headers used for inference/renewal.
-- Grok Bot model-cache identity includes configured discovery/proxy headers so tenant header changes do not reuse another catalog.
-- Grok Bot generator preserves seed/AvailableModels effort ladders (no invented router thinking; `grok-4.6` keeps `low`/`medium`/`high`/`xhigh`) and regenerates the bundled catalog to match.
-- Grok Bot renewal and stream URLs keep reverse-proxy path prefixes on the configured backend.
-- Grok Bot model-cache identity resolves namespace/client version from env and `secrets/grokbot.env` (same helpers as AvailableModels), not Bun.env alone.
-- Grok Bot max-only AvailableModels rows (`supportsMaxMode` without `supportsNonMaxMode`) keep `sandMaxMode` and use `contextTokenLimitForMaxMode` instead of being forced into non-max.
-- Grok Bot preserves live AvailableModels effort ladders through `buildModel` instead of expanding them to the static catalog scale; reasoning models without an effort parameter no longer invent a thinking control.
-- Grok Bot AvailableModels cache is scoped by renewer, backend, namespace, and client version so credential or `GROKBOT_NAMESPACE` / `GROKBOT_CLIENT_VERSION` switches do not reuse another catalog.
-- Grok Bot discovery stamps `sandMaxMode` for max-only AvailableModels rows, keeps live effort ladders through `buildModel`, and scopes the model cache by namespace/client version as well as renewer.
-- Grok Bot secrets loading uses async dotenv reads so login/discovery/stream no longer block the event loop on agent-directory I/O.
-- Grok Bot AvailableModels cache is scoped by renewer credential + backend so account switches do not reuse another catalog.
-- Grok Bot bundled catalog now includes `xhigh` on parameterized effort ladders (regenerated from seed/policy); AvailableModels discovery uses a static import.
-- Grok Bot `secrets/grokbot.env` loading now uses the shared dotenv parser so quoted values, `export` prefixes, and inline comments authenticate correctly. Async secret loads use `parseEnvFileAsync` so slow agent directories do not block the event loop.
-- Added support for GitLab Duo models
-- Added provider support for Llama.cpp, LM Studio, and Minimax
-- Added support for new models: Qwen 3.8 27B, Granite 4.2 8B, Abliterated variants, GLM 5.3, and Qwen 3.8 Flash Next
-- Added `supportsContextManagement` and `supportsReasoningSummary` compatibility metadata for provider-compatible model endpoints ([#10358](https://github.com/can1357/oh-my-pi/pull/10358) by [@jubueche](https://github.com/jubueche)).
-- Model identity and compatibility policy now live in a checked-in KDL rule tree (`src/compat/rules/`: taxonomy, class, provider, and runtime files) compiled by `bun run gen:compat` into a committed `rules.json`; the runtime engine (`resolveModelPolicy`/`classifyModel`) resolves every model's wire compat, thinking surface, and catalog metadata from these rules instead of scattered model-name matching in TypeScript.
-- Built models carry a structured `identity` (`class`, `family`, `revision`, effort/thinking-variant facts) baked into `models.json`, and Google APIs (`google-generative-ai`, `google-vertex`, `google-gemini-cli`) gain a resolved compat record instead of `undefined`.
-- Added `model.serviceTierCost` (per-tier price multipliers), a `long-context-cost` multiplier form that tracks live list prices (xAI SuperGrok 200K tier), reviewed catalog corrections (`cost-patch`/`limits-patch`/`input-modalities`), and runtime behavior vocabulary (`api-routes`, `model-limits`, `exclude-models`, `pricing-peer`, `pro-reasoning-alias`) replacing the generator's hand-maintained tables.
 - Added the native `cline-pass` provider with live roster discovery, generated offline metadata, concise public model IDs, and verified output-token and reasoning-effort request shaping ([#7863](https://github.com/can1357/oh-my-pi/pull/7863) by [@will-bogusz](https://github.com/will-bogusz)).
 - ClinePass roster discovery now also surfaces Cline's free-tier models: the `free` bucket of the recommended-models endpoint is overlaid after the subscription roster (which remains the required, independently validated anchor), free IDs keep their full OpenRouter-style form on the wire via a bucket-derived raw wire tag, and known free models self-enrich from the bundled upstream reference with a `(free)` name marker ([#7863](https://github.com/can1357/oh-my-pi/pull/7863) by [@will-bogusz](https://github.com/will-bogusz)).
 - ClinePass subscription models now surface upstream list prices (resolved from the bundled reference) so cost display reads as API-equivalent spend, matching the Codex/GitHub Copilot policy; only the free tier renders as $0 ([#7863](https://github.com/can1357/oh-my-pi/pull/7863) by [@will-bogusz](https://github.com/will-bogusz)).
@@ -132,35 +12,12 @@
 - Devin discovery now announces the native `chisel` client and display slots, filters internal configs, reads server pricing/capability/output-limit metadata, exposes the router config as `adaptive`, and collapses server-declared effort families onto each family's native default wire uid ([#8590](https://github.com/can1357/oh-my-pi/pull/8590) by [@will-bogusz](https://github.com/will-bogusz)).
 - Added Devin selector aliases for the native short and dotted model names, plus static SWE-1.6 seeds so the provider default resolves before credential-scoped discovery runs ([#8590](https://github.com/can1357/oh-my-pi/pull/8590) by [@will-bogusz](https://github.com/will-bogusz)).
 - Added optional `description`, `isNew`, `isBeta`, and `isRecommended` model metadata, populated from Devin's `GetCliModelConfigs` so discovered Cascade models keep the server's blurb and badges ([#8590](https://github.com/can1357/oh-my-pi/pull/8590) by [@will-bogusz](https://github.com/will-bogusz)).
-- Added GitLab Duo model support.
-- Added provider support for Llama.cpp, LM Studio, and Minimax.
-- Added catalog entries for Qwen 3.8 27B, Granite 4.2 8B, Abliterated variants, GLM 5.3, and Qwen 3.8 Flash Next.
-- Added compatibility metadata for context management and reasoning summaries on supported provider-compatible model endpoints.
-- Added the native ClinePass provider with live model discovery, subscription and free-tier model listings, current limits and pricing, model modalities, and per-model reasoning controls. Subscription models display API-equivalent pricing while free-tier models display as free.
-- Added native Devin provider discovery with current Cascade model capabilities, pricing, limits, reasoning controls, selector aliases, and model descriptions and recommendation/beta metadata. Added static SWE-1.6 defaults so the provider can resolve a default model before account-scoped discovery completes.
-- Added per-tier model pricing and long-context pricing support, along with expanded catalog metadata for model limits, API routes, input modalities, and provider-specific model aliases.
-
-### Changed
-
-- Updated pricing data across the catalog to reflect current provider rates.
-- Standardized model display names for greater consistency.
-- Improved model compatibility classification and variant selection using structured model identities, providing more reliable detection of model families, revisions, reasoning variants, and provider-specific capabilities.
 
 ### Fixed
 
-- Fixed compatibility detection for vendor-prefixed GLM models on Mistral and Cerebras, restoring the appropriate tokenizer and reasoning-history behavior.
-- Removed an obsolete OpenCode provider entry that exposed unavailable Zen models in the model picker.
-- Fixed model revision detection for parameterized model IDs, including correct classification of Qwen, Fireworks Kimi, and Cursor-wrapped Grok models.
-- Fixed Kimi K3 reasoning-effort handling on OpenAI-compatible hosts such as LiteLLM and vLLM.
-- Fixed pricing for Codex Daybreak aliases, including worker variants.
-- Fixed reasoning-effort variants for local Ollama models and DeepSeek V4, and corrected prompt-cache support for applicable Bedrock Nova deployments.
-- Fixed Devin model variants with separate thinking and context-size options so all supported routing combinations and context limits are preserved.
-- Corrected Devin SWE-1.6 and SWE-1.6 Fast capability metadata so image attachments use the appropriate text-only fallback instead of being silently discarded.
-- Devin discovery now warns when the service returns an empty native model catalog, helping identify stale or incompatible CLI credentials.
-
-### Removed
-
-- Removed legacy DeepSeek V3 variants from the Novita catalog.
+- Fixed native Devin families with independent Thinking and 1M Context axes losing wire variants or advertising the wrong context window; each context lane now preserves its complete off/effort routing and server-selected default ([#8590](https://github.com/can1357/oh-my-pi/pull/8590) by [@will-bogusz](https://github.com/will-bogusz)).
+- Stripped the image modality from Devin's `swe-1-6`/`swe-1-6-fast`: their configs advertise `supports_images` but the backend silently drops inline images (verified live against every other Cascade model), so clients now engage their text-only image fallback instead of losing attachments ([#6072](https://github.com/can1357/oh-my-pi/issues/6072)).
+- Devin discovery now logs a warning when the backend returns an empty native catalog, the failure signature of a stale pinned CLI identity ([#8590](https://github.com/can1357/oh-my-pi/pull/8590) by [@will-bogusz](https://github.com/will-bogusz)).
 
 ## [18.0.11] - 2026-08-29
 
@@ -1029,7 +886,7 @@
 
 ### Fixed
 
-- Fixed direct Anthropic Claude Sonnet/Haiku 4.5 advisor/agent turns crashing every call with HTTP 400 `This model does not support the effort parameter.` The catalog classified the whole Claude 4.5 family on `anthropic-messages` (and `bedrock-converse-stream`) as `anthropic-budget-effort`, which made the Anthropic provider serialize `output_config.effort` alongside `thinking.budget_tokens`. Anthropic only honors `output_config.effort` on Opus 4.5 and adaptive (4.6+) Messages-API models, so Sonnet 4.5 / Haiku 4.5 rejected the field. `inferThinkingControlMode` now gates `anthropic-budget-effort` to the structured Opus family at revision 4.5+ on both Anthropic-routed APIs, so Sonnet 4.5 / Haiku 4.5 on direct Anthropic + Cloudflare-AI-Gateway + Vertex + GitLab-Duo + Copilot + Bedrock fall through to plain `mode: "budget"` (thinking budget still scales with the selected effort tier). Opus 4.5 keeps `anthropic-budget-effort`. `anthropic-budget-effort` also stays in use for Anthropic-compatible third-party backends that natively support the field (Umans GLM 5.2). ([#3497](https://github.com/can1357/oh-my-pi/issues/3497))
+- Fixed direct Anthropic Claude Sonnet/Haiku 4.5 advisor/agent turns crashing every call with HTTP 400 `This model does not support the effort parameter.` The catalog classified the whole Claude 4.5 family on `anthropic-messages` (and `bedrock-converse-stream`) as `anthropic-budget-effort`, which made the Anthropic provider serialize `output_config.effort` alongside `thinking.budget_tokens`. Anthropic only honors `output_config.effort` on Opus 4.5 and adaptive (4.6+) Messages-API models, so Sonnet 4.5 / Haiku 4.5 rejected the field. `inferThinkingControlMode` now gates `anthropic-budget-effort` to `parsedModel.kind === "opus" && semverGte(version, "4.5")` on both Anthropic-routed APIs, so Sonnet 4.5 / Haiku 4.5 on direct Anthropic + Cloudflare-AI-Gateway + Vertex + GitLab-Duo + Copilot + Bedrock fall through to plain `mode: "budget"` (thinking budget still scales with the selected effort tier). Opus 4.5 keeps `anthropic-budget-effort`. `anthropic-budget-effort` also stays in use for Anthropic-compatible third-party backends that natively support the field (Umans GLM 5.2). ([#3497](https://github.com/can1357/oh-my-pi/issues/3497))
 
 ## [16.1.17] - 2026-06-24
 
@@ -1164,7 +1021,7 @@
 - Fixed local Ollama (`provider: "ollama"`) reasoning turns still failing with HTTP 400 `invalid reasoning value: "minimal"` when the model was selected from a stale `~/.omp/models.db` cache row or a hand-written config: the `minimal → low` / `xhigh → max` remap was only stamped during fresh discovery, so cached and custom specs reached the wire unmapped. The remap now lives in the OpenAI chat-completions and Responses compat builders, so every `buildModel` (including cache loads, custom specs, and the `whenThinking` variant) backfills it — no `omp models refresh` required. Custom OpenAI-compatible providers registered under a non-`ollama` provider id still need their own `compat.reasoningEffortMap`.
 - Advertised Ollama Cloud GLM-5.2 reasoning efforts as high/xhigh-only and mapped `xhigh` to native max effort ([#2911](https://github.com/can1357/oh-my-pi/pull/2911) by [@serverinspector](https://github.com/serverinspector))
 - Fixed OpenRouter pseudo-API model construction so bundled OpenRouter models resolve shared OpenAI compatibility metadata instead of an undefined compat record.
-- Fixed custom/direct `xai-oauth` Responses model specs (e.g. `grok-build`) emitting `reasoning.effort` and hitting xAI's HTTP 400: `buildOpenAIResponsesCompat` now defaults `supportsReasoningEffort` to `false` for `xai-oauth` Grok models that are off the effort-capable allowlist (`grok-3-mini`/`grok-4.20-multi-agent`/`grok-4.3`), matching the curated discovery path; explicit `compat.supportsReasoningEffort` still overrides. The reviewed allowlist moved into shared compat rules consumed by both the compat builder and provider-model curation so the two cannot drift.
+- Fixed custom/direct `xai-oauth` Responses model specs (e.g. `grok-build`) emitting `reasoning.effort` and hitting xAI's HTTP 400: `buildOpenAIResponsesCompat` now defaults `supportsReasoningEffort` to `false` for `xai-oauth` Grok models that are off the effort-capable allowlist (`grok-3-mini`/`grok-4.20-multi-agent`/`grok-4.3`), matching the curated discovery path; explicit `compat.supportsReasoningEffort` still overrides. The allowlist moved to a shared `isGrokReasoningEffortCapable` identity helper consumed by both the compat builder and provider-model curation so the two cannot drift.
 
 ## [16.0.5] - 2026-06-17
 
@@ -1254,13 +1111,13 @@
 ### Changed
 
 - Kept non-tool-capable Fireworks serverless models in discovery results and marked them with `supportsTools: false` for fallback-aware handling
-- Extended structured classification to cover older Claude/OpenAI forms such as `claude-3-5-sonnet-20241022` and `gpt-4o`.
+- Extended `modelFamilyToken(modelId)` to classify Claude/OpenAI ids the structured parser misses (older dated forms such as `claude-3-5-sonnet-20241022` and `gpt-4o`), returning `anthropic`/`openai` instead of an empty token.
 
 ## [15.13.1] - 2026-06-15
 
 ### Added
 
-- Added coarse vendor-lineage classification (`anthropic`/`openai`/`gemini`/`kimi`/…) to `@oh-my-pi/pi-catalog/identity` for "are two models the same family?" comparisons, with namespace normalization and kind/variant collapse ([#2406](https://github.com/can1357/oh-my-pi/issues/2406))
+- Added `modelFamilyToken(modelId)` to `@oh-my-pi/pi-catalog/identity`: a coarse vendor-lineage token (`anthropic`/`openai`/`gemini`/`kimi`/…) for "are two models the same family?" comparisons, backed by `parseKnownModel` canonical-id normalization. Opaque and comparison-only; kind/variant collapsed onto the vendor token ([#2406](https://github.com/can1357/oh-my-pi/issues/2406))
 
 ### Changed
 
@@ -1284,7 +1141,7 @@
 ### Changed
 
 - Pinned zai `glm-5.2` to 1M context during catalog generation so endpoint discovery and older fallbacks cannot regress it to 200k.
-- Replaced the hand-maintained `zhipu-coding-plan` GLM reasoning allowlist and vision regex with structured GLM class, family, and revision facts. Discovery now derives reasoning/vision capability from the GLM family instead of a per-id list, so newly-bumped integers (`glm-5.3`, `glm-6`, …) are covered automatically while `-flash`/`-preview` and the vision `…v` shape stay correctly classified.
+- Replaced the hand-maintained `zhipu-coding-plan` GLM reasoning allowlist and vision regex with a `parseGlmModel` family classifier in `identity/classify.ts` (variant + vision + version), surfaced as `isReasoningGlmModelId` / `isGlmVisionModelId`. Discovery now derives reasoning/vision capability from the GLM family instead of a per-id list, so newly-bumped integers (`glm-5.3`, `glm-6`, …) are covered automatically while `-flash`/`-preview` and the vision `…v` shape stay correctly classified.
 
 ## [15.12.4] - 2026-06-13
 
@@ -1397,7 +1254,7 @@
 - Added `ResolvedAnthropicCompat.supportsSamplingParams` (Opus 4.7+/Fable/Mythos reject `temperature`/`top_p`/`top_k` with a 400), baked at build time from model identity so the request path stops re-parsing model ids.
 - Compat detection gained model-time flags so handlers stop sniffing baseUrl: completions `supportsReasoningParams`, `alwaysSendMaxTokens`, `isOpenRouterHost`, `isVercelGatewayHost`, `streamIdleTimeoutMs`, and a precomputed `whenThinking` alternate view (OpenCode `reasoning_content` gating, #1071/#1484); responses `strictResponsesPairing`, `supportsLongPromptCacheRetention`, `supportsReasoningEffort`; anthropic `officialEndpoint`, `requiresToolResultId`, `replayUnsignedThinking`.
 - New `@oh-my-pi/pi-catalog` package: the model catalog extracted from `@oh-my-pi/pi-ai`. Owns the bundled `models.json` and its generation pipeline (`scripts/generate-models.ts`), the core model data types (`Model`, `Api`, `ThinkingConfig`, `Effort`, `Usage`, compat interfaces), thinking metadata enrichment and generated policies (`model-thinking.ts`), the SQLite model cache and model manager, per-provider discovery factories (`provider-models/`), the discovery protocol clients (`discovery/`), and the new `CATALOG_PROVIDERS` table — the single source of truth for provider ids, default models, and discovery wiring (`KnownProvider`, `PROVIDER_DESCRIPTORS`, and `DEFAULT_MODEL_PER_PROVIDER` are derived from it).
-- New `identity/` module centralizing model-identity concerns that were previously duplicated across packages: structured taxonomy classification and revisions, proxy/reseller reference lookup (`identity/reference.ts`), bracket-affix and id-segment helpers (`identity/id.ts`), and provider priority ordering (`identity/priority.ts`).
+- New `identity/` module centralizing model-identity concerns that were previously duplicated across packages: family classification and version parsing (`identity/classify.ts`, extracted from pi-ai's `model-thinking` internals), canonical model equivalence with injected reference data (`identity/equivalence.ts`, from coding-agent's `model-equivalence`), proxy/reseller reference lookup (`identity/reference.ts`, from coding-agent's `model-registry`), bracket-affix and id-segment helpers (`identity/id.ts`), a single trailing-marker vocabulary with canonical vs reference flavors (`identity/markers.ts` — `search` stays reference-only so Perplexity's `sonar-pro-search` remains canonical-distinct), and provider priority ordering (`identity/priority.ts`).
 - Memoized bundled-reference accessors (`getBundledCanonicalReferenceData` / `getBundledModelReferenceIndex` in `identity/bundled.ts`): one lazy walk of the bundled catalog feeds both canonical equivalence and proxy-reference lookup, so consumers no longer hand-roll the glue.
 - `identity/selection.ts`: pure canonical-variant selection (`resolveCanonicalVariant`, `buildCanonicalModelOrder`, `CanonicalVariantPreferences`) extracted from the coding-agent registry — provider rank, then exact-id match, variant source, id length, and candidate order.
 
@@ -1409,14 +1266,14 @@
 - `Model`'s api parameter now defaults to `Api` instead of `any` (`Model<TApi extends Api = Api>`), so bare `Model` no longer behaves as `Model<any>` at call sites.
 - `ThinkingConfig` is now explicit and total: an ordered `efforts` array replaces the `minLevel`/`maxLevel`/`levels` range encoding, and the wire facts are baked alongside it — `effortMap` (anthropic-adaptive 4-tier vs 5-tier scale, shared with the OpenRouter completions remap) and `supportsDisplay` (adaptive `display` field support). Explicit spec thinking owns the capability surface (`mode`/`efforts`/`defaultLevel`) and wins over inference; missing wire facts are backfilled from identity so configs never need to know Anthropic's tier tables. Reasoning models that reject the wire effort param (`compat.supportsReasoningEffort: false` on openai-responses*) are encoded as `thinking: undefined` ("thinks, no control surface") instead of the removed `modelOmitsReasoningEffort` special case. `models.json` was re-baked in the new vocabulary behind a 3196-model behavioral parity gate, and the model cache schema bumped to v4 to invalidate old-shape rows.
 - `mapEffortToGoogleThinkingLevel(effort)` is now a static map (model parameter dropped — validation stays at the `requireSupportedEffort` call sites), and `mapEffortToAnthropicAdaptiveEffort` reads the baked `thinking.effortMap` instead of re-classifying the model id per request.
-- Generator-only policy code moved out of the runtime bundle into `scripts/generated-policies.ts`: `applyGeneratedModelPolicies` (now policy fixups + thinking re-bake via the shared deriver), `linkOpenAIPromotionTargets`, the Copilot context-window table, minimax/opencode-go compat fixups, and `CLOUDFLARE_FALLBACK_MODEL`. Anthropic generation checks moved to structured class, family, and revision facts for build-time use by the compat/thinking derivers only.
+- Generator-only policy code moved out of the runtime bundle into `scripts/generated-policies.ts`: `applyGeneratedModelPolicies` (now policy fixups + thinking re-bake via the shared deriver), `linkOpenAIPromotionTargets`, the Copilot context-window table, minimax/opencode-go compat fixups, and `CLOUDFLARE_FALLBACK_MODEL`. The anthropic id predicates (`hasOpus47ApiRestrictions`, `supportsMidConversationSystemMessages`, `isAnthropicFableOrMythosModel`) moved to `identity/family` for build-time use by the compat/thinking derivers only.
 
 ### Fixed
 
 - Fixed Anthropic official-endpoint detection to require strict HTTPS hostname matching so non-official or lookalike URLs are no longer treated as official Anthropic hosts
 - Fixed Ollama Cloud dynamic discovery so same-id matches from other providers no longer supply context-window or max-output-token limits for discovered models.
 - Wired `@oh-my-pi/pi-catalog` into the release publish package list, tarball install smoke test, and root `bun generate-models` script.
-- Fixed adaptive-display classification only matching dash-form version ids: dotted ids (`claude-opus-4.7`) now classify through the structured taxonomy, so six bundled dotted Opus 4.7/4.8 entries (github-copilot, vercel-ai-gateway, zenmux) regain adaptive `display` support; bare dated ids (`claude-opus-4-20250514` = Opus 4.0) stay excluded.
+- Fixed `supportsAdaptiveThinkingDisplay` only matching dash-form version ids: dotted ids (`claude-opus-4.7`) now classify through `identity/classify` like every other anthropic predicate, so six bundled dotted Opus 4.7/4.8 entries (github-copilot, vercel-ai-gateway, zenmux) regain adaptive `display` support; bare dated ids (`claude-opus-4-20250514` = Opus 4.0) stay excluded.
 - Fixed the OpenRouter anthropic adaptive-effort map misclassifying bare dated Opus ids (`claude-opus-4-20250514` parsed as version 4.20 → wrongly adaptive); the map now derives from the shared classifier and the shared 4-/5-tier tables.
 
 ### Removed

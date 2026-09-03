@@ -4,15 +4,10 @@ import * as http2 from "node:http2";
 import type * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
-import { buildModel } from "../src/build";
 // Import from source, not the package specifier: the workspace `node_modules`
 // copy resolves to the primary checkout, not this worktree.
 import { fetchCursorUsableModels } from "../src/discovery/cursor";
-import {
-	GetDefaultModelForCliResponseSchema,
-	GetUsableModelsResponseSchema,
-	ModelDetailsSchema,
-} from "../src/discovery/cursor-gen/agent_pb";
+import { GetUsableModelsResponseSchema, ModelDetailsSchema } from "../src/discovery/cursor-proto";
 import { create, toBinary } from "../src/discovery/protobuf";
 import { resolveProviderModels } from "../src/model-manager";
 import { cursorModelManagerOptions } from "../src/provider-models/special";
@@ -187,15 +182,14 @@ function requireTcpAddress(address: string | net.AddressInfo | null): net.Addres
 	return address;
 }
 
-function startCursorDiscoveryServer(body: Uint8Array, defaultBody: Uint8Array = new Uint8Array()): Promise<string> {
+function startCursorDiscoveryServer(body: Uint8Array): Promise<string> {
 	const { promise, resolve, reject } = Promise.withResolvers<string>();
 	const srv = http2.createServer();
 	servers.add(srv);
 	srv.once("error", reject);
-	srv.on("stream", (stream: http2.ServerHttp2Stream, headers: http2.IncomingHttpHeaders) => {
+	srv.on("stream", (stream: http2.ServerHttp2Stream) => {
 		stream.respond({ ":status": 200, "content-type": "application/proto" });
-		const path = headers[":path"] ?? "";
-		stream.end(Buffer.from(path.endsWith("GetDefaultModelForCli") ? defaultBody : body));
+		stream.end(Buffer.from(body));
 	});
 	srv.listen(0, "127.0.0.1", () => {
 		resolve(`http://127.0.0.1:${requireTcpAddress(srv.address()).port}`);
@@ -250,25 +244,6 @@ describe("fetchCursorUsableModels", () => {
 		]);
 	});
 
-	it("appends the GetDefaultModelForCli default when it is not in the usable list", async () => {
-		const response = create(GetUsableModelsResponseSchema, {
-			models: [create(ModelDetailsSchema, { modelId: "cursor-composer-max", displayName: "Composer Max" })],
-		});
-		const defaultResponse = create(GetDefaultModelForCliResponseSchema, {
-			modelId: "composer-1",
-			displayName: "Composer",
-		});
-		const baseUrl = await startCursorDiscoveryServer(
-			toBinary(GetUsableModelsResponseSchema, response),
-			toBinary(GetDefaultModelForCliResponseSchema, defaultResponse),
-		);
-
-		const models = await fetchCursorUsableModels({ apiKey: "test-token", baseUrl, timeoutMs: 1_000 });
-		expect(models).not.toBeNull();
-
-		expect(models?.map(model => model.id)).toEqual(["composer-1", "cursor-composer-max"]);
-	});
-
 	it("assigns the 1M window from display-name labels across families", async () => {
 		const response = create(GetUsableModelsResponseSchema, {
 			models: [
@@ -304,10 +279,7 @@ describe("fetchCursorUsableModels", () => {
 
 		const models = await fetchCursorUsableModels({ apiKey: "test-token", baseUrl: nativeBaseUrl, timeoutMs: 1_000 });
 
-		// The bare-`k3` spellings are rule-owned (`providers/cursor.kdl`
-		// context-window-floor) and reach 1M once the spec is built.
-		const built = models?.map(model => buildModel(model));
-		expect(built).toEqual([
+		expect(models).toEqual([
 			expect.objectContaining({ id: "glm-5.10-high", contextWindow: 1_000_000 }),
 			expect.objectContaining({ id: "glm-5.2-max", contextWindow: 1_000_000 }),
 			expect.objectContaining({ id: "glm-6-max", contextWindow: 1_000_000 }),

@@ -26,6 +26,9 @@ export type TodoOperation = "init" | "start" | "done" | "rm" | "drop" | "block" 
 export interface TodoItem {
 	content: string;
 	status: TodoStatus;
+	id?: string;
+	notes?: string | string[];
+	details?: string;
 	/** When `status === "blocked"`, an optional note on what the task is waiting for. */
 	blocker?: string;
 	/**
@@ -38,6 +41,7 @@ export interface TodoItem {
 
 export interface TodoPhase {
 	name: string;
+	id?: string;
 	tasks: TodoItem[];
 }
 

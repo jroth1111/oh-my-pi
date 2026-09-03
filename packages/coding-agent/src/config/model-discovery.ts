@@ -577,7 +577,7 @@ function isBonsaiQwenGguf(id: string): boolean {
  * waiting for re-discovery.
  */
 export function applyLlamaCppQwenThinking(model: Model<Api>): Model<Api> {
-	if (model.identity.class !== "qwen" && !isBonsaiQwenGguf(model.id)) return model;
+	if (model.identity?.class !== "qwen" && !isBonsaiQwenGguf(model.id)) return model;
 	return buildModel({
 		...model,
 		api: "openai-completions",

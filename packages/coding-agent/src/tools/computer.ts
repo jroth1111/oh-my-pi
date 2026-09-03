@@ -33,7 +33,7 @@ function usesCoordinateSafeImageSizing(model: Model | undefined): boolean {
 	const compat = model.compat;
 	return (
 		(!!compat && "supportsImageDetailOriginal" in compat && compat.supportsImageDetailOriginal === false) ||
-		model.identity.class === "anthropic" ||
+		model.identity?.class === "anthropic" ||
 		(model.requestModelId !== undefined &&
 			classifyModel(model.provider, model.requestModelId, { lenient: true }).class === "anthropic")
 	);

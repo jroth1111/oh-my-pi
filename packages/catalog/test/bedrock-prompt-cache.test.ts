@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import { classifyModel, compareRevision, parseRevision } from "@oh-my-pi/pi-catalog/identity";
+import { supportsAdaptiveThinkingDisplay } from "@oh-my-pi/pi-catalog/identity";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import type { ModelSpec } from "@oh-my-pi/pi-catalog/types";
 
@@ -20,22 +20,6 @@ function bedrockSpec(
 		maxTokens: 128_000,
 		...overrides,
 	};
-}
-
-function expectsAdaptiveDisplay(id: string): boolean {
-	const identity = classifyModel("amazon-bedrock", id, { lenient: true });
-	if (identity.class !== "anthropic" || identity.revision === undefined) return false;
-	const revision = parseRevision(identity.revision);
-	const floor = parseRevision(identity.family === "opus" ? "4.7" : "5");
-	return (
-		revision !== undefined &&
-		floor !== undefined &&
-		(identity.family === "opus" ||
-			identity.family === "sonnet" ||
-			identity.family === "fable" ||
-			identity.family === "mythos") &&
-		compareRevision(revision, floor) >= 0
-	);
 }
 
 describe("Bedrock prompt-cache compat", () => {
@@ -109,7 +93,7 @@ describe("Bedrock prompt-cache compat", () => {
 				promptCacheMaximumCheckpoints: minimumTokens === 0 ? 0 : 4,
 				// bedrockSpec is reasoning:true → keepalive-free idle floor applies
 				// (900s for the adaptive-thinking family, 600s otherwise).
-				streamIdleTimeoutMs: expectsAdaptiveDisplay(id) ? 900_000 : 600_000,
+				streamIdleTimeoutMs: supportsAdaptiveThinkingDisplay(id) ? 900_000 : 600_000,
 			});
 		}
 	});
