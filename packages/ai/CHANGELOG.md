@@ -89,6 +89,16 @@
 - Fixed rejecting ambiguous cross-branch model reuse under a single fallback node.
 - Fixed pi-native virtual routes dispatching compiled.targets[0], suffix fallback edges per sibling, and a parse→wire Responses options contract test.
 - Fixed nested fallback edges scoped per source target, turn reservations for selected API-key rows, and rejection of unsupported Codex `previous_response_id` over the gateway.
+### Fixed
+- Fixed strict-tools Responses retries preserving caller `store`/`previous_response_id`, denied allowBlocked bypass of foreign turn reservations, and reacquired reservations after broker prepare.
+
+- Gateway error classifications now carry a failure owner and retry/failover disposition (`credential_permanent`, `provider_transient`, `policy_terminal`, …); provider status codes stay authoritative over message wording, and context-overflow detection reuses the central classifier.
+- Gateway requests now forward `previous_response_id`, `parallel_tool_calls`, `logit_bias`, `user`, and `response_format` to providers instead of dropping them; Responses requests map `response_format` JSON-schema to the flat `text.format` shape and never send Chat-Completions-only `seed`.
+- Auth gateway observes Responses SSE through a StreamCommitGate: metadata-only preludes stay failover-eligible, the first output event or 4 MiB cap commits, and post-commit terminals (`response.completed`/`response.failed`/`response.incomplete`/`response.error`) end failover eligibility instead of being misread as output.
+- Auth gateway virtual routes now fail over to a backup model when the primary is unavailable, as long as the response stream has not been committed.
+
+- Fixed Retry-After provenance hydration from persisted blocks, releasing turn reservations on fallback, and OpenAI model-does-not-exist 404 classification.
+- Fixed clearing quota probes before fallback/sibling retries, per-target sibling-credential attempt budget, and stream-commit contract coverage for pre-commit failures.
 
 ### Added
 

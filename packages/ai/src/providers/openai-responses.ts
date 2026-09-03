@@ -511,10 +511,13 @@ const streamOpenAIResponsesOnce = (
 			// Branch before any delta construction — the client id wins.
 			const clientPreviousResponseId = options?.previousResponseId;
 			const hasClientPreviousResponseId = clientPreviousResponseId !== undefined;
+			if (clientPreviousResponseId || options?.store === true) {
+				params.store = true;
+			}
 			let chainedInternal = false;
 			let chained: OpenAIResponsesChainedParams = hasClientPreviousResponseId
 				? {
-						params: { ...params, previous_response_id: clientPreviousResponseId },
+						params: { ...params, previous_response_id: clientPreviousResponseId, store: true },
 						previousResponseId: clientPreviousResponseId,
 					}
 				: chainState && !chainState.disabled

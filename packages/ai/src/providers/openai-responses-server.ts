@@ -628,6 +628,8 @@ export function parseRequest(body: unknown, headers?: Headers): ParsedRequest {
 	}
 	if (data.store === true) options.store = true;
 	// `store: false`/absent stays the default; only an explicit true is forwarded.
+	// Explicit store:true must reach the provider so the creating turn persists
+	// for later previous_response_id continuations.
 
 	return {
 		modelId: data.model,
