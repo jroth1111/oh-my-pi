@@ -29,6 +29,7 @@ export class StreamCommitGate {
 	#maxPreludeBytes: number;
 	#prelude: Uint8Array[] = [];
 	#preludeBytes = 0;
+	#sawSuccessfulTerminal = false;
 
 	constructor(maxPreludeBytes: number = DEFAULT_MAX_PRELUDE_BYTES) {
 		this.#maxPreludeBytes = maxPreludeBytes;
@@ -38,12 +39,17 @@ export class StreamCommitGate {
 		return this.#state;
 	}
 
+	get sawSuccessfulTerminal(): boolean {
+		return this.#sawSuccessfulTerminal;
+	}
+
 	/** Reset to probing for the next fallback attempt (clears prelude). */
 	reset(): void {
 		this.#state = "probing";
 		this.#bytes = 0;
 		this.#prelude = [];
 		this.#preludeBytes = 0;
+		this.#sawSuccessfulTerminal = false;
 	}
 
 	classifyAndObserve(eventType: string, byteLength: number): StreamCommitState {
@@ -58,6 +64,7 @@ export class StreamCommitGate {
 		}
 
 		const kind = classifyCommitEvent(eventType);
+		if (kind === "terminal-success") this.#sawSuccessfulTerminal = true;
 		if (this.#state === "committed") {
 			// Post-commit, every terminal event ends the stream's failover
 			// eligibility — including `response.failed` (retryable elsewhere),
@@ -178,10 +185,19 @@ export function holdSseUntilCommit(
 		new TransformStream<Uint8Array, Uint8Array>({
 			transform(chunk, controller) {
 				if (committed) {
+					// Keep observing terminals after commit so committed→terminated
+					// transitions still happen; forward bytes unchanged.
+					pending += decoder.decode(chunk, { stream: true });
+					let next = nextSseFrame(pending);
+					while (next) {
+						gate.classifyAndObserve(eventTypeFromFrame(next.frame), next.frame.length);
+						pending = next.rest;
+						next = nextSseFrame(pending);
+					}
 					controller.enqueue(chunk);
 					return;
 				}
-				gate.bufferPrelude(chunk);
+				const buffered = gate.bufferPrelude(chunk);
 				pending += decoder.decode(chunk, { stream: true });
 				let next = nextSseFrame(pending);
 				while (next) {
@@ -190,6 +206,18 @@ export function holdSseUntilCommit(
 					pending = next.rest;
 					next = nextSseFrame(pending);
 					if (state === "terminated") {
+						if (committed) {
+							// Post-commit terminal in the same chunk: observation only.
+							continue;
+						}
+						if (gate.sawSuccessfulTerminal) {
+							// Metadata-only success (created → completed/incomplete):
+							// flush the held prelude and finish without failover.
+							committed = true;
+							for (const held of gate.takePrelude() ?? []) controller.enqueue(held);
+							if (!buffered) controller.enqueue(chunk);
+							return;
+						}
 						// Dead attempt: its held frames belong to it and are never
 						// forwarded. The failover loop catches PreludeAbortedError,
 						// discards them, and dispatches a replacement attempt.
@@ -198,13 +226,31 @@ export function holdSseUntilCommit(
 					if (state === "committed") {
 						committed = true;
 						for (const held of gate.takePrelude() ?? []) controller.enqueue(held);
-						return;
+						// Cap-crossing chunk was refused by bufferPrelude — still emit it.
+						if (!buffered) controller.enqueue(chunk);
+						// Keep parsing sibling frames in this chunk (e.g. output+failed)
+						// so the gate can still transition committed→terminated.
+						continue;
 					}
 				}
+				if (!buffered && !committed) {
+					// Cap crossed without a commit event in this chunk: force commit and
+					// keep the rejected chunk so the SSE stream is not corrupted.
+					gate.classifyAndObserve("response.output_item.added", chunk.byteLength);
+					committed = true;
+					for (const held of gate.takePrelude() ?? []) controller.enqueue(held);
+					controller.enqueue(chunk);
+				}
 			},
-			flush() {
-				// truncated tail without commit: treat as metadata-only commit so
-				// a holding consumer never stalls
+			flush(controller) {
+				// Truncated tail without commit: drain the buffered prelude as a
+				// metadata-only commit so a holding consumer receives the upstream
+				// bytes instead of an empty successful stream.
+				if (!committed) {
+					committed = true;
+					gate.classifyAndObserve("response.completed", 0);
+					for (const held of gate.takePrelude() ?? []) controller.enqueue(held);
+				}
 			},
 		}),
 	);

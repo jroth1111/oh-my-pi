@@ -505,8 +505,9 @@ const streamOpenAIResponsesOnce = (
 			// the client's id would send the delta to the wrong conversation.
 			// Branch before any delta construction — the client id wins.
 			const clientPreviousResponseId = options?.previousResponseId;
+			const hasClientPreviousResponseId = clientPreviousResponseId !== undefined;
 			let chainedInternal = false;
-			let chained: OpenAIResponsesChainedParams = clientPreviousResponseId
+			let chained: OpenAIResponsesChainedParams = hasClientPreviousResponseId
 				? {
 						params: { ...params, previous_response_id: clientPreviousResponseId },
 						previousResponseId: clientPreviousResponseId,
@@ -514,7 +515,7 @@ const streamOpenAIResponsesOnce = (
 				: chainState && !chainState.disabled
 					? buildOpenAIResponsesChainedParams(params, trailingScaffoldingItems, chainState)
 					: { params };
-			chainedInternal = chained.previousResponseId !== undefined && !clientPreviousResponseId;
+			chainedInternal = chained.previousResponseId !== undefined && !hasClientPreviousResponseId;
 			sentPreviousResponseId = chained.previousResponseId;
 			const idleTimeoutMs =
 				options?.streamIdleTimeoutMs ?? getOpenAIStreamIdleTimeoutMs(model.compat.streamIdleTimeoutMs);
@@ -651,7 +652,8 @@ const streamOpenAIResponsesOnce = (
 							const fallbackParams = fallbackBuilt.params;
 							if (chainState && !chainState.disabled) fallbackParams.store = true;
 							const fallbackClientPreviousResponseId = options?.previousResponseId;
-							let fallbackChained: OpenAIResponsesChainedParams = fallbackClientPreviousResponseId
+							const hasFallbackClientPreviousResponseId = fallbackClientPreviousResponseId !== undefined;
+							let fallbackChained: OpenAIResponsesChainedParams = hasFallbackClientPreviousResponseId
 								? {
 										params: {
 											...fallbackParams,
@@ -667,7 +669,7 @@ const streamOpenAIResponsesOnce = (
 										)
 									: { params: fallbackParams };
 							chainedInternal =
-								fallbackChained.previousResponseId !== undefined && !fallbackClientPreviousResponseId;
+								fallbackChained.previousResponseId !== undefined && !hasFallbackClientPreviousResponseId;
 							sentPreviousResponseId = fallbackChained.previousResponseId;
 							fallbackChained = {
 								...fallbackChained,
@@ -1217,7 +1219,7 @@ export function buildParams(
 	if (responseFormat !== undefined && typeof responseFormat === "object" && responseFormat !== null) {
 		const format = responseFormat as {
 			type?: string;
-			json_schema?: { name?: string; schema?: unknown; strict?: boolean };
+			json_schema?: { name?: string; description?: string; schema?: unknown; strict?: boolean };
 		};
 		if (
 			format.type === "json_schema" &&
@@ -1232,6 +1234,9 @@ export function buildParams(
 					type: "json_schema",
 					name: format.json_schema.name ?? "response",
 					schema: format.json_schema.schema,
+					...(format.json_schema.description !== undefined
+						? { description: format.json_schema.description }
+						: {}),
 					...(format.json_schema.strict !== undefined ? { strict: format.json_schema.strict } : {}),
 				} as never,
 			};
