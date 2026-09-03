@@ -34,6 +34,7 @@ import type { Api, AssistantMessage, AssistantMessageEventStream, Context, Model
 import type { ClientUsageIdentity } from "../usage";
 import { deterministicUuid } from "../utils/deterministic-id";
 import { parseBind } from "../utils/parse-bind";
+import { RouteDecisionTraceLog, redactedDecisionSummary } from "./decision-trace";
 import {
 	captureRequestHeaders,
 	corsHeaders,
@@ -81,6 +82,8 @@ export interface AuthGatewayBootOptions extends AuthGatewayServerOptions {
 	listModels?: () => Iterable<Model<Api>>;
 	/** Wave A compiled-route shim. Constructed by {@link startAuthGateway} when omitted. */
 	routeRegistry?: RouteRegistry;
+	/** Bounded redacted decision log. Constructed by {@link startAuthGateway} when omitted. */
+	decisionTraces?: RouteDecisionTraceLog;
 }
 
 // `parseBind` lives in ../utils/parse-bind so the gateway and broker can't
@@ -542,6 +545,7 @@ async function handleFormatEndpoint(
 	// expected to resolve the credential and pass it as `options.apiKey`.
 	// For OAuth providers this returns the access token (refreshed via the
 	// broker override on AuthStorage when needed).
+	const traces = bootOpts.decisionTraces ?? new RouteDecisionTraceLog();
 	let apiKey: string | undefined;
 	try {
 		apiKey = await bootOpts.storage.getApiKey(model.provider, sessionId, {
@@ -551,17 +555,43 @@ async function handleFormatEndpoint(
 	} catch (error) {
 		if (controller.signal.aborted) return clientClosedResponse(route);
 		const classified = classifyGatewayError(error);
+		const skipped = traces.record({
+			requestId,
+			routeId: compiled.id,
+			generation: compiled.generation,
+			selectedTarget: compiled.root.model,
+			disposition: "skipped",
+			reason: "credential_lookup_failed",
+		});
+		logger.debug("auth-gateway route decision", redactedDecisionSummary(skipped));
 		logger.warn("auth-gateway getApiKey threw", { provider: model.provider, peer, error: classified.message });
 		return route.module.formatError(classified.status, classified.type, classified.message);
 	}
 	if (controller.signal.aborted) return clientClosedResponse(route);
 	if (!apiKey) {
+		const skipped = traces.record({
+			requestId,
+			routeId: compiled.id,
+			generation: compiled.generation,
+			selectedTarget: compiled.root.model,
+			disposition: "skipped",
+			reason: "credential_unavailable",
+		});
+		logger.debug("auth-gateway route decision", redactedDecisionSummary(skipped));
 		return route.module.formatError(
 			401,
 			"authentication_error",
 			`No credential available for provider ${model.provider}`,
 		);
 	}
+	const dispatched = traces.record({
+		requestId,
+		routeId: compiled.id,
+		generation: compiled.generation,
+		selectedTarget: compiled.root.model,
+		disposition: "dispatched",
+	});
+	logger.debug("auth-gateway route decision", redactedDecisionSummary(dispatched));
 
 	const streamOpts = buildStreamOptions(parsed, model.api, controller.signal);
 	streamOpts.apiKey = buildGatewayApiKeyResolver(
@@ -741,6 +771,7 @@ async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, pe
 	const sessionId = parsed.options.sessionId ?? deriveSessionId(parsed.modelId, parsed.context);
 	parsed.options.sessionId ??= sessionId;
 
+	const traces = bootOpts.decisionTraces ?? new RouteDecisionTraceLog();
 	let apiKey: string | undefined;
 	try {
 		apiKey = await bootOpts.storage.getApiKey(model.provider, sessionId, {
@@ -750,17 +781,43 @@ async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, pe
 	} catch (error) {
 		if (controller.signal.aborted) return aborted();
 		const classified = classifyGatewayError(error);
+		const skipped = traces.record({
+			requestId,
+			routeId: compiled.id,
+			generation: compiled.generation,
+			selectedTarget: compiled.root.model,
+			disposition: "skipped",
+			reason: "credential_lookup_failed",
+		});
+		logger.debug("auth-gateway route decision", redactedDecisionSummary(skipped));
 		logger.warn("auth-gateway getApiKey threw", { provider: model.provider, peer, error: classified.message });
 		return piNative.formatError(classified.status, classified.type, classified.message);
 	}
 	if (controller.signal.aborted) return aborted();
 	if (!apiKey) {
+		const skipped = traces.record({
+			requestId,
+			routeId: compiled.id,
+			generation: compiled.generation,
+			selectedTarget: compiled.root.model,
+			disposition: "skipped",
+			reason: "credential_unavailable",
+		});
+		logger.debug("auth-gateway route decision", redactedDecisionSummary(skipped));
 		return piNative.formatError(
 			401,
 			"authentication_error",
 			`No credential available for provider ${model.provider}`,
 		);
 	}
+	const dispatched = traces.record({
+		requestId,
+		routeId: compiled.id,
+		generation: compiled.generation,
+		selectedTarget: compiled.root.model,
+		disposition: "dispatched",
+	});
+	logger.debug("auth-gateway route decision", redactedDecisionSummary(dispatched));
 
 	// Build the SimpleStreamOptions actually handed to `streamSimple`. We
 	// trust the client's options (already allow-listed by `parseRequest`) and
@@ -950,6 +1007,7 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 	const boot: AuthGatewayBootOptions = {
 		...opts,
 		routeRegistry: opts.routeRegistry ?? new RouteRegistry(opts.resolveModel),
+		decisionTraces: opts.decisionTraces ?? new RouteDecisionTraceLog(),
 	};
 	const bind = parseBind(boot.bind ?? DEFAULT_AUTH_GATEWAY_BIND);
 	const tokens = new Set<string>(boot.bearerTokens);

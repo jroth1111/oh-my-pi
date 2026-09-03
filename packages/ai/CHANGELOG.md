@@ -30,6 +30,9 @@
 - Cursor `DEBUG_CURSOR` interaction logs go through the central logger instead of `console.error`.
 - Cursor tool passthrough synthesizes and defers `fetchArgs`, `listMcpResourcesExecArgs`, and `readMcpResourceExecArgs` the same way as other exec variants.
 - Cursor passthrough ignores server-hosted `web_fetch` interaction announcements (while retaining deferrable `fetchArgs`) and rejects unsupported `toolChoice: "required"` / `"any"` and forced server-only tools instead of silently weakening the allowlist.
+### Fixed
+
+- Fixed auth-gateway decision traces accepting `credential_lookup_failed` as a skipped reason when `getApiKey` throws.
 
 ### Added
 

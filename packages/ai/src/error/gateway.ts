@@ -1,4 +1,5 @@
 import { Flag, is, isClinePassSurfaceGateMessage, isUsageLimit, matchesOverflowText } from "./flags";
+import { isUsageLimit, matchesOverflowText } from "./flags";
 import { is402BillingCapBody, parseRateLimitReason } from "./rate-limit";
 
 /** Who owns a classified gateway failure. */
