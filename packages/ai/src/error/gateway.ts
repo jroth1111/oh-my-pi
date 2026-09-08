@@ -1,4 +1,4 @@
-import { Flag, is, isUsageLimit, matchesOverflowText } from "./flags";
+import { Flag, is, isClinePassSurfaceGateMessage, isUsageLimit, matchesOverflowText } from "./flags";
 import { is402BillingCapBody, parseRateLimitReason } from "./rate-limit";
 
 /** Who owns a classified gateway failure. */
@@ -62,7 +62,7 @@ const REVOKED_PATTERN = /\brevoked\b|\binvalid_grant\b/i;
 const TIMEOUT_OR_CONNECTION_PATTERN =
 	/\b(?:operation\s+)?timed?\s*out\b|\btimeout\b|\bconnection(?:\s+error|\s+refused)?\b|\bsocket hang up\b|\bfetch failed\b/i;
 const POLICY_PATTERN = /\bcyber_policy\b|trusted access for cyber/i;
-const MODEL_UNAVAILABLE_PATTERN = /\bmodel[_ ]?(?:not[_ ]found|unavailable|not[_ ]supported)\b/i;
+const MODEL_UNAVAILABLE_PATTERN = /\bmodel[_ ]?(?:not[_ ]found|unavailable|not[_ ]supported)\b|\b(?:the\s+)?(?:requested\s+)?model\s+does\s+not\s+exist\b|\bmodel\s+is\s+not\s+supported\b/i;
 const INVALID_REQUEST_PATTERN =
 	/\b(?:unsupported|invalid_request|invalid request|bad request|malformed|GenerateContentRequest)\b/i;
 const GATEWAY_INVARIANT_PATTERN = /\bgateway_terminal\b|\binternal invariant\b/i;
@@ -83,16 +83,15 @@ const GATEWAY_INVARIANT_PATTERN = /\bgateway_terminal\b|\binternal invariant\b/i
 export function classifyGatewayError(err: unknown): GatewayErrorClassification {
 	const message = err instanceof Error ? err.message : String(err);
 
+	// Structural AbortError stays first. Free-text "aborted" must not beat an
+	// authoritative provider status (e.g. "HTTP 503: upstream request aborted").
 	if (err instanceof Error && err.name === "AbortError") {
 		return withOwnerDisposition(err, { status: 499, type: "request_aborted", message });
 	}
-	if (/\baborted\b|\babort signal\b/i.test(message)) {
-		return withOwnerDisposition(err, { status: 499, type: "request_aborted", message });
-	}
 
-	// Honour an explicit numeric `status` property on the thrown error. This
-	// sits below the abort checks on purpose: acting on a stale transport
-	// status after the client cancelled could trigger post-abort failover.
+	// Honour an explicit / embedded provider status before message-only abort
+	// wording. A 503 whose body says "upstream request aborted" must stay
+	// retryable; only AbortError (above) or no-status abort text is cancelled.
 	let statusProp: number | undefined;
 	if (typeof err === "object" && err !== null && "status" in err && typeof err.status === "number") {
 		statusProp = err.status | 0;
@@ -101,11 +100,12 @@ export function classifyGatewayError(err: unknown): GatewayErrorClassification {
 		return withOwnerDisposition(err, bucketStatus(statusProp, message));
 	}
 
-	// Status code embedded in the message. Requires a contextual keyword
-	// (`HTTP`, `API error`, `status`, …) or a leading `(NNN)` token so we
-	// don't trip on incidental three-digit numbers ("took 200ms").
 	const embedded = extractEmbeddedStatus(message);
 	if (embedded !== undefined) return withOwnerDisposition(err, bucketStatus(embedded, message));
+
+	if (/\baborted\b|\babort signal\b/i.test(message)) {
+		return withOwnerDisposition(err, { status: 499, type: "request_aborted", message });
+	}
 
 	if (
 		// Match rate-limit phrasings before auth wording: some providers
@@ -131,6 +131,17 @@ export function classifyGatewayError(err: unknown): GatewayErrorClassification {
 	}
 	if (/\b(?:unsupported|invalid_request|invalid request|bad request|malformed)\b/i.test(message)) {
 		return withOwnerDisposition(err, { status: 400, type: "invalid_request_error", message });
+	}
+	// Status-less errors: evaluate policy / overflow / model heuristics before
+	// synthesizing the default 502 so dispositions are not stuck on provider_unavailable.
+	if (hasPolicySignal(err, message)) {
+		return withOwnerDisposition(err, { status: 403, type: "authentication_error", message });
+	}
+	if (matchesOverflowText(message)) {
+		return withOwnerDisposition(err, { status: 400, type: "invalid_request_error", message });
+	}
+	if (MODEL_UNAVAILABLE_PATTERN.test(message)) {
+		return withOwnerDisposition(err, { status: 404, type: "invalid_request_error", message });
 	}
 	return withOwnerDisposition(err, { status: 502, type: "upstream_error", message });
 }
@@ -159,11 +170,12 @@ function classifyOwnerDisposition(
 ): { owner: GatewayErrorOwner; disposition: GatewayErrorDisposition } {
 	const { status, type, message } = http;
 
-	if (
-		status === 499 ||
-		(err instanceof Error && err.name === "AbortError") ||
-		/\baborted\b|\babort signal\b/i.test(message)
-	) {
+	if (status === 499 || (err instanceof Error && err.name === "AbortError")) {
+		return { owner: "cancelled", disposition: "cancelled" };
+	}
+	// Free-text "aborted" only cancels when there is no authoritative provider
+	// status. A 503 body that mentions "aborted" must stay provider-failoverable.
+	if (status <= 0 && /\baborted\b|\babort signal\b/i.test(message)) {
 		return { owner: "cancelled", disposition: "cancelled" };
 	}
 
@@ -211,8 +223,6 @@ function classifyOwnerDisposition(
 	// disposition. Heuristics apply only within their status range, or as a
 	// last-resort fall-through when no status signal exists.
 	if (status === 429 || type === "rate_limit_error") {
-		// Structured usage-limit evidence beats generic 429 wording: the
-		// pre-chain maps "hit your usage limit" phrasing to 429/rate_limit_error.
 		if (isUsageLimit(err) || isUsageLimit(message)) {
 			return { owner: "quota", disposition: "credential_quota" };
 		}
@@ -242,7 +252,54 @@ function classifyOwnerDisposition(
 		return { owner: "provider", disposition: "provider_transient" };
 	}
 
+	// Policy denials must win over the generic 401/403 → credential_transient
+	// auth bucket (including structured `{ code: "cyber_policy" }`).
+	if (hasPolicySignal(err, message) && (status === 0 || status < 500)) {
+		return { owner: "policy", disposition: "policy_terminal" };
+	}
+
+	// Policy denials must win over the generic 401/403 auth bucket.
+	if (hasPolicySignal(err, message) && (status === 0 || status < 500)) {
+		return { owner: "policy", disposition: "policy_terminal" };
+	}
+
+	// Policy denials must win over the generic 401/403 auth bucket.
+	if (hasPolicySignal(err, message) && (status === 0 || status < 500)) {
+		return { owner: "policy", disposition: "policy_terminal" };
+	}
+
+	// Policy denials must win over the generic 401/403 auth bucket.
+	if (hasPolicySignal(err, message) && (status === 0 || status < 500)) {
+		return { owner: "policy", disposition: "policy_terminal" };
+	}
+
+	// Policy denials must win over the generic 401/403 auth bucket.
+	if (hasPolicySignal(err, message) && (status === 0 || status < 500)) {
+		return { owner: "policy", disposition: "policy_terminal" };
+	}
+
+	// Policy denials must win over the generic 401/403 auth bucket.
+	if (hasPolicySignal(err, message) && (status === 0 || status < 500)) {
+		return { owner: "policy", disposition: "policy_terminal" };
+	}
+
+	// Policy denials must win over the generic 401/403 auth bucket.
+	if (hasPolicySignal(err, message) && (status === 0 || status < 500)) {
+		return { owner: "policy", disposition: "policy_terminal" };
+	}
+
+	// Policy denials (Codex cyber_policy / Trusted Access) must win over the
+	// generic 401/403 → credential_transient auth bucket, including structured
+	// `{ code: "cyber_policy" }` with a bland message. Otherwise sibling-retry
+	// treats an account policy block as a rotatable credential failure.
+	if (hasPolicySignal(err, message) && (status === 0 || status < 500)) {
+		return { owner: "policy", disposition: "policy_terminal" };
+	}
+
 	if (status === 401 || status === 403 || type === "authentication_error") {
+		if (isClinePassSurfaceGateMessage(message)) {
+			return { owner: "policy", disposition: "policy_terminal" };
+		}
 		if (REVOKED_PATTERN.test(message)) {
 			return { owner: "credential", disposition: "credential_permanent" };
 		}
@@ -253,14 +310,10 @@ function classifyOwnerDisposition(
 		return { owner: "model", disposition: "model_unavailable" };
 	}
 
-	// Policy denials and context overflows are provider decisions delivered on
-	// 4xx statuses; on 5xx they are usually quoted upstream detail, not the
-	// provider's own verdict. Definitive OAuth failures also surface as
-	// 400 `invalid_grant`.
+	// Context overflows and definitive OAuth failures are provider decisions
+	// delivered on 4xx statuses; on 5xx they are usually quoted upstream detail,
+	// not the provider's own verdict.
 	if (status > 0 && status < 500) {
-		if (POLICY_PATTERN.test(message)) {
-			return { owner: "policy", disposition: "policy_terminal" };
-		}
 		if (matchesOverflowText(message)) {
 			return { owner: "request", disposition: "context_overflow" };
 		}
@@ -273,8 +326,39 @@ function classifyOwnerDisposition(
 		return { owner: "provider", disposition: "provider_transient" };
 	}
 
+	if ((status === 400 || type === "invalid_request_error") && MODEL_UNAVAILABLE_PATTERN.test(message)) {
+		return { owner: "model", disposition: "model_unavailable" };
+	}
+
 	if (status === 400 || type === "invalid_request_error") {
 		return { owner: "request", disposition: "request_terminal" };
+	}
+
+	// Message heuristics for no authoritative status (synthesized 502) must run
+	// before the generic 5xx provider_unavailable bucket, otherwise overflow /
+	// policy / usage wording is unreachable.
+	const authoritativeStatus =
+		(typeof err === "object" && err !== null && "status" in err && typeof (err as { status: unknown }).status === "number") ||
+		extractEmbeddedStatus(message) !== undefined;
+	if (!authoritativeStatus || status < 500) {
+		if (isUsageLimit(err) || isUsageLimit(message)) {
+			return { owner: "quota", disposition: "credential_quota" };
+		}
+		if (POLICY_PATTERN.test(message)) {
+			return { owner: "policy", disposition: "policy_terminal" };
+		}
+		if (matchesOverflowText(message)) {
+			return { owner: "request", disposition: "context_overflow" };
+		}
+		if (!authoritativeStatus && TIMEOUT_OR_CONNECTION_PATTERN.test(message)) {
+			return { owner: "transport", disposition: "provider_transient" };
+		}
+		if (!authoritativeStatus && INVALID_REQUEST_PATTERN.test(message)) {
+			return { owner: "request", disposition: "request_terminal" };
+		}
+		if (!authoritativeStatus) {
+			return { owner: "provider", disposition: "provider_unavailable" };
+		}
 	}
 
 	if (status >= 500) {
@@ -288,7 +372,7 @@ function classifyOwnerDisposition(
 	if (isUsageLimit(err) || isUsageLimit(message)) {
 		return { owner: "quota", disposition: "credential_quota" };
 	}
-	if (POLICY_PATTERN.test(message)) {
+	if (hasPolicySignal(err, message)) {
 		return { owner: "policy", disposition: "policy_terminal" };
 	}
 	if (matchesOverflowText(message)) {
@@ -304,15 +388,21 @@ function classifyOwnerDisposition(
 	return { owner: "provider", disposition: "provider_unavailable" };
 }
 
-/**
- * Pull a status code from common error-message shapes. Returns undefined when
- * no contextual keyword is present, so we never guess at incidental numbers.
- */
+
+/** True when message text or a structured `code` property signals account policy. */
+function hasPolicySignal(err: unknown, message: string): boolean {
+	if (POLICY_PATTERN.test(message)) return true;
+	if (typeof err === "object" && err !== null && "code" in err && typeof err.code === "string") {
+		return POLICY_PATTERN.test(err.code);
+	}
+	return false;
+}
 
 /**
  * Pull a status code from common error-message shapes. Returns undefined when
  * no contextual keyword is present, so we never guess at incidental numbers.
  */
+
 function extractEmbeddedStatus(message: string): number | undefined {
 	// `Google API error (400)`, `OpenAI API error (429): …`, `(503)`
 	// `HTTP 429: too many requests`

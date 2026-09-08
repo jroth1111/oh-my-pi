@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `parseEnvFileAsync` for non-blocking dotenv reads on login/discovery/stream paths.
+
+
 ## [18.1.13] - 2026-09-07
 
 ### Fixed
@@ -10,7 +15,6 @@
 
 ## [18.1.11] - 2026-09-05
 
-### Fixed
 
 - Fixed `extractRetryHint` dropping the longer timing signal when an error body carries both an account reset and an appended retry hint: competing signals now merge by longest window instead of first match, so retries honor the provider's full backoff.
 
@@ -64,6 +68,10 @@
 ### Fixed
 
 - Fixed runtime installation getting stuck for up to 60 seconds after an installer crash or forced termination, allowing subsequent installation attempts to proceed normally.
+### Fixed
+
+- `checkpointWal` ignores already-closed databases and `SQLITE_IOERR_VNODE` (temp-dir unlink races) instead of throwing during shutdown; other `SQLITE_IOERR_*` failures still surface.
+- `checkpointWal` ignores already-closed databases and benign temp-unlink I/O codes (`SQLITE_IOERR_VNODE` / `DELETE*`), while still propagating real durability failures such as `SQLITE_IOERR_WRITE` / `ACCESS`.
 
 ## [18.0.10] - 2026-08-28
 

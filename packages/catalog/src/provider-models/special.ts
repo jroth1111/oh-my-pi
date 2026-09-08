@@ -4,12 +4,15 @@ import { apiRouteFor } from "../compat/behavior";
 import { type CodexModelDiscoveryResult, fetchCodexModels } from "../discovery/codex";
 import type { DevinModelDiscoveryOptions } from "../discovery/devin";
 import { buildGitLabDuoWorkflowFallbackModel, fetchGitLabDuoWorkflowModels } from "../discovery/gitlab-duo-workflow";
+import { fetchGrokbotAvailableModels } from "../discovery/grokbot";
+import { resolveGrokbotDiscoveryIdentity } from "../discovery/grokbot-auth";
 import type { ModelManagerOptions } from "../model-manager";
 import { getBundledModel } from "../models";
 import type { Api, FetchImpl, Model, ModelSpec } from "../types";
 import { DEVIN_DEFAULT_BASE_URL } from "../wire/devin";
 import { toModelSpec } from "./bundled-references";
 import { resolveModelCacheProviderId } from "./cache-provider-id";
+import { buildGrokbotStaticSeed } from "./grokbot";
 
 // ---------------------------------------------------------------------------
 // OpenAI Codex
@@ -132,6 +135,32 @@ export function cursorModelManagerOptions(config: CursorModelManagerConfig = {})
 }
 
 const cursorDiscovery = once(() => import("../discovery/cursor"));
+
+/**
+ * Synthetic Cursor "auto" model. Cursor's backend routes the wire id "default"
+ * to a per-turn model selection (the same way Cursor's own UI does). The
+ * cursor provider translates the external id "auto" to the wire id "default"
+ * (see `resolveCursorWireModel` in providers/cursor.ts).
+ *
+ * Exposed as a prebuilt catalog entry so id-resolving callers — notably the
+ * auth-gateway, where an external OpenAI-compatible client can send
+ * `{"model":"auto"}` — get a valid `Model<"cursor-agent">` instead of a 404,
+ * and so "auto" can surface in `/v1/models` listings. Limits are conservative
+ * defaults because the routed model is unknown upfront; cost is zero since
+ * Cursor does not bill per-token for auto routing.
+ */
+export const CURSOR_AUTO_MODEL: Model<"cursor-agent"> = buildModel({
+	id: "auto",
+	name: "Cursor Auto",
+	api: "cursor-agent",
+	provider: "cursor",
+	baseUrl: "https://api2.cursor.sh",
+	reasoning: true,
+	input: ["text"],
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	contextWindow: 200_000,
+	maxTokens: 16_384,
+});
 
 // ---------------------------------------------------------------------------
 // GitLab Duo Chat
@@ -398,6 +427,63 @@ export function devinModelManagerOptions(config: DevinModelManagerConfig = {}): 
 }
 
 const devinDiscovery = once(() => import("../discovery/devin"));
+
+// ---------------------------------------------------------------------------
+// Grok Bot provider (InferenceService Stream)
+// ---------------------------------------------------------------------------
+
+export interface GrokbotModelManagerConfig {
+	apiKey?: string;
+	baseUrl?: string;
+	fetch?: FetchImpl;
+	/** Override `x-sand-box-namespace` for cache scoping (defaults to GROKBOT_NAMESPACE). */
+	namespace?: string;
+	/** Override `x-cursor-client-version` for cache scoping (defaults to GROKBOT_CLIENT_VERSION). */
+	clientVersion?: string;
+	/** Caller/model headers forwarded to AvailableModels mint + request. */
+	headers?: Record<string, string>;
+	/**
+	 * Pre-expanded renewer for model-cache scoping. Catalog refresh should pass
+	 * the async-resolved value so construction never sync-reads secrets.
+	 */
+	cacheCredential?: string;
+}
+
+export function grokbotModelManagerOptions(
+	config: GrokbotModelManagerConfig = {},
+): ModelManagerOptions<"grokbot-sand"> {
+	const { apiKey, baseUrl, fetch, headers } = config;
+	// Prefer a fully resolved identity from async prep (catalog refresh) so
+	// construction never sync-reads secrets/grokbot.env on the TUI event loop.
+	const ns = config.namespace?.trim();
+	const ver = config.clientVersion?.trim();
+	const identity =
+		ns && ver
+			? { namespace: ns, clientVersion: ver }
+			: resolveGrokbotDiscoveryIdentity({
+					namespace: config.namespace,
+					clientVersion: config.clientVersion,
+				});
+	return {
+		providerId: "grokbot",
+		cacheProviderId: resolveModelCacheProviderId("grokbot", {
+			apiKey,
+			baseUrl,
+			namespace: identity.namespace,
+			clientVersion: identity.clientVersion,
+			headers,
+			...(config.cacheCredential !== undefined ? { cacheCredential: config.cacheCredential } : undefined),
+		}),
+		staticModels: buildGrokbotStaticSeed(baseUrl),
+		...(apiKey
+			? {
+					dynamicModelsAuthoritative: true,
+					fetchDynamicModels: async () => fetchGrokbotAvailableModels({ apiKey, baseUrl, fetch, headers }),
+				}
+			: undefined),
+	};
+}
+
 // ---------------------------------------------------------------------------
 // Zai
 // ---------------------------------------------------------------------------
