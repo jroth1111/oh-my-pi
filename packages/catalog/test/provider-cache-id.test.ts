@@ -99,3 +99,20 @@ test("ollama cache scope preserves reverse-proxy path prefixes", () => {
 	expect(teamA).toBe(resolveModelCacheProviderId("ollama", { baseUrl: "https://proxy.example/team-a/" }));
 	expect(teamA).not.toBe(resolveModelCacheProviderId("ollama", { baseUrl: "https://proxy.example/team-b/v1" }));
 });
+
+test("cursor cache namespace partitions by credential", () => {
+	const a = resolveModelCacheProviderId("cursor", { apiKey: "account-a-key" });
+	const b = resolveModelCacheProviderId("cursor", { apiKey: "account-b-key" });
+	expect(a).not.toBe(b);
+	expect(a).toBe(resolveModelCacheProviderId("cursor", { apiKey: "account-a-key" }));
+	expect(a).toContain("cursor:models-v5:");
+});
+
+test("cursor manager options scope the cache namespace to the credential", () => {
+	const descriptor = PROVIDER_DESCRIPTORS.find(candidate => candidate.providerId === "cursor");
+	if (!descriptor) throw new Error("Missing descriptor for cursor");
+	const a = descriptor.createModelManagerOptions({ apiKey: "account-a-key" });
+	const b = descriptor.createModelManagerOptions({ apiKey: "account-b-key" });
+	expect(a.cacheProviderId).not.toBe(b.cacheProviderId);
+	expect(a.cacheProviderId).toBe(resolveModelCacheProviderId("cursor", { apiKey: "account-a-key" }));
+});

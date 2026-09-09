@@ -36,6 +36,7 @@ const CREDENTIAL_SCOPED_MODEL_CACHE_PROVIDERS: Readonly<Record<string, true>> = 
 	"github-copilot": true,
 	grokbot: true,
 	"muse-code": true,
+	cursor: true,
 };
 
 /** Whether a provider's model-cache namespace requires its resolved credential. */
@@ -83,11 +84,16 @@ export function resolveModelCacheProviderId(providerId: string, options: ModelCa
 	switch (providerId) {
 		case "ollama":
 			return resolveOllamaModelCacheProviderId(providerId, options.baseUrl);
-		case "cursor":
+		case "cursor": {
 			// v4: Grok 4.5/4.6 rows cached before the effort-less default-tier fix
 			// carry `requestModelId: *-low`, which the Start plan refuses; refetch
 			// so the collapsed default is re-pointed to `-medium` (issue #9478).
-			return "cursor:default-effort-v4";
+			// v5: GetUsableModels rosters are credential-scoped (a second account
+			// must miss the first account's cache and re-run discovery instead of
+			// being served its roster). Key the namespace on the credential hash.
+			const scope = `${options.apiKey ?? ""}`;
+			return `cursor:models-v5:${Bun.hash(scope).toString(36)}`;
+		}
 		case "muse-code": {
 			const baseUrl = options.baseUrl ?? getDefaultModelDiscoveryBaseUrl(providerId)!;
 			const scope = `${options.apiKey ?? ""}\u0000${baseUrl}`;
