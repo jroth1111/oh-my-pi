@@ -2,6 +2,11 @@
 
 ### Fixed
 
+- Grok Bot inference uses the dedicated token returned by renewal, fixing authentication failures after successful model discovery.
+- Grok Bot Opus tool calls and late advisor follow-ups no longer fail with provider HTTP 400 errors.
+
+### Fixed
+
 - Restored Cursor capability/session option wiring (`cursorClientSupportsInlineImages`, `cursorClientSupportsRoutedModelUpdate`, `cursorClientSupportsPromptContextUsageRpc`, `cursorRunId`, `cursorAgentSessionId`) onto `AgentRunRequest`.
 - Cursor mints a fresh `runId` per request (linked to `x-request-id`, like the CLI) and defaults `conversationGroupId` to the conversation instead of sending empty ids.
 - Cursor auto mode echoes a roster-resolved `requestModelId` of `auto` verbatim on `requestedModel`/`modelDetails` (matching the CLI); the synthetic catalog id without roster proof keeps the `default` wire contract.
