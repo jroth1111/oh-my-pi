@@ -37,7 +37,6 @@ import { requestNeeds } from "./capabilities";
  *   POST /v1beta/models/streamGenerateContent → Gemini v1beta streamGenerateContent
  */
 
-import { requestNeeds } from "./capabilities";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { extractHttpStatusFromError, extractRetryHint, isRecord, logger } from "@oh-my-pi/pi-utils";
 import type { ApiKeyResolver } from "../auth-retry";
@@ -83,7 +82,6 @@ import { parseRouteDefinition } from "./route-definitions";
 import { type CompiledRoute, type RouteDefinition, RouteRegistry, pickInitialRouteTarget } from "./route-graph";
 import {
 	commitGateObservesDownstreamSse,
-	holdSseUntilCommitOutcome,
 	observeSseCommit,
 	StreamCommitGate,
 	type StreamCommitState,
@@ -132,9 +130,6 @@ export interface AuthGatewayBootOptions extends AuthGatewayServerOptions {
 
 // `parseBind` lives in ../utils/parse-bind so the gateway and broker can't
 // drift on accepted inputs (e.g. empty hostname, IPv6 brackets).
-
-/** Native Gemini paths carry the model in the URL (`/v1beta/models/{model}:generateContent`). */
-const GEMINI_MODEL_PATH = /^\/v1beta\/models\/([^/]+):(stream)?generateContent$/;
 
 export const FORMAT_ROUTES: Record<string, { module: FormatModule; label: string }> = {
 	"/v1/chat/completions": { module: openaiChat, label: "openai-chat" },
@@ -237,26 +232,6 @@ function buildStreamOptions(parsed: ParsedFormatRequest, api: Api, signal: Abort
 	if (options.serviceTier !== undefined) opts.serviceTier = options.serviceTier;
 	if (options.cacheRetention !== undefined) opts.cacheRetention = options.cacheRetention;
 	if (options.include !== undefined) opts.include = options.include;
-	// Cursor-specific gateway options
-	if (options.cursorAutoMode !== undefined) opts.cursorAutoMode = options.cursorAutoMode;
-	if (options.cursorToolPassthrough !== undefined) opts.cursorToolPassthrough = options.cursorToolPassthrough;
-	// Upstream renamed the provider-side flag; bridge the gateway spelling so
-	// the passthrough header keeps working end to end.
-	if (options.cursorToolPassthrough !== undefined && opts.cursorExternalToolExecutor === undefined) {
-		opts.cursorExternalToolExecutor = options.cursorToolPassthrough;
-	}
-	// Cursor control headers without a first-class `SimpleStreamOptions` slot
-	// are threaded through `opts.headers` so Cursor's backend receives them
-	// (cursor.ts spreads caller headers into the upstream request).
-	if (options.cursorExcludeTools !== undefined) {
-		opts.headers = { ...(opts.headers ?? {}), "x-cursor-agent-exclude-tools": options.cursorExcludeTools };
-	}
-	if (options.cursorLocalCliMode) {
-		opts.headers = { ...(opts.headers ?? {}), "local-cli-mode": "true" };
-	}
-	if (options.cursorDevExperimentOverrides !== undefined) {
-		opts.headers = { ...(opts.headers ?? {}), "x-dev-experiment-overrides": options.cursorDevExperimentOverrides };
-	}
 	// Client-supplied `prompt_cache_key` wins; otherwise derive a stable
 	// key from the model + system + tools so prefix caching engages on
 	// Codex-class backends across turns of the same logical conversation.
@@ -288,6 +263,12 @@ function buildStreamOptions(parsed: ParsedFormatRequest, api: Api, signal: Abort
  * (Responses continuation, parallel tool calls, …) must be able to read them.
  */
 export function applyParsedGatewayOptions(opts: SimpleStreamOptions, options: AuthGatewayParsedRequestOptions): void {
+	if (options.cursorAutoMode !== undefined) opts.cursorAutoMode = options.cursorAutoMode;
+	if (options.cursorToolPassthrough !== undefined) opts.cursorExternalToolExecutor = options.cursorToolPassthrough;
+	if (options.cursorExcludeTools !== undefined) opts.cursorExcludeTools = options.cursorExcludeTools;
+	if (options.cursorLocalCliMode !== undefined) opts.cursorLocalCliMode = options.cursorLocalCliMode;
+	if (options.cursorDevExperimentOverrides !== undefined)
+		opts.cursorDevExperimentOverrides = options.cursorDevExperimentOverrides;
 	if (options.parallelToolCalls !== undefined) opts.parallelToolCalls = options.parallelToolCalls;
 	if (options.previousResponseId !== undefined) opts.previousResponseId = options.previousResponseId;
 	if (options.store !== undefined) opts.store = options.store;
@@ -422,30 +403,13 @@ function buildGatewayApiKeyResolver(
 	};
 }
 
-function classifyAssistantFailure(message: AssistantMessage): GatewayErrorClassification {
-	return classifyGatewayError(
-		Object.assign(
-			new Error(message.errorClassificationMessage ?? message.errorMessage ?? "Upstream request failed"),
-			{
-				status: message.errorStatus,
-				errorId: message.errorId,
-				kind: "kind" in message ? message.kind : undefined,
-			},
-		),
-	);
-}
-
 function clientClosedResponse(route: { module: FormatModule }): Response {
 	return route.module.formatError(499, "request_aborted", "client closed request");
 }
 
 type FormatErrorFn = (status: number, type: string, message: string) => Response;
 
-type AttemptPrep =
-	| { type: "key"; apiKey: string }
-	| { type: "retry" }
-	| { type: "skip" }
-	| { type: "respond"; response: Response };
+type AttemptPrep = { type: "key"; apiKey: string } | { type: "retry" } | { type: "respond"; response: Response };
 
 /**
  * Resolve the first viable dispatch target for a compiled route. A primary
@@ -472,117 +436,10 @@ function resolveFirstAvailableTarget(
 		if (next.type !== "dispatch") return { target: current, model: undefined };
 		current = next.targetModelId;
 	}
-}
-
-/**
- * Resolve the first viable dispatch target for a compiled route. A primary
- * that is absent from the catalog (stale route, credential-scoped model
- * change) is marked attempted and the conductor advances to the next sibling
- * instead of 404ing a route with usable fallbacks.
- */
-function resolveFirstAvailableTarget(
-	compiled: CompiledRoute,
-	resolveModel: (id: string) => Model<Api> | undefined,
-	firstTarget: string,
-	attemptedTargets: Set<string>,
-): { target: string; model: Model<Api> | undefined } {
-	let current = firstTarget;
-	for (;;) {
-		const model = resolveModel(current);
-		if (model !== undefined) return { target: current, model };
-		attemptedTargets.add(current);
-		const next = decideAttempt({
-			route: compiled,
-			state: conductorExecutionState(compiled, attemptedTargets, new Set<number>(), 0, 0, current, false, "probing"),
-			commitState: "probing",
-		});
-		if (next.type !== "dispatch") return { target: current, model: undefined };
-		current = next.targetModelId;
-	}
-}
-
-function hashString(value: string): number {
-	let h = 0;
-	for (let i = 0; i < value.length; i++) h = (h * 31 + value.charCodeAt(i)) | 0;
-	return h;
-}
-
-/**
- * Resolve the first viable dispatch target for a compiled route. A primary
- * that is absent from the catalog (stale route, credential-scoped model
- * change) is marked attempted and the conductor advances to the next sibling
- * instead of 404ing a route with usable fallbacks.
- */
-function resolveFirstAvailableTarget(
-	compiled: CompiledRoute,
-	resolveModel: (id: string) => Model<Api> | undefined,
-	firstTarget: string,
-	attemptedTargets: Set<string>,
-): { target: string; model: Model<Api> | undefined } {
-	let current = firstTarget;
-	for (;;) {
-		const model = resolveModel(current);
-		if (model !== undefined) return { target: current, model };
-		attemptedTargets.add(current);
-		const next = decideAttempt({
-			route: compiled,
-			state: conductorExecutionState(compiled, attemptedTargets, new Set<number>(), 0, 0, current, false, "probing"),
-			commitState: "probing",
-		});
-		if (next.type !== "dispatch") return { target: current, model: undefined };
-		current = next.targetModelId;
-	}
-}
-
-function hashString(value: string): number {
-	let h = 0;
-	for (let i = 0; i < value.length; i++) h = (h * 31 + value.charCodeAt(i)) | 0;
-	return h;
-}
-
-/**
- * Order route targets for initial selection: the balance strategy's pick
- * first, then the remaining targets in compiled order so a catalog-absent
- * primary falls through to viable siblings instead of 404ing the route.
- */
-function orderedInitialTargets(compiled: CompiledRoute, salt: number): string[] {
-	const first = pickInitialRouteTarget(compiled, salt);
-	if (first === undefined) return [...compiled.targets];
-	return [first, ...compiled.targets.filter(target => target !== first)];
 }
 
 function unknownModelResponse(formatError: FormatErrorFn, modelId: string): Response {
 	return formatError(404, "invalid_request_error", `Unknown model: ${modelId}`);
-}
-
-function unavailableModel(target: string): GatewayErrorClassification {
-	return {
-		status: 404,
-		type: "invalid_request_error",
-		message: `Unknown model: ${target}`,
-		owner: "model",
-		disposition: "model_unavailable",
-	};
-}
-
-function initialAvailableTarget(
-	compiled: CompiledRoute,
-	resolve: (id: string) => Model<Api> | undefined,
-	attempted: Set<string>,
-): { target: string; model: Model<Api> } | undefined {
-	let target: string | undefined = compiled.targets[0];
-	while (target !== undefined) {
-		const model = resolve(target);
-		if (model) return { target, model };
-		attempted.add(target);
-		target = fallbackTargetId(
-			compiled,
-			conductorExecutionState(compiled, attempted, 0, 0, target, "probing"),
-			unavailableModel(target),
-			"probing",
-		);
-	}
-	return undefined;
 }
 
 function conductorExecutionState(
@@ -602,7 +459,6 @@ function conductorExecutionState(
 		attemptedCredentials,
 		retryCount,
 		fallbackCount,
-		siblingsExhausted: false,
 		committed: commitState !== "probing",
 		currentTarget,
 		siblingsExhausted,
@@ -656,6 +512,14 @@ function messageHasBillableUsage(message: AssistantMessage): boolean {
 	const usage = message.usage;
 	return usage.input + usage.output + usage.cacheRead + usage.cacheWrite > 0;
 }
+
+const STREAM_PRELUDE_MAX_BYTES = 4 * 1024 * 1024;
+
+type SseRead = { done: boolean; value?: Uint8Array };
+
+type HeldSse =
+	| { type: "forward"; stream: ReadableStream<Uint8Array> }
+	| { type: "failed"; error: unknown; message?: AssistantMessage };
 
 function attachCommitGateSseObserver(
 	streamOpts: SimpleStreamOptions,
@@ -810,20 +674,17 @@ export function releaseTurnOnStreamEnd(
 	storage: AuthStorage,
 	requestId: string,
 	commitGate?: StreamCommitGate,
-	settled?: Promise<void>,
+	settled?: Promise<unknown>,
 ): ReadableStream<Uint8Array> {
 	const reader = stream.getReader();
 	let released = false;
-	const release = (successful: boolean): void => {
+	const release = (): void => {
 		if (released) return;
 		released = true;
 		if (commitGate?.sawSuccessfulTerminal) {
 			storage.settleQuotaProbeSuccess(requestId);
-		} else {
-			storage.clearQuotaProbe(requestId);
 		}
 		storage.releaseTurnReservation(requestId);
-		await onSettled?.(outcome);
 	};
 	return new ReadableStream({
 		async pull(controller) {
@@ -842,7 +703,7 @@ export function releaseTurnOnStreamEnd(
 			}
 		},
 		cancel(reason) {
-			release(false);
+			release();
 			return reader.cancel(reason);
 		},
 	});
@@ -931,7 +792,7 @@ function rememberPromptCacheHit(
 }
 
 async function handleFormatEndpoint(
-	route: { module: FormatModule; label: string; pathModel?: string; pathStream?: boolean },
+	route: { module: FormatModule; label: string },
 	bootOpts: AuthGatewayBootOptions,
 	req: Request,
 	peer: string,
@@ -972,14 +833,6 @@ async function handleFormatEndpoint(
 	// All three supported wire formats put the model id on a top-level `model`
 	// field. Read it without running the full strict schema so the route can
 	// produce a coherent error envelope when the model id is missing.
-	if (route.pathModel !== undefined && isRecord(body)) {
-		body = {
-			...body,
-			model: typeof body.model === "string" && body.model.length > 0 ? body.model : route.pathModel,
-			stream: typeof body.stream === "boolean" ? body.stream : route.pathStream,
-		};
-	}
-
 	const modelId =
 		typeof body === "object" && body !== null && typeof (body as { model?: unknown }).model === "string"
 			? (body as { model: string }).model
@@ -1038,23 +891,13 @@ async function handleFormatEndpoint(
 	{
 		const captured = captureRequestHeaders(req.headers);
 		parsed.options.headers = { ...captured, ...parsed.options.headers };
-		// Cursor-specific control headers: parse into typed options so they
-		// flow through `buildStreamOptions` into `SimpleStreamOptions`.
-		if (captured["x-cursor-auto-mode"] === "true") {
-			parsed.options.cursorAutoMode = true;
-		}
-		if (captured["x-cursor-tool-passthrough"] === "true") {
-			parsed.options.cursorToolPassthrough = true;
-		}
-		if (captured["x-cursor-agent-exclude-tools"]) {
+		if (captured["x-cursor-auto-mode"] === "true") parsed.options.cursorAutoMode = true;
+		if (captured["x-cursor-tool-passthrough"] === "true") parsed.options.cursorToolPassthrough = true;
+		if (captured["x-cursor-agent-exclude-tools"])
 			parsed.options.cursorExcludeTools = captured["x-cursor-agent-exclude-tools"];
-		}
-		if (captured["local-cli-mode"] === "true") {
-			parsed.options.cursorLocalCliMode = true;
-		}
-		if (captured["x-dev-experiment-overrides"]) {
+		if (captured["local-cli-mode"] === "true") parsed.options.cursorLocalCliMode = true;
+		if (captured["x-dev-experiment-overrides"])
 			parsed.options.cursorDevExperimentOverrides = captured["x-dev-experiment-overrides"];
-		}
 	}
 	if (controller.signal.aborted) return clientClosedResponse(route);
 
@@ -1103,7 +946,12 @@ async function handleFormatEndpoint(
 
 	const traces = bootOpts.decisionTraces ?? new RouteDecisionTraceLog();
 	const commitGate = new StreamCommitGate();
-	const formatError = route.module.formatError;
+	const formatError: FormatErrorFn = (status, type, message) => {
+		const response = route.module.formatError(status, type, message);
+		response.headers.set("x-request-id", requestId);
+		response.headers.set("request-id", requestId);
+		return response;
+	};
 	const fingerprint = resolvePromptCacheKey(body, req.headers) ?? sessionId;
 	const attemptedCredentials = new Set<number>();
 	let retryCount = 0;
@@ -1128,13 +976,6 @@ async function handleFormatEndpoint(
 
 	const classifiedError = (classified: GatewayErrorClassification): Response =>
 		formatError(classified.status, classified.type, classified.message);
-
-	const attemptHookCtx = () => ({
-		requestId,
-		routeId: compiled.id,
-		target: currentTarget,
-		generation: compiled.generation,
-	});
 
 	const considerFallback = (classified: GatewayErrorClassification): boolean => {
 		lastClassified = classified;
@@ -1174,11 +1015,6 @@ async function handleFormatEndpoint(
 	};
 
 	const bindCurrentTarget = (targetId: string): Response | undefined | "skipped" => {
-		if (targetId !== currentTarget) {
-			// Sibling-credential exhaustion is per-target: a fresh target gets
-			// its own credential siblings before the conductor moves on.
-			siblingsExhausted = false;
-		}
 		currentTarget = targetId;
 		const resolved = bootOpts.resolveModel(currentTarget);
 		if (!resolved) {
@@ -1256,16 +1092,6 @@ async function handleFormatEndpoint(
 	};
 
 	const resolveCredential = async (): Promise<AttemptPrep> => {
-		if (parsed.options.previousResponseId && bootOpts.storage.listStoredCredentials(model.provider).length > 1) {
-			return {
-				type: "respond",
-				response: formatError(
-					400,
-					"invalid_request_error",
-					"Responses continuations require an unambiguous single-credential provider; credential rotation is disabled",
-				),
-			};
-		}
 		let apiKey: string | undefined;
 		if (
 			parsed.options.previousResponseId &&
@@ -1282,18 +1108,22 @@ async function handleFormatEndpoint(
 			};
 		}
 		try {
-			apiKey = await bootOpts.storage.getApiKey(activeModel.provider, sessionId, {
-				modelId: activeModel.id,
+			apiKey = await bootOpts.storage.getApiKey(model.provider, sessionId, {
+				modelId: model.id,
 				signal: controller.signal,
 				requestId,
 			});
 		} catch (error) {
 			if (controller.signal.aborted) return { type: "respond", response: clientClosedResponse(route) };
 			const classified = classifyGatewayError(error);
-			logger.warn("auth-gateway getApiKey threw", {
-				provider: activeModel.provider,
-				peer,
-				error: classified.message,
+			logger.warn("auth-gateway getApiKey threw", { provider: model.provider, peer, error: classified.message });
+			traces.record({
+				requestId,
+				routeId: compiled.id,
+				generation: compiled.generation,
+				selectedTarget: currentTarget,
+				disposition: "skipped",
+				reason: "credential_lookup_failed",
 			});
 			if (considerFallback(classified)) return { type: "retry" };
 			return { type: "respond", response: classifiedError(classified) };
@@ -1309,12 +1139,13 @@ async function handleFormatEndpoint(
 				reason: "credential_unavailable",
 			});
 			logger.debug("auth-gateway route decision", redactedDecisionSummary(skipped));
+			const unconfigured = !bootOpts.storage.hasAuth(model.provider);
 			const classified: GatewayErrorClassification = {
-				status: 401,
-				type: "authentication_error",
+				status: unconfigured ? 503 : 401,
+				type: unconfigured ? "upstream_error" : "authentication_error",
 				message: `No credential available for provider ${model.provider}`,
-				owner: "credential",
-				disposition: "credential_transient",
+				owner: unconfigured ? "provider" : "credential",
+				disposition: unconfigured ? "provider_unavailable" : "credential_transient",
 			};
 			// No key means there is no sibling credential to rotate — skip straight
 			// to disposition-compiled credential_transient fallbacks when present.
@@ -1324,8 +1155,6 @@ async function handleFormatEndpoint(
 				type: "respond",
 				response: formatError(classified.status, classified.type, classified.message),
 			};
-			if (considerFallback(unavailable)) return { type: "retry" };
-			return { type: "respond", response: lastEligibilityResponse };
 		}
 		const activeCredentialId = bootOpts.storage
 			.listOAuthAccounts(model.provider, sessionId)
@@ -1339,29 +1168,6 @@ async function handleFormatEndpoint(
 			disposition: "dispatched",
 		});
 		logger.debug("auth-gateway route decision", redactedDecisionSummary(dispatched));
-		// Identity-scoped portability (account/deployment) can only be verified
-		// now that the credential is known: skip targets from the wrong account
-		// instead of dispatching cross-account continuations.
-		const identity = bootOpts.storage.getOAuthAccountIdentity(model.provider, sessionId);
-		if (
-			!candidateAllowed(
-				compiled.portability,
-				{ id: currentTarget, provider: model.provider, accountId: identity?.accountId, deployment: model.baseUrl },
-				compiled.affinity ?? "preferred",
-			)
-		) {
-			attemptedTargets.add(currentTarget);
-			const skipped = traces.record({
-				requestId,
-				routeId: compiled.id,
-				generation: compiled.generation,
-				selectedTarget: currentTarget,
-				disposition: "skipped",
-				reason: "state_incompatible",
-			});
-			logger.debug("auth-gateway route decision", redactedDecisionSummary(skipped));
-			return { type: "retry" };
-		}
 		return { type: "key", apiKey };
 	};
 
@@ -1422,8 +1228,8 @@ async function handleFormatEndpoint(
 					requestId,
 					format: route.label,
 					model: parsed.modelId,
-					resolvedProvider: activeModel.provider,
-					resolvedModel: activeModel.id,
+					resolvedProvider: model.provider,
+					resolvedModel: model.id,
 					stream: parsed.stream,
 					peer,
 				});
@@ -1464,7 +1270,6 @@ async function handleFormatEndpoint(
 					}
 					bootOpts.storage.settleQuotaProbeSuccess(requestId);
 					health.recordSuccess(model.provider, model.id);
-					await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: true });
 					rememberPromptCacheHit(cacheStore, fingerprint, model, sessionId, currentTarget);
 					await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: true });
 					await runHook(bootOpts.hooks?.afterRequest, {
@@ -1476,7 +1281,7 @@ async function handleFormatEndpoint(
 					return json(
 						200,
 						route.module.encodeResponse(message, parsed.modelId),
-						gatewayResponseHeaders(activeModel, { requestId, message, startedAt }),
+						gatewayResponseHeaders(model, { requestId, message, startedAt }),
 					);
 				} catch (error) {
 					if (controller.signal.aborted) return clientClosedResponse(route);
@@ -1496,7 +1301,7 @@ async function handleFormatEndpoint(
 				}
 			}
 			if (lastClassified) return classifiedError(lastClassified);
-			return lastEligibilityResponse ?? formatError(502, "upstream_error", "Upstream request failed");
+			return formatError(502, "upstream_error", "Upstream request failed");
 		} finally {
 			bootOpts.storage.releaseTurnReservation(requestId);
 		}
@@ -1519,10 +1324,6 @@ async function handleFormatEndpoint(
 			bootOpts.storage.releaseTurnReservation(requestId);
 			continue;
 		}
-		if (cred.type === "skip") {
-			bootOpts.storage.releaseTurnReservation(requestId);
-			continue;
-		}
 		if (cred.type === "respond") {
 			await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
 			bootOpts.storage.releaseTurnReservation(requestId);
@@ -1539,14 +1340,14 @@ async function handleFormatEndpoint(
 			requestId,
 			format: route.label,
 			model: parsed.modelId,
-			resolvedProvider: activeModel.provider,
-			resolvedModel: activeModel.id,
+			resolvedProvider: model.provider,
+			resolvedModel: model.id,
 			stream: parsed.stream,
 			peer,
 		});
 		let events: AssistantMessageEventStream;
 		try {
-			events = streamSimple(activeModel, parsed.context, streamOpts);
+			events = streamSimple(model, parsed.context, streamOpts);
 		} catch (error) {
 			const classified = classifyGatewayError(error);
 			logger.warn("auth-gateway streamSimple threw", { format: route.label, error: classified.message, peer });
@@ -1557,7 +1358,6 @@ async function handleFormatEndpoint(
 			}
 			await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
 			bootOpts.storage.releaseTurnReservation(requestId);
-			await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
 			return classifiedError(classified);
 		}
 		if (!commitGateObservesDownstreamSse(route.label)) observeAssistantCommit(events, commitGate);
@@ -1583,7 +1383,6 @@ async function handleFormatEndpoint(
 				if (held.message.stopReason === "aborted") {
 					await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
 					bootOpts.storage.releaseTurnReservation(requestId);
-					await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
 					return formatError(499, "request_aborted", errorMessage);
 				}
 				const classified = classifyAssistantFailure(held.message);
@@ -1605,7 +1404,6 @@ async function handleFormatEndpoint(
 			}
 			await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
 			bootOpts.storage.releaseTurnReservation(requestId);
-			await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
 			return classifiedError(classified);
 		}
 		if (controller.signal.aborted) {
@@ -1634,7 +1432,7 @@ async function handleFormatEndpoint(
 		return new Response(sseStream, {
 			status: 200,
 			headers: {
-				...gatewayResponseHeaders(activeModel, { requestId }),
+				...gatewayResponseHeaders(model, { requestId }),
 				"Content-Type": "text/event-stream; charset=utf-8",
 				"Cache-Control": "no-cache",
 				Connection: "keep-alive",
@@ -1647,7 +1445,7 @@ async function handleFormatEndpoint(
 	}
 	bootOpts.storage.releaseTurnReservation(requestId);
 	if (lastClassified) return classifiedError(lastClassified);
-	return lastEligibilityResponse ?? formatError(502, "upstream_error", "Upstream request failed");
+	return formatError(502, "upstream_error", "Upstream request failed");
 }
 
 /**
@@ -1728,7 +1526,12 @@ async function handlePiNative(
 
 	const traces = bootOpts.decisionTraces ?? new RouteDecisionTraceLog();
 	const commitGate = new StreamCommitGate();
-	const formatError = piNative.formatError;
+	const formatError: FormatErrorFn = (status, type, message) => {
+		const response = piNative.formatError(status, type, message);
+		response.headers.set("x-request-id", requestId);
+		response.headers.set("request-id", requestId);
+		return response;
+	};
 	const fingerprint = resolvePromptCacheKey(body, req.headers) ?? sessionId;
 	const attemptedCredentials = new Set<number>();
 	let retryCount = 0;
@@ -1792,11 +1595,6 @@ async function handlePiNative(
 	};
 
 	const bindCurrentTarget = (targetId: string): Response | undefined | "skipped" => {
-		if (targetId !== currentTarget) {
-			// Sibling-credential exhaustion is per-target: a fresh target gets
-			// its own credential siblings before the conductor moves on.
-			siblingsExhausted = false;
-		}
 		currentTarget = targetId;
 		const resolved = bootOpts.resolveModel(currentTarget);
 		if (!resolved) {
@@ -1872,16 +1670,6 @@ async function handlePiNative(
 	};
 
 	const resolveCredential = async (): Promise<AttemptPrep> => {
-		if (parsed.options.previousResponseId && bootOpts.storage.listStoredCredentials(model.provider).length > 1) {
-			return {
-				type: "respond",
-				response: formatError(
-					400,
-					"invalid_request_error",
-					"Responses continuations require an unambiguous single-credential provider; credential rotation is disabled",
-				),
-			};
-		}
 		let apiKey: string | undefined;
 		if (
 			parsed.options.previousResponseId &&
@@ -1898,18 +1686,22 @@ async function handlePiNative(
 			};
 		}
 		try {
-			apiKey = await bootOpts.storage.getApiKey(activeModel.provider, sessionId, {
-				modelId: activeModel.id,
+			apiKey = await bootOpts.storage.getApiKey(model.provider, sessionId, {
+				modelId: model.id,
 				signal: controller.signal,
 				requestId,
 			});
 		} catch (error) {
 			if (controller.signal.aborted) return { type: "respond", response: aborted() };
 			const classified = classifyGatewayError(error);
-			logger.warn("auth-gateway getApiKey threw", {
-				provider: activeModel.provider,
-				peer,
-				error: classified.message,
+			logger.warn("auth-gateway getApiKey threw", { provider: model.provider, peer, error: classified.message });
+			traces.record({
+				requestId,
+				routeId: compiled.id,
+				generation: compiled.generation,
+				selectedTarget: currentTarget,
+				disposition: "skipped",
+				reason: "credential_lookup_failed",
 			});
 			if (considerFallback(classified)) return { type: "retry" };
 			return { type: "respond", response: classifiedError(classified) };
@@ -1925,12 +1717,13 @@ async function handlePiNative(
 				reason: "credential_unavailable",
 			});
 			logger.debug("auth-gateway route decision", redactedDecisionSummary(skipped));
+			const unconfigured = !bootOpts.storage.hasAuth(model.provider);
 			const classified: GatewayErrorClassification = {
-				status: 401,
-				type: "authentication_error",
+				status: unconfigured ? 503 : 401,
+				type: unconfigured ? "upstream_error" : "authentication_error",
 				message: `No credential available for provider ${model.provider}`,
-				owner: "credential",
-				disposition: "credential_transient",
+				owner: unconfigured ? "provider" : "credential",
+				disposition: unconfigured ? "provider_unavailable" : "credential_transient",
 			};
 			// No key means there is no sibling credential to rotate — skip straight
 			// to disposition-compiled credential_transient fallbacks when present.
@@ -1940,8 +1733,6 @@ async function handlePiNative(
 				type: "respond",
 				response: formatError(classified.status, classified.type, classified.message),
 			};
-			if (considerFallback(unavailable)) return { type: "retry" };
-			return { type: "respond", response: lastEligibilityResponse };
 		}
 		const activeCredentialId = bootOpts.storage
 			.listOAuthAccounts(model.provider, sessionId)
@@ -1955,34 +1746,10 @@ async function handlePiNative(
 			disposition: "dispatched",
 		});
 		logger.debug("auth-gateway route decision", redactedDecisionSummary(dispatched));
-		// Identity-scoped portability (account/deployment) can only be verified
-		// now that the credential is known: skip targets from the wrong account
-		// instead of dispatching cross-account continuations.
-		const identity = bootOpts.storage.getOAuthAccountIdentity(model.provider, sessionId);
-		if (
-			!candidateAllowed(
-				compiled.portability,
-				{ id: currentTarget, provider: model.provider, accountId: identity?.accountId, deployment: model.baseUrl },
-				compiled.affinity ?? "preferred",
-			)
-		) {
-			attemptedTargets.add(currentTarget);
-			const skipped = traces.record({
-				requestId,
-				routeId: compiled.id,
-				generation: compiled.generation,
-				selectedTarget: currentTarget,
-				disposition: "skipped",
-				reason: "state_incompatible",
-			});
-			logger.debug("auth-gateway route decision", redactedDecisionSummary(skipped));
-			return { type: "retry" };
-		}
 		return { type: "key", apiKey };
 	};
 
 	const buildAttemptStreamOpts = (apiKey: string): SimpleStreamOptions => {
-		const activeModel = requireModel();
 		// Build the SimpleStreamOptions actually handed to `streamSimple`. We
 		// trust the client's options (already allow-listed by `parseRequest`) and
 		// only inject server-controlled fields. The codex sampling strip mirrors
@@ -2056,8 +1823,8 @@ async function handlePiNative(
 					requestId,
 					format: "pi-native",
 					model: parsed.modelId,
-					resolvedProvider: activeModel.provider,
-					resolvedModel: activeModel.id,
+					resolvedProvider: model.provider,
+					resolvedModel: model.id,
 					stream: parsed.stream,
 					peer,
 				});
@@ -2098,7 +1865,6 @@ async function handlePiNative(
 					}
 					bootOpts.storage.settleQuotaProbeSuccess(requestId);
 					health.recordSuccess(model.provider, model.id);
-					await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: true });
 					rememberPromptCacheHit(cacheStore, fingerprint, model, sessionId, currentTarget);
 					await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: true });
 					return json(200, { message }, gatewayResponseHeaders(model, { requestId, message, startedAt }));
@@ -2120,7 +1886,7 @@ async function handlePiNative(
 				}
 			}
 			if (lastClassified) return classifiedError(lastClassified);
-			return lastEligibilityResponse ?? formatError(502, "upstream_error", "Upstream request failed");
+			return formatError(502, "upstream_error", "Upstream request failed");
 		} finally {
 			bootOpts.storage.releaseTurnReservation(requestId);
 		}
@@ -2143,10 +1909,6 @@ async function handlePiNative(
 			bootOpts.storage.releaseTurnReservation(requestId);
 			continue;
 		}
-		if (cred.type === "skip") {
-			bootOpts.storage.releaseTurnReservation(requestId);
-			continue;
-		}
 		if (cred.type === "respond") {
 			await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
 			bootOpts.storage.releaseTurnReservation(requestId);
@@ -2163,14 +1925,14 @@ async function handlePiNative(
 			requestId,
 			format: "pi-native",
 			model: parsed.modelId,
-			resolvedProvider: activeModel.provider,
-			resolvedModel: activeModel.id,
+			resolvedProvider: model.provider,
+			resolvedModel: model.id,
 			stream: parsed.stream,
 			peer,
 		});
 		let events: AssistantMessageEventStream;
 		try {
-			events = streamSimple(activeModel, parsed.context, streamOpts);
+			events = streamSimple(model, parsed.context, streamOpts);
 		} catch (error) {
 			const classified = classifyGatewayError(error);
 			logger.warn("auth-gateway streamSimple threw", { format: "pi-native", error: classified.message, peer });
@@ -2181,7 +1943,6 @@ async function handlePiNative(
 			}
 			await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
 			bootOpts.storage.releaseTurnReservation(requestId);
-			await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
 			return classifiedError(classified);
 		}
 		if (!commitGateObservesDownstreamSse("pi-native")) observeAssistantCommit(events, commitGate);
@@ -2205,7 +1966,6 @@ async function handlePiNative(
 				if (held.message.stopReason === "aborted") {
 					await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
 					bootOpts.storage.releaseTurnReservation(requestId);
-					await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
 					return formatError(499, "request_aborted", errorMessage);
 				}
 				const classified = classifyAssistantFailure(held.message);
@@ -2227,7 +1987,6 @@ async function handlePiNative(
 			}
 			await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
 			bootOpts.storage.releaseTurnReservation(requestId);
-			await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
 			return classifiedError(classified);
 		}
 		if (controller.signal.aborted) {
@@ -2256,7 +2015,7 @@ async function handlePiNative(
 		return new Response(sseStream, {
 			status: 200,
 			headers: {
-				...gatewayResponseHeaders(activeModel, { requestId }),
+				...gatewayResponseHeaders(model, { requestId }),
 				"Content-Type": "text/event-stream; charset=utf-8",
 				"Cache-Control": "no-cache",
 				Connection: "keep-alive",
@@ -2266,7 +2025,7 @@ async function handlePiNative(
 	}
 	bootOpts.storage.releaseTurnReservation(requestId);
 	if (lastClassified) return classifiedError(lastClassified);
-	return lastEligibilityResponse ?? formatError(502, "upstream_error", "Upstream request failed");
+	return formatError(502, "upstream_error", "Upstream request failed");
 }
 
 /**
@@ -2375,14 +2134,6 @@ function handleRouteGet(registry: RouteRegistry, id: string): Response {
 		fallbacks: route.fallbacks,
 	};
 	return json(200, row);
-}
-
-function decodeRoutePathId(pathname: string): { id?: string; error?: Response } {
-	try {
-		return { id: decodeURIComponent(pathname.slice("/v1/routes/".length)) };
-	} catch (error) {
-		return { error: json(400, { error: `Invalid encoded route id: ${String(error)}` }) };
-	}
 }
 
 async function handleRoutePut(registry: RouteRegistry, id: string, req: Request): Promise<Response> {
@@ -2595,78 +2346,6 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 					);
 				}
 
-				// Native Gemini paths carry the model in the URL. Inject it (and
-				// the endpoint's streaming mode) so the module sees a complete body.
-				if (req.method === "POST") {
-					const geminiPath = GEMINI_MODEL_PATH.exec(pathname);
-					if (geminiPath) {
-						let pathModel: string;
-						try {
-							pathModel = decodeURIComponent(geminiPath[1]!);
-						} catch {
-							return withCors(json(400, { error: "invalid model path encoding" }), req);
-						}
-						const streaming = geminiPath[2] !== undefined;
-						const module = {
-							...geminiV1beta,
-							parseRequest: (body: unknown, headers?: Headers) => {
-								if (!isRecord(body)) return geminiV1beta.parseRequest(body, headers);
-								let injected = body;
-								if (typeof injected.model !== "string") injected = { ...injected, model: pathModel };
-								if (typeof injected.stream !== "boolean") injected = { ...injected, stream: streaming };
-								return geminiV1beta.parseRequest(injected, headers);
-							},
-						};
-						return withCors(
-							await handleFormatEndpoint(
-								{ module, label: "gemini-v1beta" },
-								boot,
-								req,
-								peer,
-								health,
-								cacheStore,
-							),
-							req,
-						);
-					}
-				}
-
-				// Native Gemini paths carry the model in the URL. Inject it (and
-				// the endpoint's streaming mode) so the module sees a complete body.
-				if (req.method === "POST") {
-					const geminiPath = GEMINI_MODEL_PATH.exec(pathname);
-					if (geminiPath) {
-						let pathModel: string;
-						try {
-							pathModel = decodeURIComponent(geminiPath[1]!);
-						} catch {
-							return withCors(json(400, { error: "invalid model path encoding" }), req);
-						}
-						const streaming = geminiPath[2] === "streamGenerateContent";
-						const module = {
-							...geminiV1beta,
-							parseRequest: (body: unknown, headers?: Headers) => {
-								if (!isRecord(body)) return geminiV1beta.parseRequest(body, headers);
-								let injected = body;
-								if (typeof injected.model !== "string") injected = { ...injected, model: pathModel };
-								if (typeof injected.stream !== "boolean") injected = { ...injected, stream: streaming };
-								return geminiV1beta.parseRequest(injected, headers);
-							},
-						};
-						return withCors(
-							await handleFormatEndpoint(
-								{ module, label: "gemini-v1beta", pathModel, pathStream: streaming },
-								boot,
-								req,
-								peer,
-								health,
-								cacheStore,
-							),
-							req,
-						);
-					}
-				}
-
 				// Pi-native fast path. Same auth + provider plumbing as the
 				// foreign-wire routes, just without the wire-format translation.
 				if (req.method === "POST" && pathname === "/v1/pi/stream") {
@@ -2694,15 +2373,6 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 					const id = routeId!;
 					if (id.length === 0) {
 						return withCors(handleRoutesList(registry), req);
-					}
-					// Route ids may carry reserved characters; clients send
-					// them escaped (`virtual%2Fprimary`). Malformed escapes
-					// are a client error, not a missing route.
-					let id: string;
-					try {
-						id = decodeURIComponent(rawId);
-					} catch {
-						return withCors(json(400, { error: "invalid route id encoding" }), req);
 					}
 					return withCors(handleRouteGet(registry, id), req);
 				}

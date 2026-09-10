@@ -66,9 +66,7 @@ describe("auth-gateway account pool", () => {
 		vi.spyOn(globalThis, "fetch").mockImplementation(
 			Object.assign(
 				async (input: Parameters<typeof fetch>[0], init: Parameters<typeof fetch>[1]) => {
-					const url = String(
-						typeof input === "object" && input !== null && "url" in input ? input.url : input,
-					);
+					const url = String(typeof input === "object" && input !== null && "url" in input ? input.url : input);
 					if (url.includes("127.0.0.1") || url.includes("localhost")) return originalFetch(input, init);
 					return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
 				},

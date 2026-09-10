@@ -2260,7 +2260,7 @@ async function handleExecServerMessage(
 				onToolResult,
 				toolResult => buildMcpResultFromToolResult(mcpCall, toolResult),
 				_reason =>
-					cursorToolPassthrough && !execHandlers?.mcp
+					externalToolExecutor && !execHandlers?.mcp
 						? buildMcpExternalHandoffResult()
 						: buildMcpToolNotFoundResult(mcpCall),
 				error => buildMcpErrorResult(error),

@@ -61,7 +61,7 @@ it("does not use an overflow-only fallback for a credentialless target", async (
 				stream: false,
 			}),
 		});
-		expect(res.status).toBe(401);
+		expect(res.status).toBe(503);
 		expect(primary.calls).toHaveLength(0);
 		expect(backup.calls).toHaveLength(0);
 	} finally {

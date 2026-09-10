@@ -489,8 +489,6 @@ export interface StreamOptions {
 	 * `x-grok-conv-id`; when omitted, they fall back to `sessionId`.
 	 */
 	promptCacheKey?: string;
-	/** Persist the response for later previous_response_id continuation (Responses-style APIs). */
-	store?: boolean;
 	/**
 	 * OpenAI GPT-5.6+ prompt-cache policy. Ignored by providers that do not
 	 * support explicit OpenAI cache breakpoints; explicit mode fails locally on
@@ -704,17 +702,6 @@ export interface SimpleStreamOptions extends Omit<StreamOptions, "apiKey"> {
 	cursorOnToolResult?: CursorToolResultHandler;
 	/** Cursor hands unhandled MCP calls to an external executor instead of reporting them as missing. */
 	cursorExternalToolExecutor?: boolean;
-	/** Accept inline images in Cursor responses. */
-	cursorClientSupportsInlineImages?: boolean;
-	/** Accept routed-model updates from Cursor. */
-	cursorClientSupportsRoutedModelUpdate?: boolean;
-	/** Support Cursor prompt-context usage requests. */
-	cursorClientSupportsPromptContextUsageRpc?: boolean;
-	/** Caller-owned Cursor run identity. */
-	cursorRunId?: string;
-	/** Caller-owned Cursor agent session identity. */
-	cursorAgentSessionId?: string;
-
 	/**
 	 * Amazon Bedrock Guardrail settings forwarded through transports that do not
 	 * dispatch directly to the Bedrock provider. Model-level values take

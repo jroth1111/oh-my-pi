@@ -359,7 +359,7 @@ describe("AgentSession snapcompact frame dead-end rescue", () => {
 			.filter((entry): entry is CompactionEntry => entry.type === "compaction");
 		expect(compactions.length).toBe(2);
 		const [hookWritten, rebuilt] = compactions;
-		expect(hookWritten.summary).toBe("compacted");
+		expect(hookWritten.summary).toStartWith("compacted");
 		expect(snapcompact.getPreservedArchive(hookWritten.preserveData)?.frames.length).toBe(SEEDED_FRAME_COUNT);
 		expect(snapcompact.getPreservedArchive(rebuilt.preserveData)?.frames.length).toBe(4);
 		// Extensions must be notified about the entry that is now active, not

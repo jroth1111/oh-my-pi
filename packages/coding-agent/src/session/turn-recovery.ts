@@ -83,7 +83,8 @@ const HTTP2_STREAM_RESET_ERROR_RE =
 // (openai-completions "finish_reason", openai/azure responses "terminal
 // response event"). Same transport-failure class as the stall/reset entries:
 // retriable, and eligible for preserved-turn continuation on resolved tool turns.
-const PREMATURE_STREAM_CLOSE_ERROR_RE = /stream closed before a (?:finish_reason|terminal response event)/i;
+const PREMATURE_STREAM_CLOSE_ERROR_RE =
+	/(?:stream closed before a (?:finish_reason|terminal response event)|Codex stream ended before terminal completion event)/i;
 const IMMUTABLE_ANTHROPIC_THINKING_ERROR_PATTERN =
 	/messages\.\d+\.content\.\d+.*\b(?:thinking|redacted_thinking)\b.*\blatest assistant message cannot be modified\b/is;
 

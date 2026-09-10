@@ -136,7 +136,7 @@ function isConservativeIdentityEnrichment(oldFingerprint: string, newFingerprint
 		const next = newFields.get(key);
 		if (next !== undefined && next !== value) return false;
 	}
-	return false;
+	return true;
 }
 
 function turnReservationKey(credentialId: number, incarnation: number): string {
@@ -2536,18 +2536,6 @@ export class AuthStorage {
 			});
 		}
 		return this.#orderUsageRankedCandidates(ranked, "none");
-	}
-
-	/** Acquire an exclusive turn reservation for a stored API-key row when requestId is set. */
-	#tryReserveApiKeySelection(provider: string, selection: ApiKeySelection, requestId: string | undefined): boolean {
-		if (!requestId) return true;
-		const reserveId = this.#getStoredCredentials(provider)[selection.index]?.id;
-		if (reserveId === undefined) return true;
-		return this.tryAcquireTurnReservation({
-			credentialId: reserveId,
-			incarnation: this.getCredentialIncarnation(reserveId),
-			requestId,
-		}).ok;
 	}
 
 	async #selectApiKeyCredential(
@@ -5353,21 +5341,6 @@ export class AuthStorage {
 		this.#probeLeases.release(probe.credentialId, probe.blockScope, probe.leaseId);
 	}
 
-	#acquireRequestQuotaProbe(requestId: string | undefined, credentialId: number, scope: string): boolean {
-		if (requestId) return this.#acquireOrReuseQuotaProbeLease(requestId, credentialId, scope);
-		const key = `anonymous-probe:${credentialId}:${scope}`;
-		if (this.#inflightProbes.has(key)) return false;
-		return this.#acquireOrReuseQuotaProbeLease(key, credentialId, scope);
-	}
-
-	settleAnonymousQuotaProbe(credentialId: number, scope: string): boolean {
-		return this.settleQuotaProbeSuccess(`anonymous-probe:${credentialId}:${scope}`);
-	}
-
-	clearAnonymousQuotaProbe(credentialId: number, scope: string): void {
-		this.clearQuotaProbe(`anonymous-probe:${credentialId}:${scope}`);
-	}
-
 	settleQuotaProbeSuccess(requestId: string): boolean {
 		const probe = this.#inflightProbes.get(requestId);
 		if (!probe) return false;
@@ -6241,7 +6214,7 @@ export class AuthStorage {
 					entry.credential.type === selection.credential.type &&
 					!this.#isCredentialBlocked(provider, providerKey, index, blockScopes ?? blockScope),
 			);
-			if (!allowBlocked && hasUsableSibling) return undefined;
+			if (hasUsableSibling) return undefined;
 			const held = this.#activeTurnReservation(blockedId, this.getCredentialIncarnation(blockedId));
 			if (held && held.requestId !== options?.requestId) return undefined;
 			const probeScope = this.#resolveBlockingProbeScope(
@@ -6494,9 +6467,8 @@ export class AuthStorage {
 				if (options?.requestId) {
 					this.releaseTurnReservation(options.requestId);
 					this.clearQuotaProbe(options.requestId);
-				} else if (anonymousProbe) {
-					const key = anonymousProbeRequestKey(anonymousProbe.credentialId, anonymousProbe.blockScope);
-					if (this.#inflightProbes.get(key)?.leaseId === anonymousProbe.leaseId) this.clearQuotaProbe(key);
+				} else if (finishId !== undefined) {
+					this.clearAnonymousQuotaProbe(finishId, finishScope);
 				}
 			}
 		}

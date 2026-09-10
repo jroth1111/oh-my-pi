@@ -2013,6 +2013,7 @@ mod tests {
 	#[cfg(unix)]
 	fn write_hook(path: &Path, body: &str, executable: bool) {
 		use std::os::unix::fs::PermissionsExt;
+		fs::create_dir_all(path.parent().unwrap()).unwrap();
 		fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
 		let mode = if executable { 0o755 } else { 0o644 };
 		fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();

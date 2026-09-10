@@ -1,4 +1,5 @@
 import type { Api, Context, Model } from "../types";
+import { surfaceAllowsApi } from "./route-surface";
 
 export interface ModelCapabilities {
 	text: boolean;

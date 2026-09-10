@@ -84,7 +84,10 @@ describe("auth-gateway decision-trace wiring", () => {
 				headers: { Authorization: "Bearer t" },
 			});
 			expect(got.status).toBe(200);
-			expect(await got.json()).toEqual(expect.objectContaining({ requestId: id, routeId: "mock/trace-exec" }));
+			expect(await got.json()).toEqual({
+				object: "list",
+				data: expect.arrayContaining([expect.objectContaining({ requestId: id, routeId: "mock/trace-exec" })]),
+			});
 			const missing = await fetch(`${handle.url}/v1/executions/does-not-exist`, {
 				headers: { Authorization: "Bearer t" },
 			});
@@ -120,7 +123,7 @@ describe("auth-gateway decision-trace wiring", () => {
 					stream: false,
 				}),
 			});
-			expect(res.status).toBe(401);
+			expect(res.status).toBe(503);
 			const recorded = traces.list().filter(t => t.routeId === "mock/trace-skip");
 			expect(recorded.length).toBeGreaterThanOrEqual(1);
 			expect(recorded.every(t => t.disposition === "skipped" && t.reason === "credential_unavailable")).toBe(true);

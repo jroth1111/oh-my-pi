@@ -1,4 +1,3 @@
-import { RouteRegistry } from "../src/auth-gateway/route-graph";
 import { describe, expect, it } from "bun:test";
 import type { CompiledRoute } from "@oh-my-pi/pi-ai/auth-gateway";
 import { RouteRegistry } from "@oh-my-pi/pi-ai/auth-gateway/route-graph";

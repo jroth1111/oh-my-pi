@@ -89,6 +89,7 @@ async function dispatchExec(
 		requestContextTools?: McpToolDefinition[];
 		requestContextRules?: CursorRule[];
 		externalToolExecutor?: boolean;
+		cursorToolPassthrough?: boolean;
 	} = {},
 ): Promise<{ frames: AgentClientMessage[]; output: AssistantMessage; results: ToolResultMessage[] }> {
 	const output = cursorAssistantMessage();
@@ -119,7 +120,7 @@ async function dispatchExec(
 		options.requestContextTools ?? [],
 		options.requestContextRules,
 		undefined,
-		options.externalToolExecutor,
+		options.externalToolExecutor ?? options.cursorToolPassthrough,
 	);
 
 	return { frames: written.map(decodeClientFrame), output, results };

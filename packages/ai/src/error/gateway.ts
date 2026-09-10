@@ -72,13 +72,13 @@ const RETRYABLE_DISPOSITION: Record<GatewayErrorDisposition, boolean> = {
 	cancelled: false,
 };
 
+/** True when a disposition may be retried against another credential or provider. */
 export const RETRYABLE_GATEWAY_DISPOSITIONS: readonly GatewayErrorDisposition[] = Object.freeze(
 	(Object.keys(RETRYABLE_DISPOSITION) as GatewayErrorDisposition[]).filter(
 		disposition => RETRYABLE_DISPOSITION[disposition],
 	),
 );
 
-/** True when a disposition may be retried against another credential or provider. */
 export function isRetryableGatewayDisposition(disposition: GatewayErrorDisposition): boolean {
 	return RETRYABLE_DISPOSITION[disposition];
 }
@@ -89,7 +89,7 @@ const TIMEOUT_OR_CONNECTION_PATTERN =
 	/\b(?:operation\s+)?timed?\s*out\b|\btimeout\b|\bconnection(?:\s+error|\s+refused)?\b|\bsocket hang up\b|\bfetch failed\b/i;
 const POLICY_PATTERN = /\bcyber_policy\b|trusted access for cyber/i;
 const MODEL_UNAVAILABLE_PATTERN =
-	/\bmodel[-_ ]?(?:not[-_ ]found|not[-_ ]available|unavailable|not[-_ ]supported)(?:[-_ ]\w+)*\b|\bthe model does not exist\b/i;
+	/\bmodel(?:[-_ ]is)?[-_ ]?(?:not[-_ ]found|not[-_ ]available|unavailable|not[-_ ]supported)(?:[-_ ]\w+)*\b|\bthe model(?:\s+[`"'][^`"']+[`"'])? does not exist\b/i;
 const INVALID_REQUEST_PATTERN =
 	/\b(?:unsupported|invalid_request|invalid request|bad request|malformed|GenerateContentRequest)\b/i;
 const GATEWAY_INVARIANT_PATTERN = /\bgateway_terminal\b|\binternal invariant\b/i;
@@ -133,126 +133,8 @@ export function classifyGatewayError(err: unknown): GatewayErrorClassification {
 	if (modelUnavailableCode(err) || MODEL_UNAVAILABLE_PATTERN.test(message)) {
 		return withOwnerDisposition(err, { status: 404, type: "invalid_request_error", message });
 	}
-
-	// Free-text abort wording sits below authoritative statuses on purpose: a
-	// provider-reported `HTTP 503: upstream request aborted` is a retryable
-	// outage, not a client cancellation. Genuine cancels arrive as AbortError
-	// (handled above) or structural Flag.Abort / status 499.
-	if (/\baborted\b|\babort signal\b/i.test(message)) {
-		return withOwnerDisposition(err, { status: 499, type: "request_aborted", message });
-	}
-
-	// Free-text abort wording sits below authoritative statuses on purpose: a
-	// provider-reported `HTTP 503: upstream request aborted` is a retryable
-	// outage, not a client cancellation. Genuine cancels arrive as AbortError
-	// (handled above) or structural Flag.Abort / status 499.
-	if (/\baborted\b|\babort signal\b/i.test(message)) {
-		return withOwnerDisposition(err, { status: 499, type: "request_aborted", message });
-	}
-
-	// Free-text abort wording sits below authoritative statuses on purpose: a
-	// provider-reported `HTTP 503: upstream request aborted` is a retryable
-	// outage, not a client cancellation. Genuine cancels arrive as AbortError
-	// (handled above) or structural Flag.Abort / status 499.
-	if (/\baborted\b|\babort signal\b/i.test(message)) {
-		return withOwnerDisposition(err, { status: 499, type: "request_aborted", message });
-	}
-
-	// Free-text abort wording sits below authoritative statuses on purpose: a
-	// provider-reported `HTTP 503: upstream request aborted` is a retryable
-	// outage, not a client cancellation. Genuine cancels arrive as AbortError
-	// (handled above) or structural Flag.Abort / status 499.
-	if (/\baborted\b|\babort signal\b/i.test(message)) {
-		return withOwnerDisposition(err, { status: 499, type: "request_aborted", message });
-	}
-
-	// Free-text abort wording sits below authoritative statuses on purpose: a
-	// provider-reported `HTTP 503: upstream request aborted` is a retryable
-	// outage, not a client cancellation. Genuine cancels arrive as AbortError
-	// (handled above) or structural Flag.Abort / status 499.
-	if (/\baborted\b|\babort signal\b/i.test(message)) {
-		return withOwnerDisposition(err, { status: 499, type: "request_aborted", message });
-	}
-
-	// Free-text abort wording sits below authoritative statuses on purpose: a
-	// provider-reported `HTTP 503: upstream request aborted` is a retryable
-	// outage, not a client cancellation. Genuine cancels arrive as AbortError
-	// (handled above) or structural Flag.Abort / status 499.
-	if (/\baborted\b|\babort signal\b/i.test(message)) {
-		return withOwnerDisposition(err, { status: 499, type: "request_aborted", message });
-	}
-
-	// Free-text abort wording sits below authoritative statuses on purpose: a
-	// provider-reported `HTTP 503: upstream request aborted` is a retryable
-	// outage, not a client cancellation. Genuine cancels arrive as AbortError
-	// (handled above) or structural Flag.Abort / status 499.
-	if (/\baborted\b|\babort signal\b/i.test(message)) {
-		return withOwnerDisposition(err, { status: 499, type: "request_aborted", message });
-	}
-
-	// Free-text abort wording sits below authoritative statuses on purpose: a
-	// provider-reported `HTTP 503: upstream request aborted` is a retryable
-	// outage, not a client cancellation. Genuine cancels arrive as AbortError
-	// (handled above) or structural Flag.Abort / status 499.
-	if (/\baborted\b|\babort signal\b/i.test(message)) {
-		return withOwnerDisposition(err, { status: 499, type: "request_aborted", message });
-	}
-
-	// Free-text abort wording sits below authoritative statuses on purpose: a
-	// provider-reported `HTTP 503: upstream request aborted` is a retryable
-	// outage, not a client cancellation. Genuine cancels arrive as AbortError
-	// (handled above) or structural Flag.Abort / status 499.
-	if (/\baborted\b|\babort signal\b/i.test(message)) {
-		return withOwnerDisposition(err, { status: 499, type: "request_aborted", message });
-	}
-
-	// Free-text abort wording sits below authoritative statuses on purpose: a
-	// provider-reported `HTTP 503: upstream request aborted` is a retryable
-	// outage, not a client cancellation. Genuine cancels arrive as AbortError
-	// (handled above) or structural Flag.Abort / status 499.
-	if (/\baborted\b|\babort signal\b/i.test(message)) {
-		return withOwnerDisposition(err, { status: 499, type: "request_aborted", message });
-	}
-
-	// Free-text abort wording sits below authoritative statuses on purpose: a
-	// provider-reported `HTTP 503: upstream request aborted` is a retryable
-	// outage, not a client cancellation. Genuine cancels arrive as AbortError
-	// (handled above) or structural Flag.Abort / status 499.
-	if (/\baborted\b|\babort signal\b/i.test(message)) {
-		return withOwnerDisposition(err, { status: 499, type: "request_aborted", message });
-	}
-
-	// Free-text abort wording sits below authoritative statuses on purpose: a
-	// provider-reported `HTTP 503: upstream request aborted` is a retryable
-	// outage, not a client cancellation. Genuine cancels arrive as AbortError
-	// (handled above) or structural Flag.Abort / status 499.
-	if (/\baborted\b|\babort signal\b/i.test(message)) {
-		return withOwnerDisposition(err, { status: 499, type: "request_aborted", message });
-	}
-
-	// Free-text abort wording sits below authoritative statuses on purpose: a
-	// provider-reported `HTTP 503: upstream request aborted` is a retryable
-	// outage, not a client cancellation. Genuine cancels arrive as AbortError
-	// (handled above) or structural Flag.Abort / status 499.
-	if (/\baborted\b|\babort signal\b/i.test(message)) {
-		return withOwnerDisposition(err, { status: 499, type: "request_aborted", message });
-	}
-
-	// Free-text abort wording sits below authoritative statuses on purpose: a
-	// provider-reported `HTTP 503: upstream request aborted` is a retryable
-	// outage, not a client cancellation. Genuine cancels arrive as AbortError
-	// (handled above) or structural Flag.Abort / status 499.
-	if (/\baborted\b|\babort signal\b/i.test(message)) {
-		return withOwnerDisposition(err, { status: 499, type: "request_aborted", message });
-	}
-
-	// Free-text abort wording sits below authoritative statuses on purpose: a
-	// provider-reported `HTTP 503: upstream request aborted` is a retryable
-	// outage, not a client cancellation. Genuine cancels arrive as AbortError
-	// (handled above) or structural Flag.Abort / status 499.
-	if (/\baborted\b|\babort signal\b/i.test(message)) {
-		return withOwnerDisposition(err, { status: 499, type: "request_aborted", message });
-	}
+	if (isAccountPolicyError(err))
+		return withOwnerDisposition(err, { status: 403, type: "authentication_error", message });
 
 	// Free-text abort wording sits below authoritative statuses on purpose: a
 	// provider-reported `HTTP 503: upstream request aborted` is a retryable

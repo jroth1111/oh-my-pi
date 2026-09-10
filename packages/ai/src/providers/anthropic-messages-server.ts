@@ -835,9 +835,7 @@ export function encodeStream(
 					}
 					case "error": {
 						const msg = ev.error.errorMessage ?? "stream error";
-						controller.enqueue(
-							sseFrame("error", { type: "error", error: { type: "api_error", message: msg } }),
-						);
+						controller.enqueue(sseFrame("error", { type: "error", error: { type: "api_error", message: msg } }));
 						controller.close();
 						return "return";
 					}

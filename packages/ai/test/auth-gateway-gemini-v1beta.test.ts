@@ -97,14 +97,12 @@ describe("auth-gateway gemini-v1beta: parseRequest", () => {
 		expect(parsed.options.temperature).toBe(0.2);
 	});
 
-	it("leaves modelId empty when the body omits model (path-filled later)", () => {
+	it("retains text while leaving an omitted model available for gateway path resolution", () => {
 		const parsed = parseRequest({
 			contents: [{ role: "user", parts: [{ text: "path model" }] }],
 		});
 		expect(parsed.modelId).toBe("");
-		expect(parsed.context.messages[0]).toEqual(
-			expect.objectContaining({ content: [{ type: "text", text: "path model" }] }),
-		);
+		expect(parsed.context.messages[0]).toMatchObject({ content: "path model" });
 	});
 
 	it("maps inlineData parts to image content and keeps image-only turns", () => {
@@ -147,9 +145,7 @@ describe("auth-gateway gemini-v1beta: parseRequest", () => {
 			generationConfig: { temperature: 0.5, maxOutputTokens: 32, topK: 8 },
 		});
 		expect(parsed.context.systemPrompt).toEqual(["sys"]);
-		expect(parsed.context.messages[0]).toEqual(
-			expect.objectContaining({ role: "user", content: [{ type: "text", text: "ab" }] }),
-		);
+		expect(parsed.context.messages[0]).toEqual(expect.objectContaining({ role: "user", content: "ab" }));
 		expect(parsed.context.messages[1]?.role).toBe("assistant");
 		expect(parsed.options.temperature).toBe(0.5);
 		expect(parsed.options.maxOutputTokens).toBe(32);

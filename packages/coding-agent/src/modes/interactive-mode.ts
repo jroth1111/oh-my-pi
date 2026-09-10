@@ -140,7 +140,8 @@ import {
 import { setAutoQaConsentHandler } from "../tools/report-tool-issue";
 import {
 	formatPhaseDisplayName,
-	isClosedTodo,
+	isCompletedTodo,
+	isHudSettledTodo,
 	nextActionableTask,
 	selectCollapsedTodos,
 	setActiveTodoDescriptionsProvider,
@@ -2673,7 +2674,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		let seenTask = false;
 		for (const phase of phases) {
 			for (const task of phase.tasks) {
-				if (!isClosedTodo(task)) return false;
+				if (!isHudSettledTodo(task)) return false;
 				seenTask = true;
 			}
 		}
@@ -2824,7 +2825,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			const label = multiPhase ? formatPhaseDisplayName(phase.name, oneBased) : phase.name;
 			// Closed, not just completed: the collapsed task window hides abandoned
 			// tasks too, so counting only completions leaves the phase reading stuck.
-			const done = phase.tasks.filter(isClosedTodo).length;
+			const done = phase.tasks.filter(isCompletedTodo).length;
 			const progress = ` · ${done}/${phase.tasks.length}`;
 			if (!isActive) {
 				const header = theme.fg("muted", label) + theme.fg("dim", progress);
@@ -2874,7 +2875,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		// Clamp so partial progress lights at least one cell; a closed plan fills
 		// the entire path until the configured auto-clear removes the HUD.
 		const totalTasks = phases.reduce((sum, phase) => sum + phase.tasks.length, 0);
-		const closedTasks = phases.reduce((sum, phase) => sum + phase.tasks.filter(isClosedTodo).length, 0);
+		const closedTasks = phases.reduce((sum, phase) => sum + phase.tasks.filter(isCompletedTodo).length, 0);
 		const pathLen = contentLines.length + tailLen;
 		let filled = Math.round((closedTasks / totalTasks) * pathLen);
 		if (closedTasks > 0) filled = Math.max(filled, 1);
@@ -2903,7 +2904,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			activeDescs.length > 0 && todoMatchesAnyDescription(todo.content, activeDescs);
 
 		const totalTasks = phases.reduce((sum, phase) => sum + phase.tasks.length, 0);
-		const closedTasks = phases.reduce((sum, phase) => sum + phase.tasks.filter(isClosedTodo).length, 0);
+		const closedTasks = phases.reduce((sum, phase) => sum + phase.tasks.filter(isCompletedTodo).length, 0);
 		const activeTask = nextActionableTask(phases);
 
 		const header = `${theme.bold(theme.fg("accent", "TODO"))} ${theme.fg("dim", `${closedTasks}/${totalTasks}`)}`;

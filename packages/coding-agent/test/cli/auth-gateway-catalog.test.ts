@@ -13,6 +13,8 @@ function stubAuthStorage(configKeys?: string[]): AuthStorage {
 		removeConfigApiKey: () => {},
 		hasAuth: () => true,
 		getAll: () => ({ anthropic: {} }),
+		peekApiKeyOverrides: () => undefined,
+		listStoredCredentials: () => [],
 	};
 	return stub as unknown as AuthStorage;
 }

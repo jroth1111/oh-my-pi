@@ -403,6 +403,7 @@ function snapshotAssistantMessageEvent(
 		case "start":
 			return { ...event, partial: partialSnapshot ?? snapshotAssistantMessage(event.partial) };
 		case "text_start":
+		case "routed_model":
 		case "text_delta":
 		case "text_end":
 		case "image_end":

@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { BunPlugin } from "bun";
+import { prepareCompiledBinary } from "../helpers/compiled-binaries";
 import { resolveBundledChangelogPath } from "../../src/utils/changelog";
 
 interface HeapProbeResult {
@@ -145,6 +146,7 @@ describe("changelog static import resources", () => {
 			});
 			expect(buildOutput.success, buildOutput.logs.map(log => log.message).join("\n")).toBe(true);
 
+			await prepareCompiledBinary(binaryPath);
 			const result = await runProbe([binaryPath, missingPackageChangelogPath], unrelatedCwd);
 			expect(result.entries).toBe(sourceResult.entries);
 			expect(result.version).toBe(sourceResult.version);

@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { BunPlugin } from "bun";
+import { prepareCompiledBinary } from "./helpers/compiled-binaries";
 import { getTemplate, resolveBundledHtmlAssetPath } from "../src/export/html/index";
 
 interface HeapProbeResult {
@@ -118,6 +119,7 @@ beforeAll(async () => {
 		compile: { outfile: compiledPath },
 	});
 	expect(compiled.success, compiled.logs.map(log => log.message).join("\n")).toBe(true);
+	await prepareCompiledBinary(compiledPath);
 }, 120_000);
 
 afterAll(() => {

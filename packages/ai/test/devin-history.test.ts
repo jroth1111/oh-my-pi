@@ -58,7 +58,7 @@ async function captureRequest(context: Context) {
 		false,
 	);
 	const compressed = requestPayload.subarray(5, 5 + length);
-	return fromBinary(GetChatMessageRequestSchema, gunzipSync(compressed));
+	return fromBinary(GetChatMessageRequestSchema, requestPayload[0] & 1 ? gunzipSync(compressed) : compressed);
 }
 
 describe("streamDevin history handoff", () => {
@@ -98,7 +98,7 @@ describe("streamDevin history handoff", () => {
 
 		expect(request.chatMessagePrompts).toHaveLength(6);
 		expect(foreign?.messageId).not.toBe("resp_foreign");
-		expect(foreign?.messageId).toMatch(/^bot-[0-9a-f-]{36}$/);
+		expect(foreign?.messageId).toMatch(/^[0-9a-f-]{36}$/);
 		expect(foreign?.prompt).toContain("foreign reasoning");
 		expect(foreign?.prompt).toContain("foreign answer");
 		expect(foreign?.thinking).toBe("");

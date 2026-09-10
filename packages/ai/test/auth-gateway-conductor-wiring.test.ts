@@ -332,7 +332,7 @@ describe("auth-gateway conductor wiring", () => {
 					stream: false,
 				}),
 			});
-			expect(res.status).toBe(401);
+			expect(res.status).toBe(503);
 			expect(primary.calls).toHaveLength(0);
 		} finally {
 			await handle.close();

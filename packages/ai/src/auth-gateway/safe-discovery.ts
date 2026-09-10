@@ -70,55 +70,9 @@ export async function safeDiscoverModels(url: string, opts?: SafeDiscoveryOption
 		}
 	}
 
-	const target = new URL(parsed.href);
-	if (opts?.allowPrivate !== true) {
-		const host = parsed.hostname.replace(/^\[|\]$/g, "");
-		if (net.isIP(host) === 0) {
-			let addresses: Bun.DNSLookup[];
-			try {
-				addresses = await untilAborted(init.signal, Bun.dns.lookup(host));
-			} catch (error) {
-				throw wrapDiscoveryError(error, "discovery DNS lookup failed");
-			}
-			if (
-				addresses.length === 0 ||
-				addresses.some(row => net.isIP(row.address) === 0 || isPrivateHostname(row.address))
-			) {
-				throw new SafeDiscoveryError("discovery hostname resolves to a private or invalid address");
-			}
-			const address = addresses[0]!.address;
-			target.hostname = net.isIP(address) === 6 ? `[${address}]` : address;
-			init.headers = { Host: parsed.host };
-			if (parsed.protocol === "https:") init.tls = { serverName: host };
-		}
-	}
-
-	const target = new URL(parsed.href);
-	if (opts?.allowPrivate !== true) {
-		const host = parsed.hostname.replace(/^\[|\]$/g, "");
-		if (net.isIP(host) === 0) {
-			let addresses: Bun.DNSLookup[];
-			try {
-				addresses = await untilAborted(init.signal, Bun.dns.lookup(host));
-			} catch (error) {
-				throw wrapDiscoveryError(error, "discovery DNS lookup failed");
-			}
-			if (
-				addresses.length === 0 ||
-				addresses.some(row => net.isIP(row.address) === 0 || isPrivateHostname(row.address))
-			) {
-				throw new SafeDiscoveryError("discovery hostname resolves to a private or invalid address");
-			}
-			const address = addresses[0]!.address;
-			target.hostname = net.isIP(address) === 6 ? `[${address}]` : address;
-			init.headers = { Host: parsed.host };
-			if (parsed.protocol === "https:") init.tls = { serverName: host };
-		}
-	}
-
 	let response: Response;
 	try {
-		response = await fetch(target.href, init);
+		response = await fetch(parsed.href, init);
 	} catch (err) {
 		throw wrapDiscoveryError(err, "discovery fetch failed");
 	}
@@ -166,29 +120,6 @@ function assertUrlAllowed(parsed: URL, opts: SafeDiscoveryOptions | undefined): 
 	if (opts?.allowPrivate !== true && isPrivateHostname(hostname)) {
 		throw new SafeDiscoveryError(`private discovery hostname is not allowed: ${hostname}`);
 	}
-}
-
-const privateAddresses = new net.BlockList();
-for (const [address, prefix] of [
-	["0.0.0.0", 8],
-	["10.0.0.0", 8],
-	["100.64.0.0", 10],
-	["127.0.0.0", 8],
-	["169.254.0.0", 16],
-	["172.16.0.0", 12],
-	["192.168.0.0", 16],
-	["224.0.0.0", 4],
-	["240.0.0.0", 4],
-] as const)
-	privateAddresses.addSubnet(address, prefix, "ipv4");
-for (const [address, prefix] of [
-	["::", 128],
-	["::1", 128],
-	["fc00::", 7],
-	["fe80::", 10],
-	["ff00::", 8],
-] as const) {
-	privateAddresses.addSubnet(address, prefix, "ipv6");
 }
 
 function isPrivateHostname(hostname: string): boolean {

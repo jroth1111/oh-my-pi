@@ -1,6 +1,12 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { $ } from "bun";
+
+/** Match the release build's Darwin signing step before executing a compiled fixture. */
+export async function prepareCompiledBinary(file: string): Promise<void> {
+	if (process.platform === "darwin") await $`codesign --force --sign - ${file}`.quiet();
+}
 
 /**
  * Opt out of compile-backed tests on hosts that cannot launch `bun build --compile`

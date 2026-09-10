@@ -1,4 +1,5 @@
 import type { AssistantMessageEventStream } from "../utils/event-stream";
+import type { AssistantMessage } from "../types";
 
 /** Classification of one Responses SSE event for commit / failover. */
 export type CommitClass = "metadata" | "output" | "terminal-success" | "terminal-retryable" | "terminal-failure";
@@ -26,9 +27,6 @@ const METADATA_EVENTS: Record<string, true> = {
 	toolcall_start: true,
 	heartbeat: true,
 	ping: true,
-	// Anthropic envelope events share the hold wrapper: message_start carries
-	// no content and must not commit the stream.
-	message_start: true,
 };
 
 /**

@@ -21,7 +21,6 @@ import type {
 	Context,
 	ImageContent,
 	Message,
-	ImageContent,
 	ServiceTier,
 	StopReason,
 	TextContent,
@@ -55,69 +54,14 @@ function readStringArray(value: unknown): string[] | undefined {
 }
 
 function textFromGeminiParts(parts: unknown): string {
-	return blocksFromGeminiParts(parts).text;
-}
-
-interface GeminiPartBlocks {
-	text: string;
-	images: ImageContent[];
-	toolCalls: ToolCall[];
-	toolResponses: Array<{ name: string; text: string }>;
-}
-
-/** Split native Gemini parts into text, images, tool calls, and tool responses. */
-function blocksFromGeminiParts(parts: unknown): GeminiPartBlocks {
-	const out: GeminiPartBlocks = { text: "", images: [], toolCalls: [], toolResponses: [] };
-	if (!Array.isArray(parts)) return out;
+	if (!Array.isArray(parts)) return "";
+	let text = "";
 	for (const part of parts) {
 		if (!isRecord(part)) continue;
 		if (part.thought === true) continue;
-		if (typeof part.text === "string") {
-			out.text += part.text;
-			continue;
-		}
-		if (isRecord(part.inlineData)) {
-			const data = part.inlineData.data;
-			const mimeType = part.inlineData.mimeType;
-			if (typeof data === "string" && data.length > 0 && typeof mimeType === "string" && mimeType.length > 0) {
-				out.images.push({ type: "image", data, mimeType });
-			}
-			continue;
-		}
-		if (isRecord(part.fileData)) {
-			const fileUri = part.fileData.fileUri;
-			if (typeof fileUri === "string" && fileUri.length > 0) {
-				const mimeType =
-					typeof part.fileData.mimeType === "string" && part.fileData.mimeType.length > 0
-						? part.fileData.mimeType
-						: "image/png";
-				out.images.push({ type: "image", data: "", mimeType, url: fileUri });
-			}
-			continue;
-		}
-		if (isRecord(part.functionCall)) {
-			const name = part.functionCall.name;
-			if (typeof name === "string" && name.length > 0) {
-				const args = part.functionCall.args;
-				out.toolCalls.push({
-					type: "toolCall",
-					id: `gemini-fc-${out.toolCalls.length}`,
-					name,
-					arguments: isRecord(args) ? args : {},
-				});
-			}
-			continue;
-		}
-		if (isRecord(part.functionResponse)) {
-			const name = part.functionResponse.name;
-			const response = part.functionResponse.response;
-			out.toolResponses.push({
-				name: typeof name === "string" ? name : "",
-				text: typeof response === "string" ? response : JSON.stringify(response ?? null),
-			});
-		}
+		if (typeof part.text === "string") text += part.text;
 	}
-	return out;
+	return text;
 }
 
 function readInlineData(part: Record<string, unknown>): ImageContent | undefined {
@@ -173,11 +117,7 @@ function readFunctionCall(part: Record<string, unknown>, lastCallIdByName?: Map<
 		typeof call.id === "string" && call.id.length > 0
 			? call.id
 			: `gemini_call_${name}_${Math.random().toString(36).slice(2, 10)}`;
-	if (lastCallIdByName) {
-		const pending = lastCallIdByName.get(name) ?? [];
-		pending.push(id);
-		lastCallIdByName.set(name, pending);
-	}
+	lastCallIdByName?.set(name, id);
 	const args = call.args ?? call.arguments;
 	return {
 		type: "toolCall",
@@ -190,21 +130,18 @@ function readFunctionCall(part: Record<string, unknown>, lastCallIdByName?: Map<
 function functionResponseToToolResult(
 	part: Record<string, unknown>,
 	timestamp: number,
-	lastCallIdByName?: Map<string, string[]>,
+	lastCallIdByName?: Map<string, string>,
 ): ToolResultMessage | undefined {
 	const resp = part.functionResponse ?? part.function_response;
 	if (!isRecord(resp)) return undefined;
 	const name = typeof resp.name === "string" ? resp.name : "unknown";
-	const pending = lastCallIdByName?.get(name);
-	const correlated = pending?.[0];
+	const correlated = lastCallIdByName?.get(name);
 	const id =
 		typeof resp.id === "string" && resp.id.length > 0
 			? resp.id
 			: (correlated ?? `gemini_resp_${name}_${Math.random().toString(36).slice(2, 10)}`);
-	if (pending) {
-		const index = pending.indexOf(id);
-		if (index >= 0) pending.splice(index, 1);
-		if (pending.length === 0) lastCallIdByName?.delete(name);
+	if (correlated !== undefined && id === correlated) {
+		lastCallIdByName?.delete(name);
 	}
 	const response = resp.response;
 	let isError = false;
@@ -350,7 +287,7 @@ function walkContents(
 	timestamp: number,
 ): void {
 	// Correlate id-less functionResponse parts with the preceding functionCall of the same name.
-	const lastCallIdByName = new Map<string, string[]>();
+	const lastCallIdByName = new Map<string, string>();
 	for (const item of contents) {
 		if (!isRecord(item)) continue;
 		const role = classifyRole(item.role) ?? "user";
@@ -389,33 +326,6 @@ function walkContents(
 			messages.push(result);
 		}
 	}
-	for (const response of blocks.toolResponses) {
-		const match = findCallId(messages, response.name, usedCalls);
-		messages.push({
-			role: "toolResult",
-			toolCallId: match ?? `gemini-unpaired-${response.name}`,
-			toolName: response.name,
-			content: [{ type: "text", text: response.text }],
-			isError: false,
-			timestamp,
-		});
-	}
-}
-
-/** Pair a function response with the most recent unmatched same-name call. */
-function findCallId(messages: Message[], name: string, usedCalls: Set<string>): string | undefined {
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const message = messages[i];
-		if (message.role !== "assistant") continue;
-		for (const block of message.content) {
-			if (block.type !== "toolCall") continue;
-			if (name !== "" && block.name !== name) continue;
-			if (usedCalls.has(block.id)) continue;
-			usedCalls.add(block.id);
-			return block.id;
-		}
-	}
-	return undefined;
 }
 
 function walkMessages(
@@ -429,7 +339,7 @@ function walkMessages(
 		if (!isRecord(item)) continue;
 		const role = classifyRole(item.role);
 		if (role === undefined) continue;
-		pushTurn(messages, systemParts, role, textFromOpenAiContent(item.content), [], new Set(), modelId, timestamp);
+		pushTurn(messages, systemParts, role, textFromOpenAiContent(item.content), modelId, timestamp);
 	}
 }
 
@@ -559,7 +469,6 @@ export function parseRequest(body: unknown, _headers?: Headers, defaultStream = 
 	if (toolChoice !== undefined) options.toolChoice = toolChoice;
 
 	const context: Context = {
-		...(tools ? { tools } : {}),
 		messages,
 		...(systemParts.length > 0 ? { systemPrompt: systemParts } : {}),
 		...(tools ? { tools } : {}),
@@ -571,30 +480,6 @@ export function parseRequest(body: unknown, _headers?: Headers, defaultStream = 
 		stream: typeof body.stream === "boolean" ? body.stream : defaultStream,
 		options,
 	};
-}
-
-/** Translate Gemini `tools[].functionDeclarations` into canonical `Context.tools`. */
-function buildToolsFromGeminiBody(tools: unknown): Context["tools"] | undefined {
-	if (!Array.isArray(tools) || tools.length === 0) return undefined;
-	const out: NonNullable<Context["tools"]> = [];
-	for (const entry of tools) {
-		if (!isRecord(entry)) continue;
-		const decls = entry.functionDeclarations ?? entry.function_declarations;
-		if (!Array.isArray(decls)) continue;
-		for (const decl of decls) {
-			if (!isRecord(decl) || typeof decl.name !== "string" || decl.name.length === 0) continue;
-			const parameters = (decl.parametersJsonSchema ??
-				decl.parameters_json_schema ??
-				decl.parameters ??
-				{}) as NonNullable<Context["tools"]>[number]["parameters"];
-			out.push({
-				name: decl.name,
-				description: typeof decl.description === "string" ? decl.description : "",
-				parameters,
-			});
-		}
-	}
-	return out.length > 0 ? out : undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -672,22 +557,6 @@ export function encodeStream(
 
 	return new ReadableStream<Uint8Array>({
 		async start(controller) {
-			const emittedCalls = new Set<string>();
-			const emitCall = (call: ToolCall) => {
-				if (emittedCalls.has(call.id)) return;
-				emittedCalls.add(call.id);
-				writeSse(
-					controller,
-					{
-						...geminiCandidate(
-							[{ functionCall: { name: call.name, args: call.arguments, id: call.id } }],
-							undefined,
-						),
-						modelVersion: requestedModelId,
-					},
-					cancelled,
-				);
-			};
 			try {
 				if (cancelled) {
 					controller.close();
@@ -708,7 +577,6 @@ export function encodeStream(
 						case "toolcall_end": {
 							// Gemini functionCall parts are complete calls, not argument deltas.
 							const call = event.toolCall;
-							if (call === undefined) break;
 							writeSse(
 								controller,
 								{
@@ -729,10 +597,8 @@ export function encodeStream(
 								cancelled,
 							);
 							break;
+						}
 						case "done":
-							for (const part of event.message.content) {
-								if (part.type === "toolCall") emitCall(part);
-							}
 							writeSse(
 								controller,
 								{

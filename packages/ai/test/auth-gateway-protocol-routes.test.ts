@@ -50,7 +50,7 @@ describe("auth-gateway protocol routes over HTTP", () => {
 			const json = await fetch(`${url}/v1beta/models/known-model:generateContent`, {
 				method: "POST",
 				headers: { "Content-Type": "application/json", Authorization: "Bearer t" },
-				body: JSON.stringify({}),
+				body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "hello" }] }] }),
 			});
 			expect(json.status).toBe(200);
 			expect(json.headers.get("content-type")).toContain("application/json");
@@ -58,7 +58,7 @@ describe("auth-gateway protocol routes over HTTP", () => {
 			const stream = await fetch(`${url}/v1beta/models/known-model:streamGenerateContent`, {
 				method: "POST",
 				headers: { "Content-Type": "application/json", Authorization: "Bearer t" },
-				body: JSON.stringify({}),
+				body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "hello" }] }] }),
 			});
 			expect(stream.status).toBe(200);
 			expect(stream.headers.get("content-type")).toContain("text/event-stream");
