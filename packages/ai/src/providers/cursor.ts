@@ -409,16 +409,6 @@ export interface CursorOptions extends StreamOptions {
 	cursorLocalCliMode?: boolean;
 	/** Statsig experiment overrides (`x-dev-experiment-overrides`). */
 	cursorDevExperimentOverrides?: string;
-	/** Populates `AgentRunRequest.client_supports_inline_images`. */
-	cursorClientSupportsInlineImages?: boolean;
-	/** Populates `AgentRunRequest.client_supports_routed_model_update`. */
-	cursorClientSupportsRoutedModelUpdate?: boolean;
-	/** Populates `AgentRunRequest.client_supports_prompt_context_usage_rpc`. */
-	cursorClientSupportsPromptContextUsageRpc?: boolean;
-	/** Populates `AgentRunRequest.run_id`. */
-	cursorRunId?: string;
-	/** Populates `AgentRunRequest.agent_session_id`. */
-	cursorAgentSessionId?: string;
 }
 
 type CursorWireMode = "normalized" | "discovered";

@@ -63,6 +63,34 @@ import { ExtensionRunner } from "./extensibility/extensions/runner";
 import type { ExtensionUIContext } from "./extensibility/extensions/types";
 import { scheduleMarketplaceAutoUpdate } from "./extensibility/plugins/marketplace-auto-update";
 import { registerDaemonProjectPresence } from "./launch/presence";
+
+type ModelRoleLookup = { getModelRole(role: string): string | undefined };
+
+function expandReviewRoleSelector(selector: string | undefined, lookup: ModelRoleLookup): string | undefined {
+	if (!selector) return undefined;
+	let current = selector.trim();
+	const seen = new Set<string>();
+	while (current.startsWith("@") || current === "*") {
+		if (seen.has(current)) return undefined;
+		seen.add(current);
+		const role = current === "*" ? "default" : current.slice(1);
+		const next = lookup.getModelRole(role);
+		if (!next) return undefined;
+		current = next.trim();
+	}
+	return current;
+}
+
+export function resolveCredentialScopedRefreshTarget(
+	parsed: Pick<Args, "model" | "models">,
+	lookup: ModelRoleLookup,
+): { providerId: string; selectors: Pick<Args, "model" | "models"> } | undefined {
+	const model = expandReviewRoleSelector(parsed.model, lookup);
+	if (!model) return undefined;
+	const parsedModel = parseModelString(model);
+	if (!parsedModel?.provider) return undefined;
+	return { providerId: parsedModel.provider.toLowerCase(), selectors: { model, models: parsed.models } };
+}
 import { discoverStartupLspServers } from "./lsp/servers";
 import type { MCPManager } from "./mcp";
 import { InteractiveMode } from "./modes/interactive-mode";
