@@ -1011,7 +1011,7 @@ export function encodeStream(
 				openItemsByContentIndex.get(contentIndex) ?? null;
 
 			const responseSnapshot = (status: ResponseStatus, output: OutputItem[] | []) => ({
-				id: responseId,
+				id: responseId ?? makeRespId(),
 				object: "response",
 				created_at: createdAt,
 				status,
@@ -1020,6 +1020,17 @@ export function encodeStream(
 				usage: null,
 				incomplete_details: incompleteDetailsForStatus(status),
 			});
+			const chooseResponseId = (candidate?: string): string => {
+				if (responseId === undefined) responseId = candidate ?? makeRespId();
+				return responseId;
+			};
+			const emitPreamble = (): void => {
+				if (preambleEmitted) return;
+				chooseResponseId();
+				preambleEmitted = true;
+				emit("response.created", { response: responseSnapshot("in_progress", []) });
+				emit("response.in_progress", { response: responseSnapshot("in_progress", []) });
+			};
 
 			const openMessage = (signature: MessageSignature | undefined, sourceContentIndex: number): OpenMessage => {
 				const itemOutputIndex = allocateOutputIndex();
@@ -1518,6 +1529,7 @@ export function encodeStream(
 				}
 
 				if (failureMessage) {
+					emitPreamble();
 					closeAllOpenItems();
 					controller.enqueue(
 						encoder.encode(
@@ -1538,6 +1550,8 @@ export function encodeStream(
 
 				closeAllOpenItems();
 				const message = finalMessage ?? ((await events.result().catch(() => null)) as AssistantMessage | null);
+				if (message?.responseId) chooseResponseId(message.responseId);
+				emitPreamble();
 
 				// Build the canonical output from the final message so non-streaming
 				// readers see the exact same shape they'd get from encodeResponse().
