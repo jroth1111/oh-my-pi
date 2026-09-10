@@ -312,6 +312,9 @@
 
 - Devin chat now uses CLI-compatible authentication and transport while preserving model assignment and caller generation settings ([#8534](https://github.com/can1357/oh-my-pi/pull/8534)).
 
+- Product-surface model restrictions no longer rotate otherwise valid credentials.
+- Fixed gateway error classification swallowing retryable failures: authoritative statuses now outrank abort wording, 403 account caps rotate as quota, Trusted-Access/cyber-policy denials rotate credentials instead of terminating, 400 model-missing responses fail over by model, dead OAuth grants (`invalid_token` et al) retire permanently, and concurrency-cap 429s stay in provider backoff.
+- Fixed gateway classification for structurally flagged authentication failures and transient provider errors, including exhausted Anthropic 409 conflicts; strict-tool fallback now preserves storage overrides from the actual first request payload.
 
 ## [18.1.14] - 2026-09-07
 
@@ -551,6 +554,7 @@
 - Auth gateway `GET /v1/routes/:id` returns a registered virtual route.
 - Auth gateway `PUT /v1/routes/:id` registers or replaces a virtual route.
 - Auth gateway `DELETE /v1/routes/:id` unregisters a virtual route.
+- Devin parallel tool calls follow `compat.supportsParallelToolCalls` instead of being disabled unconditionally, so natively discovered configs that support parallelism can use it ([#8590](https://github.com/can1357/oh-my-pi/pull/8590) by [@will-bogusz](https://github.com/will-bogusz)).
 - Updated OpenAI Codex requests to improve routing by communicating the selected model and service tier across Responses, WebSocket, and remote-compaction requests.
 
 ## [18.1.7] - 2026-09-03
