@@ -339,6 +339,8 @@
 - Auth gateway can load virtual routes from a JSON/JSON5 file.
 - Unavailable models select model fallbacks, and empty stream preludes no longer prevent failover.
 - Fixed concurrent credential probes and permanent-credential fallback; stateful continuations keep their target and reject ambiguous account selection.
+- Ambiguous duplicate route targets are rejected instead of creating unreachable fallback branches.
+- Fixed concurrent credential probes and prevented nested fallback routes from selecting targets in unrelated branches.
 
 
 ## [18.1.14] - 2026-09-07

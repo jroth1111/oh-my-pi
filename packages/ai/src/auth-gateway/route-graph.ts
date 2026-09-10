@@ -60,6 +60,8 @@ type ResolveModel = (modelId: string) => Model<Api> | undefined;
 
 type NodeCompile = {
 	targets: string[];
+	entries: string[];
+	byTarget: Map<string, Partial<Record<GatewayErrorDisposition, string[]>>>;
 	fallbacks: Partial<Record<GatewayErrorDisposition, string[]>>;
 };
 
@@ -308,6 +310,8 @@ function compileFallback(node: FallbackNode, seenOnPath: ReadonlySet<string>): N
 	const targets: string[] = [];
 	const fallbacks: Partial<Record<GatewayErrorDisposition, string[]>> = {};
 	const afterPrimary: string[] = [];
+	const parts: NodeCompile[] = [];
+	const byTarget: NodeCompile["byTarget"] = new Map();
 	const sequential = new Set(seenOnPath);
 	let primary = true;
 	for (const child of node.children) {
@@ -315,6 +319,8 @@ function compileFallback(node: FallbackNode, seenOnPath: ReadonlySet<string>): N
 		// inherit sequential sibling targets — those are other leaves.
 		const childSeen = new Set(child.type === "target" ? sequential : seenOnPath);
 		const part = compileNode(child, childSeen);
+		parts.push(part);
+		for (const [id, edges] of part.byTarget) if (!byTarget.has(id)) byTarget.set(id, { ...edges });
 		targets.push(...part.targets);
 		if (!primary) afterPrimary.push(...part.targets);
 		else afterPrimary.push(...initialBalancedTargets(child));
@@ -341,7 +347,21 @@ function compileFlatten(children: readonly RouteNode[], seenOnPath: ReadonlySet<
 		mergeFallbacks(fallbacks, part.fallbacks);
 		if (child.type === "target") sequential.add(child.model);
 	}
-	return { targets, fallbacks };
+	for (let index = 0; index < parts.length; index++) {
+		const nextEntries = parts.slice(index + 1).flatMap(part => part.entries);
+		for (const from of parts[index]!.targets) {
+			const edges = byTarget.get(from)!;
+			for (const disposition of node.on)
+				edges[disposition] = [...new Set([...(edges[disposition] ?? []), ...nextEntries])].filter(
+					id => id !== from,
+				);
+		}
+	}
+	for (const disposition of Object.keys(fallbacks) as GatewayErrorDisposition[]) {
+		const included = new Set(fallbacks[disposition]);
+		fallbacks[disposition] = [...new Set(targets.filter(id => included.has(id)))];
+	}
+	return { targets, entries: parts[0]!.entries, byTarget, fallbacks };
 }
 
 function copyNode(node: RouteNode): RouteNode {
