@@ -285,6 +285,8 @@
 - Fixed auth-gateway model discovery treating non-2xx responses with array/`data` bodies as successful catalogs.
 - Fixed auth-gateway SSE streams leaking turn reservations when `reader.read()` rejects after the response is returned.
 - Fixed OpenAI Responses file-id compatibility being checked only against the initial route target; fallback targets are revalidated before dispatch.
+- Fixed conditional and domain routing, forward route references, Gemini multimodal requests, and token estimates that omitted system prompts or tools.
+
 - Honour balance rr/weighted strategies on first dispatch, and resolve replaceAll route-refs against the complete incoming definition set.
 - Renew in-flight turn reservations for the lifetime of the SSE stream, defer OpenAI file_id compat until a catalog target binds, and route temporary credential unavailability through the conductor before 401.
 - Reject shared 100.64/10 discovery hosts, gate previous_response_id fallbacks by Responses-compatible APIs, and detect OpenAI file refs in user/assistant messages.
