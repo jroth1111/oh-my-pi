@@ -1178,15 +1178,19 @@ async function handleFormatEndpoint(
 			};
 		}
 		try {
-			apiKey = await bootOpts.storage.getApiKey(model.provider, sessionId, {
-				modelId: model.id,
+			apiKey = await bootOpts.storage.getApiKey(activeModel.provider, sessionId, {
+				modelId: activeModel.id,
 				signal: controller.signal,
 				requestId,
 			});
 		} catch (error) {
 			if (controller.signal.aborted) return { type: "respond", response: clientClosedResponse(route) };
 			const classified = classifyGatewayError(error);
-			logger.warn("auth-gateway getApiKey threw", { provider: model.provider, peer, error: classified.message });
+			logger.warn("auth-gateway getApiKey threw", {
+				provider: activeModel.provider,
+				peer,
+				error: classified.message,
+			});
 			if (considerFallback(classified)) return { type: "retry" };
 			return { type: "respond", response: classifiedError(classified) };
 		}
@@ -1291,8 +1295,8 @@ async function handleFormatEndpoint(
 					requestId,
 					format: route.label,
 					model: parsed.modelId,
-					resolvedProvider: model.provider,
-					resolvedModel: model.id,
+					resolvedProvider: activeModel.provider,
+					resolvedModel: activeModel.id,
 					stream: parsed.stream,
 					peer,
 				});
@@ -1344,7 +1348,7 @@ async function handleFormatEndpoint(
 					return json(
 						200,
 						route.module.encodeResponse(message, parsed.modelId),
-						gatewayResponseHeaders(model, { requestId, message, startedAt }),
+						gatewayResponseHeaders(activeModel, { requestId, message, startedAt }),
 					);
 				} catch (error) {
 					if (controller.signal.aborted) return clientClosedResponse(route);
@@ -1407,14 +1411,14 @@ async function handleFormatEndpoint(
 			requestId,
 			format: route.label,
 			model: parsed.modelId,
-			resolvedProvider: model.provider,
-			resolvedModel: model.id,
+			resolvedProvider: activeModel.provider,
+			resolvedModel: activeModel.id,
 			stream: parsed.stream,
 			peer,
 		});
 		let events: AssistantMessageEventStream;
 		try {
-			events = streamSimple(model, parsed.context, streamOpts);
+			events = streamSimple(activeModel, parsed.context, streamOpts);
 		} catch (error) {
 			const classified = classifyGatewayError(error);
 			logger.warn("auth-gateway streamSimple threw", { format: route.label, error: classified.message, peer });
@@ -1499,7 +1503,7 @@ async function handleFormatEndpoint(
 		return new Response(sseStream, {
 			status: 200,
 			headers: {
-				...gatewayResponseHeaders(model, { requestId }),
+				...gatewayResponseHeaders(activeModel, { requestId }),
 				"Content-Type": "text/event-stream; charset=utf-8",
 				"Cache-Control": "no-cache",
 				Connection: "keep-alive",
@@ -1758,15 +1762,19 @@ async function handlePiNative(
 			};
 		}
 		try {
-			apiKey = await bootOpts.storage.getApiKey(model.provider, sessionId, {
-				modelId: model.id,
+			apiKey = await bootOpts.storage.getApiKey(activeModel.provider, sessionId, {
+				modelId: activeModel.id,
 				signal: controller.signal,
 				requestId,
 			});
 		} catch (error) {
 			if (controller.signal.aborted) return { type: "respond", response: aborted() };
 			const classified = classifyGatewayError(error);
-			logger.warn("auth-gateway getApiKey threw", { provider: model.provider, peer, error: classified.message });
+			logger.warn("auth-gateway getApiKey threw", {
+				provider: activeModel.provider,
+				peer,
+				error: classified.message,
+			});
 			if (considerFallback(classified)) return { type: "retry" };
 			return { type: "respond", response: classifiedError(classified) };
 		}
@@ -1815,6 +1823,7 @@ async function handlePiNative(
 	};
 
 	const buildAttemptStreamOpts = (apiKey: string): SimpleStreamOptions => {
+		const activeModel = requireModel();
 		// Build the SimpleStreamOptions actually handed to `streamSimple`. We
 		// trust the client's options (already allow-listed by `parseRequest`) and
 		// only inject server-controlled fields. The codex sampling strip mirrors
@@ -1888,8 +1897,8 @@ async function handlePiNative(
 					requestId,
 					format: "pi-native",
 					model: parsed.modelId,
-					resolvedProvider: model.provider,
-					resolvedModel: model.id,
+					resolvedProvider: activeModel.provider,
+					resolvedModel: activeModel.id,
 					stream: parsed.stream,
 					peer,
 				});
@@ -1994,14 +2003,14 @@ async function handlePiNative(
 			requestId,
 			format: "pi-native",
 			model: parsed.modelId,
-			resolvedProvider: model.provider,
-			resolvedModel: model.id,
+			resolvedProvider: activeModel.provider,
+			resolvedModel: activeModel.id,
 			stream: parsed.stream,
 			peer,
 		});
 		let events: AssistantMessageEventStream;
 		try {
-			events = streamSimple(model, parsed.context, streamOpts);
+			events = streamSimple(activeModel, parsed.context, streamOpts);
 		} catch (error) {
 			const classified = classifyGatewayError(error);
 			logger.warn("auth-gateway streamSimple threw", { format: "pi-native", error: classified.message, peer });
@@ -2084,7 +2093,7 @@ async function handlePiNative(
 		return new Response(sseStream, {
 			status: 200,
 			headers: {
-				...gatewayResponseHeaders(model, { requestId }),
+				...gatewayResponseHeaders(activeModel, { requestId }),
 				"Content-Type": "text/event-stream; charset=utf-8",
 				"Cache-Control": "no-cache",
 				Connection: "keep-alive",
