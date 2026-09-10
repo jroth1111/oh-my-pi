@@ -204,6 +204,11 @@
 - Fixed auth-gateway model discovery treating non-2xx responses with array/`data` bodies as successful catalogs.
 - Fixed auth-gateway SSE streams leaking turn reservations when `reader.read()` rejects after the response is returned.
 - Fixed OpenAI Responses file-id compatibility being checked only against the initial route target; fallback targets are revalidated before dispatch.
+- Fixed weighted target dispatch, deployment affinity, tool capability checks, and concurrent API-key reservations.
+
+- Fixed auth-gateway SSE streams leaking turn reservations when `reader.read()` rejects.
+- Fixed `/v1/messages/count_tokens` resolving only concrete catalog models; virtual routes are registry-aware.
+- Fixed Anthropic count-tokens accepting missing/non-array `messages` and ignoring `system`/`tools` in the estimate.
 ## [18.1.14] - 2026-09-07
 
 ### Fixed

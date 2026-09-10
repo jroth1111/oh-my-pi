@@ -83,6 +83,9 @@
 - Grok Bot Auto routers bake catalog `sand-wire-model-id=sand-default` so parent-chat rewrite no longer special-cases `sand-cua` in TypeScript.
 - Grok Bot auth is only advertised when both the renewer and machine id are present, so models are not selectable before streaming can succeed.
 - Grok Bot exports `resolveGrokbotMachineId` so CLI credential overrides can require the same machine-id pair as env auth.
+### Fixed
+
+- Gateway surface API eligibility now comes from compiled runtime KDL policy, preserving custom identifiers and explicit exclusions.
 
 ## [18.1.14] - 2026-09-07
 
