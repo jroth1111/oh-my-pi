@@ -63,6 +63,10 @@ describe("auth-gateway StreamCommitGate wiring", () => {
 			const body = await res.text();
 			expect(body.length).toBeGreaterThan(0);
 			expect(states.some(s => s === "committed" || s === "terminated")).toBe(true);
+			expect(classify.mock.calls.length).toBeGreaterThan(0);
+			// Bytes must actually flow through the hold wrapper, not just
+			// trigger observation while the stream stays empty.
+			expect(body).toContain("hello");
 		} finally {
 			classify.mockRestore();
 			await gw.close();

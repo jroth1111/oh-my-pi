@@ -114,6 +114,8 @@ export interface OpenAIResponsesOptions extends StreamOptions {
 	serviceTier?: ServiceTier;
 	textVerbosity?: "low" | "medium" | "high";
 	toolChoice?: ToolChoice;
+	/** Persist the response for later previous_response_id continuation. */
+	store?: boolean;
 	openrouterVariant?: string;
 	maxTokensExplicit?: boolean;
 	disableReasoning?: boolean;
