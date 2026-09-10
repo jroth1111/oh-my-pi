@@ -297,6 +297,11 @@
 
 - Quota probes require a requestId; balance routes pick the initial target via rr/weighted strategy.
 - Fixed auth-gateway credential disable returning success before a remote broker disable completed; the handler now awaits the remote path when present.
+### Changed
+
+- Devin chat now uses CLI-compatible authentication and transport while preserving model assignment and caller generation settings ([#8534](https://github.com/can1357/oh-my-pi/pull/8534)).
+
+
 ## [18.1.14] - 2026-09-07
 
 ### Fixed
