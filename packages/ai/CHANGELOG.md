@@ -309,6 +309,7 @@
 - Fixed auth-gateway SSE streams leaking turn reservations when `reader.read()` rejects.
 - Fixed `/v1/messages/count_tokens` resolving only concrete catalog models; virtual routes are registry-aware.
 - Fixed Anthropic count-tokens accepting missing/non-array `messages` and ignoring `system`/`tools` in the estimate.
+- Model discovery blocks private DNS and IPv6 addresses and rejects unsuccessful HTTP responses.
 - Fixed Gemini URL routing and tool calls, conditional routing, conversation affinity, and stream health updates after late failures.
 
 - Fixed auth-gateway streaming retries leaving StreamCommitGate terminated; the gate resets between attempts.

@@ -480,6 +480,39 @@ function hashString(value: string): number {
 	return h;
 }
 
+function hashString(value: string): number {
+	let h = 0;
+	for (let i = 0; i < value.length; i++) h = (h * 31 + value.charCodeAt(i)) | 0;
+	return h;
+}
+
+/**
+ * Resolve the first viable dispatch target for a compiled route. A primary
+ * that is absent from the catalog (stale route, credential-scoped model
+ * change) is marked attempted and the conductor advances to the next sibling
+ * instead of 404ing a route with usable fallbacks.
+ */
+function resolveFirstAvailableTarget(
+	compiled: CompiledRoute,
+	resolveModel: (id: string) => Model<Api> | undefined,
+	firstTarget: string,
+	attemptedTargets: Set<string>,
+): { target: string; model: Model<Api> | undefined } {
+	let current = firstTarget;
+	for (;;) {
+		const model = resolveModel(current);
+		if (model !== undefined) return { target: current, model };
+		attemptedTargets.add(current);
+		const next = decideAttempt({
+			route: compiled,
+			state: conductorExecutionState(compiled, attemptedTargets, new Set<number>(), 0, 0, current, false, "probing"),
+			commitState: "probing",
+		});
+		if (next.type !== "dispatch") return { target: current, model: undefined };
+		current = next.targetModelId;
+	}
+}
+
 function unknownModelResponse(formatError: FormatErrorFn, modelId: string): Response {
 	return formatError(404, "invalid_request_error", `Unknown model: ${modelId}`);
 }
@@ -748,8 +781,11 @@ export function releaseTurnOnStreamEnd(
 		released = true;
 		if (commitGate?.sawSuccessfulTerminal) {
 			storage.settleQuotaProbeSuccess(requestId);
+		} else {
+			storage.clearQuotaProbe(requestId);
 		}
 		storage.releaseTurnReservation(requestId);
+		await onSettled?.(outcome);
 	};
 	return new ReadableStream({
 		async pull(controller) {
@@ -857,7 +893,7 @@ function rememberPromptCacheHit(
 }
 
 async function handleFormatEndpoint(
-	route: { module: FormatModule; label: string },
+	route: { module: FormatModule; label: string; pathModel?: string; pathStream?: boolean },
 	bootOpts: AuthGatewayBootOptions,
 	req: Request,
 	peer: string,
@@ -898,6 +934,14 @@ async function handleFormatEndpoint(
 	// All three supported wire formats put the model id on a top-level `model`
 	// field. Read it without running the full strict schema so the route can
 	// produce a coherent error envelope when the model id is missing.
+	if (route.pathModel !== undefined && isRecord(body)) {
+		body = {
+			...body,
+			model: typeof body.model === "string" && body.model.length > 0 ? body.model : route.pathModel,
+			stream: typeof body.stream === "boolean" ? body.stream : route.pathStream,
+		};
+	}
+
 	const modelId =
 		typeof body === "object" && body !== null && typeof (body as { model?: unknown }).model === "string"
 			? (body as { model: string }).model
@@ -2513,6 +2557,42 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 						return withCors(
 							await handleFormatEndpoint(
 								{ module, label: "gemini-v1beta" },
+								boot,
+								req,
+								peer,
+								health,
+								cacheStore,
+							),
+							req,
+						);
+					}
+				}
+
+				// Native Gemini paths carry the model in the URL. Inject it (and
+				// the endpoint's streaming mode) so the module sees a complete body.
+				if (req.method === "POST") {
+					const geminiPath = GEMINI_MODEL_PATH.exec(pathname);
+					if (geminiPath) {
+						let pathModel: string;
+						try {
+							pathModel = decodeURIComponent(geminiPath[1]!);
+						} catch {
+							return withCors(json(400, { error: "invalid model path encoding" }), req);
+						}
+						const streaming = geminiPath[2] === "streamGenerateContent";
+						const module = {
+							...geminiV1beta,
+							parseRequest: (body: unknown, headers?: Headers) => {
+								if (!isRecord(body)) return geminiV1beta.parseRequest(body, headers);
+								let injected = body;
+								if (typeof injected.model !== "string") injected = { ...injected, model: pathModel };
+								if (typeof injected.stream !== "boolean") injected = { ...injected, stream: streaming };
+								return geminiV1beta.parseRequest(injected, headers);
+							},
+						};
+						return withCors(
+							await handleFormatEndpoint(
+								{ module, label: "gemini-v1beta", pathModel, pathStream: streaming },
 								boot,
 								req,
 								peer,

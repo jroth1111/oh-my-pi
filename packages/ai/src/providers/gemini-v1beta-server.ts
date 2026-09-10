@@ -21,6 +21,7 @@ import type {
 	Context,
 	ImageContent,
 	Message,
+	ImageContent,
 	ServiceTier,
 	StopReason,
 	TextContent,
@@ -54,14 +55,69 @@ function readStringArray(value: unknown): string[] | undefined {
 }
 
 function textFromGeminiParts(parts: unknown): string {
-	if (!Array.isArray(parts)) return "";
-	let text = "";
+	return blocksFromGeminiParts(parts).text;
+}
+
+interface GeminiPartBlocks {
+	text: string;
+	images: ImageContent[];
+	toolCalls: ToolCall[];
+	toolResponses: Array<{ name: string; text: string }>;
+}
+
+/** Split native Gemini parts into text, images, tool calls, and tool responses. */
+function blocksFromGeminiParts(parts: unknown): GeminiPartBlocks {
+	const out: GeminiPartBlocks = { text: "", images: [], toolCalls: [], toolResponses: [] };
+	if (!Array.isArray(parts)) return out;
 	for (const part of parts) {
 		if (!isRecord(part)) continue;
 		if (part.thought === true) continue;
-		if (typeof part.text === "string") text += part.text;
+		if (typeof part.text === "string") {
+			out.text += part.text;
+			continue;
+		}
+		if (isRecord(part.inlineData)) {
+			const data = part.inlineData.data;
+			const mimeType = part.inlineData.mimeType;
+			if (typeof data === "string" && data.length > 0 && typeof mimeType === "string" && mimeType.length > 0) {
+				out.images.push({ type: "image", data, mimeType });
+			}
+			continue;
+		}
+		if (isRecord(part.fileData)) {
+			const fileUri = part.fileData.fileUri;
+			if (typeof fileUri === "string" && fileUri.length > 0) {
+				const mimeType =
+					typeof part.fileData.mimeType === "string" && part.fileData.mimeType.length > 0
+						? part.fileData.mimeType
+						: "image/png";
+				out.images.push({ type: "image", data: "", mimeType, url: fileUri });
+			}
+			continue;
+		}
+		if (isRecord(part.functionCall)) {
+			const name = part.functionCall.name;
+			if (typeof name === "string" && name.length > 0) {
+				const args = part.functionCall.args;
+				out.toolCalls.push({
+					type: "toolCall",
+					id: `gemini-fc-${out.toolCalls.length}`,
+					name,
+					arguments: isRecord(args) ? args : {},
+				});
+			}
+			continue;
+		}
+		if (isRecord(part.functionResponse)) {
+			const name = part.functionResponse.name;
+			const response = part.functionResponse.response;
+			out.toolResponses.push({
+				name: typeof name === "string" ? name : "",
+				text: typeof response === "string" ? response : JSON.stringify(response ?? null),
+			});
+		}
 	}
-	return text;
+	return out;
 }
 
 function readInlineData(part: Record<string, unknown>): ImageContent | undefined {
@@ -326,6 +382,33 @@ function walkContents(
 			messages.push(result);
 		}
 	}
+	for (const response of blocks.toolResponses) {
+		const match = findCallId(messages, response.name, usedCalls);
+		messages.push({
+			role: "toolResult",
+			toolCallId: match ?? `gemini-unpaired-${response.name}`,
+			toolName: response.name,
+			content: [{ type: "text", text: response.text }],
+			isError: false,
+			timestamp,
+		});
+	}
+}
+
+/** Pair a function response with the most recent unmatched same-name call. */
+function findCallId(messages: Message[], name: string, usedCalls: Set<string>): string | undefined {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const message = messages[i];
+		if (message.role !== "assistant") continue;
+		for (const block of message.content) {
+			if (block.type !== "toolCall") continue;
+			if (name !== "" && block.name !== name) continue;
+			if (usedCalls.has(block.id)) continue;
+			usedCalls.add(block.id);
+			return block.id;
+		}
+	}
+	return undefined;
 }
 
 function walkMessages(
@@ -339,7 +422,7 @@ function walkMessages(
 		if (!isRecord(item)) continue;
 		const role = classifyRole(item.role);
 		if (role === undefined) continue;
-		pushTurn(messages, systemParts, role, textFromOpenAiContent(item.content), modelId, timestamp);
+		pushTurn(messages, systemParts, role, textFromOpenAiContent(item.content), [], new Set(), modelId, timestamp);
 	}
 }
 
@@ -469,6 +552,7 @@ export function parseRequest(body: unknown, _headers?: Headers, defaultStream = 
 	if (toolChoice !== undefined) options.toolChoice = toolChoice;
 
 	const context: Context = {
+		...(tools ? { tools } : {}),
 		messages,
 		...(systemParts.length > 0 ? { systemPrompt: systemParts } : {}),
 		...(tools ? { tools } : {}),
