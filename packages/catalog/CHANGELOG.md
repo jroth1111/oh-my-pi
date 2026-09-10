@@ -26,6 +26,19 @@
 
 - Regenerated Cursor `cursor-proto.ts` from the vendored `agent.proto` (`bun run gen:proto`): `AgentRunRequest` gains fields 10–28 (capability flags, session ids, subagent/harness members) plus new server messages (`ttftBreakdown`, …).
 - Cursor discovery records the verbatim roster id as `requestModelId` on the `auto` entry so the provider echoes it instead of the synthetic `default` wire id.
+- Grok Bot AvailableModels namespace-only overrides recompute `clientVersion` (e.g. `lab` → `0.30.0-lab`) via the discovery identity helper.
+- Retain cached model catalogs when Grok Bot discovery returns malformed or empty results.
+
+- Grok Bot sand router union and offline seeds share one `GROKBOT_SAND_ROUTER_IDS` roster (no divergent discovery hard-code).
+- Grok Bot `buildModel` always reapplies KDL-owned Sand wire/retry/promote policy over stale cached values so offline rebuilds pick up rule changes.
+- Grok Bot live AvailableModels rows always stamp an empty thinking ladder when non-reasoning; synthetic sand routers stay on the separate `buildSandRouterSpec` path so KDL `reasoning` fills are not gated by a TypeScript router-id list.
+- Grok Bot Gemini/OpenAI native tool-schema projection is owned by KDL `sand-native-tool-schema` (`google` / `strict`) so rows can override without TypeScript class branches.
+- Grok Bot Anthropic+tools auto wire defaults to catalog `sand-tools-wire` (KDL class anthropic → keep-model); TypeScript no longer forces keep-model from taxonomy class.
+- Grok Bot / Devin gen:models exclusions derive from KDL `credential-scoped-catalog` (no TypeScript provider-name table).
+- Grok Bot is excluded from `gen:models` catalog discovery (credential-scoped like Devin) so a maintainer renewer cannot bake AvailableModels into the shared `models.json`.
+- Grok Bot `gemini-*` rows declare `sand-empty-tools-retry-wire keep-model` so empty first tool turns replay on product Shell/Read/Write without a TypeScript class branch.
+- Grok Bot `gemini-*` rows declare `sand-accept-empty-write-followup` so empty Write follow-ups are accepted via catalog policy, not a Gemini class check.
+- Grok Bot merge authority for live input/limits/reasoning uses KDL `credential-scoped-catalog` (no `provider === "grokbot"` TypeScript lists).
 - Grok Bot backend URL join appends endpoints onto the pathname while preserving reverse-proxy query strings, including trailing `/` inside query values (mint + AvailableModels).
 - Grok Bot AvailableModels discovery passes the configured base URL unmodified into `joinGrokbotBackendUrl` (no whole-URL trailing-slash strip before parse).
 - Opaque Grok Bot variant/legacy selectors resolve full model policy (identity, thinking, compat, catalog assignments/corrections) from `requestModelId` in `buildModel`.

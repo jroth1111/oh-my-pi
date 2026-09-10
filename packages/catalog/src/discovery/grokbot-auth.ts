@@ -7,7 +7,7 @@
  */
 import * as path from "node:path";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { $env, getAgentDir, logger, parseEnvFile, parseEnvFileAsync } from "@oh-my-pi/pi-utils";
+import { $env, AUTHENTICATED_SENTINEL, getAgentDir, logger, parseEnvFile, parseEnvFileAsync } from "@oh-my-pi/pi-utils";
 import type { FetchImpl } from "../types";
 
 export const GROKBOT_BACKEND = "https://api2.cursor.sh";
@@ -40,7 +40,7 @@ export const GROKBOT_DEFAULT_NAMESPACE = "prod";
 export const GROKBOT_DEFAULT_TOKEN_TTL_MS = 10 * 60_000;
 
 /** Shared with Bedrock/Vertex env hooks — not a literal renewal credential. */
-export const GROKBOT_AUTHENTICATED_SENTINEL = "<authenticated>";
+export const GROKBOT_AUTHENTICATED_SENTINEL = AUTHENTICATED_SENTINEL;
 const STAMPED_VERSION_BASE = /^(\d+\.\d+\.\d+)(?:-.+)?$/;
 
 /**

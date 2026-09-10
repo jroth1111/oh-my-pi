@@ -89,6 +89,7 @@ function resolveSandEffortWireValue(
 ): string | undefined {
 	const explicit = toSandEffortValue(options?.effort, options?.effortMap);
 	if (explicit) return explicit;
+	if (options?.thinking === false) return undefined;
 	const defaults = options?.sandParameterDefaults;
 	if (allowed.has("effort")) {
 		const value = defaults?.effort?.trim();
