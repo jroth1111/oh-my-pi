@@ -1993,6 +1993,7 @@ export class TurnRecovery {
 				const resolved = resolveModelOverride([selector.raw], this.#host.modelRegistry, this.#host.settings);
 				const candidate = resolved.model ?? this.#host.modelRegistry.find(selector.provider, selector.id);
 				if (!candidate) continue;
+				if (options?.excludeProvider === candidate.provider) continue;
 				// Empty-stop / hard-error takeover requires a different provider/model.
 				// Effort-only chain entries (provider/model:high → :low) must not count.
 				if (
@@ -2002,7 +2003,6 @@ export class TurnRecovery {
 				) {
 					continue;
 				}
-				if (options?.excludeProvider === candidate.provider) continue;
 				// Anthropic signatures and redacted blocks are model-bound, while the
 				// latest assistant response must remain byte-identical. A same-provider
 				// model switch can satisfy neither constraint, so keep retrying the
