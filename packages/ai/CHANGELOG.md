@@ -209,6 +209,12 @@
 - Fixed auth-gateway SSE streams leaking turn reservations when `reader.read()` rejects.
 - Fixed `/v1/messages/count_tokens` resolving only concrete catalog models; virtual routes are registry-aware.
 - Fixed Anthropic count-tokens accepting missing/non-array `messages` and ignoring `system`/`tools` in the estimate.
+- Fixed Gemini URL routing and tool calls, conditional routing, conversation affinity, and stream health updates after late failures.
+
+- Fixed auth-gateway streaming retries leaving StreamCommitGate terminated; the gate resets between attempts.
+- Fixed bare `balance` routes always dispatching the first child; initial pick now rotates across children.
+- Fixed Anthropic count-tokens ignoring `system`/`tools` and accepting non-array `messages`.
+- Fixed quota-share DRR picking by weight when the first finalist already holds higher deficit than the second.
 ## [18.1.14] - 2026-09-07
 
 ### Fixed
