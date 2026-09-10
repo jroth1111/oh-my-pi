@@ -8,6 +8,7 @@
 - Grok Bot keeps interleaved assistant messages independent, and catalog smoke checks reject commands that do not perform the required operation.
 - Fixed concurrent credential probes and permanent-credential fallback; stateful continuations keep their target and reject ambiguous account selection.
 - Fixed stateful continuations changing targets or accounts, and rejected route IDs that URL normalization would erase.
+- Azure Responses requests preserve structured-output formats, and concurrent requests retain separate credential reservations.
 - Forward OpenRouter Responses `previous_response_id` / `parallel_tool_calls` and Chat Completions `parallel_tool_calls` through the API mapper.
 - Delay non-Responses stream commit until meaningful assistant events, and flush held SSE prelude frames when a probing stream ends without commit.
 - Keep the leased credential id for anonymous cooldown-probe cleanup when concurrent reorders shift selection indices.
