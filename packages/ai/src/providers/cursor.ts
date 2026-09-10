@@ -5919,12 +5919,6 @@ async function buildGrpcRequestForWireMode(
 	runRequest.agentSessionId = options?.cursorAgentSessionId ?? "";
 	runRequest.conversationGroupId = state.conversationId;
 
-	runRequest.clientSupportsInlineImages = options?.cursorClientSupportsInlineImages === true;
-	runRequest.clientSupportsRoutedModelUpdate = options?.cursorClientSupportsRoutedModelUpdate === true;
-	runRequest.clientSupportsPromptContextUsageRpc = options?.cursorClientSupportsPromptContextUsageRpc === true;
-	runRequest.runId = options?.cursorRunId ?? "";
-	runRequest.agentSessionId = options?.cursorAgentSessionId ?? "";
-
 	// Tools are sent later via requestContext (exec handshake)
 	const replacementRequest = await options?.onPayload?.(runRequest, model);
 	if (replacementRequest !== undefined) runRequest = replacementRequest as typeof runRequest;

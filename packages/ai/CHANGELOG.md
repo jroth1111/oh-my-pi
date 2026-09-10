@@ -2,6 +2,10 @@
 
 ### Fixed
 
+- Grok Bot Gemini tool calls preserve their required arguments instead of returning empty objects.
+- Grok Bot parameterized model selectors no longer fail with an unknown-model error after resolving to a canonical model.
+- Grok Bot executes separate JSON tool calls reliably, preserves extension tool identities, and avoids executing mirrored thinking/text calls twice.
+- Cursor requests retain their generated run identifiers.
 - Cursor requests preserve caller-supplied capability flags and session identifiers.
 - Cursor user messages use agent mode consistently with the native CLI.
 

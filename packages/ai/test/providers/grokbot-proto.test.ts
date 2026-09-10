@@ -245,7 +245,7 @@ describe("grokbot proto", () => {
 });
 
 describe("grokbot requested model mapping", () => {
-	test("sand-wire-model-id rewrite is a bare requestedModel (gemini-3-flash → 3.8-flash)", () => {
+	test("an explicit wire-model rewrite removes parameters and variant flags", () => {
 		const rewritten = resolveGrokbotRequestedModel("gemini-3-flash", {
 			effort: "low",
 			sandParameterIds: ["effort", "fast"],
@@ -385,7 +385,7 @@ describe("grokbot requested model mapping", () => {
 		});
 	});
 
-	test("sets isVariantStringRepresentation for variant-string catalog rows", () => {
+	test("normalized variant selectors omit the string flag so Sand accepts the canonical model id", () => {
 		expect(
 			resolveGrokbotRequestedModel("variant-string-model::high", {
 				sandParameterIds: ["effort"],
@@ -395,9 +395,16 @@ describe("grokbot requested model mapping", () => {
 			}),
 		).toEqual({
 			modelId: "variant-string-model",
-			isVariantStringRepresentation: true,
 			parameters: [{ id: "effort", value: "high" }],
 		});
+	});
+
+	test("opaque variant selectors retain their string flag when no canonical mapping exists", () => {
+		expect(
+			resolveGrokbotRequestedModel("opaque[effort=high]", {
+				sandVariantStringRepresentation: true,
+			}),
+		).toEqual({ modelId: "opaque[effort=high]", isVariantStringRepresentation: true });
 	});
 
 	test("preserves discovered minimal and max effort on the wire", () => {
@@ -2252,7 +2259,7 @@ describe("grokbot request headers", () => {
 		expect(result.responseId).toBe("resp-1");
 	});
 
-	test("gemini-3-flash catalog rewrite sends bare gemini-3.8-flash only when tools are present", async () => {
+	test("Gemini 3 Flash keeps its selected model and effort when tools are added", async () => {
 		spyOn(grokbotAuth, "loadGrokbotConfig").mockResolvedValue({
 			renewal: "renew",
 			machineId: "machine",
@@ -2293,11 +2300,6 @@ describe("grokbot request headers", () => {
 				...(spec.sandVariantStringRepresentation ? { sandVariantStringRepresentation: true } : {}),
 				...(spec.sandParameterIds ? { sandParameterIds: [...spec.sandParameterIds] } : {}),
 			});
-			expect(gemini.id).toBe(spec.id);
-			expect(gemini.sandWireModelId).toBe("gemini-3.8-flash");
-			expect(gemini.sandWireModelIdWhen).toBe("tools");
-			expect(gemini.sandToolsWire).toBeUndefined();
-
 			let textOnlyRequested: unknown;
 			await streamGrokBot(
 				gemini as Model<"grokbot-sand">,
@@ -2316,7 +2318,6 @@ describe("grokbot request headers", () => {
 				spec.sandParameterIds
 					? {
 							modelId: "gemini-3-flash",
-							isVariantStringRepresentation: true,
 							parameters: [{ id: "effort", value: "low" }],
 						}
 					: { modelId: "gemini-3-flash" },
@@ -2349,7 +2350,7 @@ describe("grokbot request headers", () => {
 					},
 				},
 			).result();
-			expect(withToolsRequested).toEqual({ modelId: "gemini-3.8-flash" });
+			expect(withToolsRequested).toEqual(textOnlyRequested);
 		}
 	});
 

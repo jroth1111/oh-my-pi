@@ -209,6 +209,47 @@ describe("streamGrokBot JSON-as-text promotion", () => {
 			"bash",
 		]);
 	});
+	test("mirrored thinking and text invoke bash once while preserving surrounding prose", async () => {
+		spyOn(grokbotAuth, "loadGrokbotConfig").mockResolvedValue({
+			renewal: "renew",
+			machineId: "machine",
+			namespace: "prod",
+			clientVersion: "0.30.0",
+		});
+		spyOn(grokbotAuth, "mintGrokbotAccessToken").mockResolvedValue("fake-jwt");
+		const frames = [
+			encodeInferenceStreamResponse({ textPart: { text: "Running the requested check.", isFinal: true } }),
+			encodeInferenceStreamResponse({
+				thinkingPart: { text: '{"name":"Shell","arguments":{"command":"echo once","timeout":5}}', isFinal: true },
+			}),
+			encodeInferenceStreamResponse({
+				textPart: { text: '{"name":"bash","arguments":{"timeout":5,"command":"echo once"}}', isFinal: true },
+			}),
+		].map(frame => frameConnectProto(frame));
+		const stream = streamGrokBot(
+			model,
+			{
+				messages: [{ role: "user", content: "run check", timestamp: 0 }],
+				tools: [bashTool],
+			},
+			{
+				apiKey: "renew",
+				fetch: async () => connectBody(...frames, frameConnectProto(Buffer.alloc(0), CONNECT_END_STREAM_FLAG)),
+			},
+		);
+		const events = [];
+		for await (const event of stream) events.push(event);
+		const result = await stream.result();
+		expect(result.stopReason).toBe("toolUse");
+		expect(result.content.filter(block => block.type === "toolCall")).toEqual([
+			expect.objectContaining({ name: "bash", arguments: { command: "echo once", timeout: 5 } }),
+		]);
+		expect(result.content.filter(block => block.type === "text")).toEqual([
+			{ type: "text", text: "Running the requested check." },
+		]);
+		expect(events.filter(event => event.type === "toolcall_end")).toHaveLength(1);
+	});
+
 	test("automation wire fenced Shell JSON becomes a bash toolCall (matrix no-tool-call regression)", async () => {
 		spyOn(grokbotAuth, "loadGrokbotConfig").mockResolvedValue({
 			renewal: "renew",

@@ -2,7 +2,7 @@ import { classifyModel } from "@oh-my-pi/pi-catalog/compat/taxonomy";
 import type { ModelIdentity } from "@oh-my-pi/pi-catalog/compat/types";
 import type { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
-import { logger } from "@oh-my-pi/pi-utils";
+import { logger, stableStringifyJson } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
 import type {
 	Api,
@@ -49,6 +49,7 @@ import {
 	shouldPromoteJsonTextToolCall,
 	parseGeminiInbandToolCall,
 	parseJsonTextToolCall,
+	type JsonTextToolCall,
 } from "./grokbot/json-text-tool-call";
 import { nativeToolParametersForIdentity } from "./grokbot/tool-policy";
 import {
@@ -1059,12 +1060,12 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 					if (anthropicWire.acceptedUnadvertisedToolNames?.length) {
 						body.acceptedUnadvertisedToolNames = anthropicWire.acceptedUnadvertisedToolNames;
 					}
-					augmentToolIndexForProductWire(grammarTools, context.tools);
 					if (
 						anthropicWire.wireMode === "automation" ||
 						anthropicWire.wireMode === "parent-chat" ||
 						anthropicWire.wireMode === "keep-model"
 					) {
+						augmentToolIndexForProductWire(grammarTools, context.tools);
 						// History stores omp names (bash/read/write); product tools are
 						// Shell/Read/Write — rewrite replayed call/result names to match.
 						body.messages = rewriteInferenceMessagesForProductWire(
@@ -1661,16 +1662,43 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 					}) &&
 					!output.content.some(b => b.type === "toolCall")
 				) {
-					const text = assistantTextForJsonPromotion(output.content, sendToUserTextIndexes);
 					const advertised = advertisedNamesForJsonTextToolCall(body.tools, context.tools);
-					const promoted = parseJsonTextToolCall(text, advertised) ?? parseGeminiInbandToolCall(text, advertised);
-					if (promoted) {
-						const removedIndexes = new Set<number>();
-						for (let i = 0; i < output.content.length; i++) {
-							if (sendToUserTextIndexes.has(i)) continue;
-							const block = output.content[i];
-							if (block?.type === "text" || block?.type === "thinking") removedIndexes.add(i);
+					const promotedCalls: JsonTextToolCall[] = [];
+					const blockCalls: { call: JsonTextToolCall; thinking: boolean; fingerprint: string }[] = [];
+					const textFingerprints = new Set<string>();
+					const removedIndexes = new Set<number>();
+					for (let i = 0; i < output.content.length; i++) {
+						if (sendToUserTextIndexes.has(i)) continue;
+						const text = assistantTextForJsonPromotion([output.content[i]]);
+						const promoted =
+							parseJsonTextToolCall(text, advertised) ?? parseGeminiInbandToolCall(text, advertised);
+						if (!promoted) continue;
+						const owner = grammarTools.get(promoted.name)?.name ?? promoted.name;
+						const fingerprint = `${owner}\0${stableStringifyJson(promoted.arguments)}`;
+						const thinking = output.content[i].type === "thinking";
+						blockCalls.push({ call: promoted, thinking, fingerprint });
+						if (!thinking) textFingerprints.add(fingerprint);
+						removedIndexes.add(i);
+					}
+					// A final text invocation supersedes its mirrored thinking dump.
+					for (const entry of blockCalls) {
+						if (!entry.thinking || !textFingerprints.has(entry.fingerprint)) promotedCalls.push(entry.call);
+					}
+					// Preserve support for a single invocation split across blocks.
+					if (promotedCalls.length === 0) {
+						const text = assistantTextForJsonPromotion(output.content, sendToUserTextIndexes);
+						const promoted =
+							parseJsonTextToolCall(text, advertised) ?? parseGeminiInbandToolCall(text, advertised);
+						if (promoted) {
+							promotedCalls.push(promoted);
+							for (let i = 0; i < output.content.length; i++) {
+								if (sendToUserTextIndexes.has(i)) continue;
+								const block = output.content[i];
+								if (block?.type === "text" || block?.type === "thinking") removedIndexes.add(i);
+							}
 						}
+					}
+					if (promotedCalls.length > 0) {
 						// Compacting content shifts retained SendToUser text left —
 						// remap buffered event indices so flush matches the final message.
 						const oldToNew = new Map<number, number>();
@@ -1703,17 +1731,19 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 							}
 							attemptEventBuffer = remappedEvents;
 						}
-						upsertTool({
-							toolCallId: `call_json_${crypto.randomUUID()}`,
-							toolName: promoted.name,
-							args: JSON.stringify(promoted.arguments),
-							isComplete: true,
-						});
-						logger.info("grokbot: promoted JSON-as-text tool call", {
-							toolName: promoted.name,
-							wireMode: anthropicWire.wireMode,
-							routedResponseModel: routedResponseModel || undefined,
-						});
+						for (const promoted of promotedCalls) {
+							upsertTool({
+								toolCallId: `call_json_${crypto.randomUUID()}`,
+								toolName: promoted.name,
+								args: JSON.stringify(promoted.arguments),
+								isComplete: true,
+							});
+							logger.info("grokbot: promoted JSON-as-text tool call", {
+								toolName: promoted.name,
+								wireMode: anthropicWire.wireMode,
+								routedResponseModel: routedResponseModel || undefined,
+							});
+						}
 					}
 				}
 

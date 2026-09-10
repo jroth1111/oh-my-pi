@@ -8917,7 +8917,7 @@
 				}
 			},
 			{
-				"source": "providers/grokbot.kdl:51",
+				"source": "providers/grokbot.kdl:49",
 				"providers": [
 					"grokbot"
 				],
@@ -8932,13 +8932,11 @@
 					}
 				],
 				"catalog": {
-					"sandWireModelId": "gemini-3.8-flash",
-					"sandWireModelIdWhen": "tools",
 					"sandPromoteJsonTextTools": true
 				}
 			},
 			{
-				"source": "providers/grokbot.kdl:56",
+				"source": "providers/grokbot.kdl:52",
 				"providers": [
 					"grokbot"
 				],
@@ -8977,7 +8975,7 @@
 				}
 			},
 			{
-				"source": "providers/grokbot.kdl:64",
+				"source": "providers/grokbot.kdl:60",
 				"providers": [
 					"grokbot"
 				],
@@ -9006,7 +9004,7 @@
 				}
 			},
 			{
-				"source": "providers/grokbot.kdl:72",
+				"source": "providers/grokbot.kdl:68",
 				"providers": [
 					"grokbot"
 				],

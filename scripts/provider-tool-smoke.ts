@@ -21,8 +21,9 @@ const challenge = `verified-${crypto.randomUUID()}`;
 await Bun.write(path.join(workspace, "input.txt"), input);
 await Bun.write(path.join(workspace, "challenge.sh"), `printf '%s\\n' '${challenge}'\n`);
 const args = [
-	process.execPath,
-	path.resolve(import.meta.dir, "../packages/coding-agent/src/cli.ts"),
+	...(process.env.OMP_PROVIDER_SMOKE_BINARY
+		? [path.resolve(process.env.OMP_PROVIDER_SMOKE_BINARY)]
+		: [process.execPath, path.resolve(import.meta.dir, "../packages/coding-agent/src/cli.ts")]),
 	"--cwd",
 	workspace,
 	"-p",

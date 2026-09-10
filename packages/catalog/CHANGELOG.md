@@ -5,6 +5,7 @@
 ### Added
 ### Fixed
 
+- Grok Bot Gemini 3 Flash tool requests stay on the selected model instead of switching to Gemini 3.8 Flash, which may be unavailable.
 - Cursor discovery preserves the roster model ID for automatic routing.
 - Updated Cursor protocol definitions for capability flags, session identifiers, and server updates.
 
