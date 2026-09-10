@@ -180,6 +180,10 @@
 
 - Fixed auth-gateway decision traces accepting `credential_lookup_failed` as a skipped reason when `getApiKey` throws.
 - Fixed caller-owned Responses continuations to store each response, and returned matching `x-request-id` trace headers for credential lookup failures.
+- Fixed gateway fallback routing through missing models and credentials while honoring each route’s configured failure conditions.
+
+- Fixed gateway SSE holds to share the canonical commit-aware implementation and flush EOF metadata, while unresolved or credentialless route targets now advance to the next eligible target.
+
 ## [18.1.14] - 2026-09-07
 
 ### Fixed
