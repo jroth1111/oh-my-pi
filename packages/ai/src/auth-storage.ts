@@ -100,19 +100,11 @@ function fingerprintOAuthPhysicalIdentity(credential: AuthCredential): string | 
 	const accountId = credential.accountId?.trim();
 	const email = credential.email?.trim().toLowerCase();
 	const orgId = credential.orgId?.trim();
-	const projectId = credential.projectId?.trim();
 	if (accountId) parts.push(`account:${accountId}`);
 	if (email) parts.push(`email:${email}`);
 	if (orgId) parts.push(`org:${orgId}`);
-	if (projectId) parts.push(`project:${projectId}`);
 	if (parts.length === 0) return null;
 	return parts.join("|");
-}
-
-/** Stable identity for API-key rows so key replacement bumps incarnation. */
-function fingerprintApiKeyPhysicalIdentity(credential: AuthCredential): string | null {
-	if (credential.type !== "api_key") return null;
-	return `api_key:${createHash("sha256").update(credential.key).digest("base64url")}`;
 }
 
 function identityFieldMap(fingerprint: string): Map<string, string> {
@@ -125,26 +117,18 @@ function identityFieldMap(fingerprint: string): Map<string, string> {
 	return fields;
 }
 
-/**
- * True when fingerprints do not conflict: shared keys match, and keys present
- * on only one side are inconclusive (enrichment or temporary field omission).
- */
+/** True when every old field is still present with the same value (new fields only). */
 function isConservativeIdentityEnrichment(oldFingerprint: string, newFingerprint: string): boolean {
 	const oldFields = identityFieldMap(oldFingerprint);
 	const newFields = identityFieldMap(newFingerprint);
 	for (const [key, value] of oldFields) {
-		const next = newFields.get(key);
-		if (next !== undefined && next !== value) return false;
+		if (newFields.get(key) !== value) return false;
 	}
 	return true;
 }
 
 function turnReservationKey(credentialId: number, incarnation: number): string {
 	return `${credentialId}:${incarnation}`;
-}
-
-function anonymousProbeRequestKey(credentialId: number, blockScope: string): string {
-	return `anon-probe:${credentialId}:${blockScope}`;
 }
 
 const WORKSPACE_DEACTIVATED_PATTERN = /\bdeactivated_workspace\b|\bdeactivated[_ ](?:org|organization|workspace)\b/i;
@@ -234,8 +218,6 @@ export interface StoredCredentialBlock {
 	blockScope: string;
 	/** Epoch milliseconds. */
 	blockedUntilMs: number;
-	/** True when the block came from a provider Retry-After / usage wait window. */
-	retryAfter?: boolean;
 	/** Last row update timestamp in epoch milliseconds, when provided by the backing store. */
 	updatedAtMs?: number;
 }
@@ -1295,7 +1277,6 @@ function authCredentialEquals(left: AuthCredential, right: AuthCredential): bool
 		left.expires === right.expires &&
 		left.accountId === right.accountId &&
 		left.email === right.email &&
-		left.orgId === right.orgId &&
 		left.projectId === right.projectId &&
 		left.enterpriseUrl === right.enterpriseUrl
 	);
@@ -1787,26 +1768,10 @@ export class AuthStorage {
 	}
 
 	#maybeBumpIncarnation(provider: string, credentialId: number, previous: AuthCredential, next: AuthCredential): void {
-		// Type replacement (oauth ↔ api_key) always invalidates prior reservations.
-		if (previous.type !== next.type) {
-			this.#bumpCredentialIncarnation(provider, credentialId);
-			return;
-		}
-		if (previous.type === "api_key" && next.type === "api_key") {
-			const oldFp = fingerprintApiKeyPhysicalIdentity(previous);
-			const newFp = fingerprintApiKeyPhysicalIdentity(next);
-			if (!oldFp || !newFp || oldFp === newFp) return;
-			this.#bumpCredentialIncarnation(provider, credentialId);
-			return;
-		}
 		const oldFp = fingerprintOAuthPhysicalIdentity(previous);
 		const newFp = fingerprintOAuthPhysicalIdentity(next);
 		if (!oldFp || !newFp || oldFp === newFp) return;
 		if (isConservativeIdentityEnrichment(oldFp, newFp)) return;
-		this.#bumpCredentialIncarnation(provider, credentialId);
-	}
-
-	#bumpCredentialIncarnation(provider: string, credentialId: number): void {
 		const incarnation = (this.#credentialIncarnation.get(credentialId) ?? 1) + 1;
 		this.#credentialIncarnation.set(credentialId, incarnation);
 		this.#clearSessionStickiesForCredential(provider, credentialId);
@@ -1865,14 +1830,16 @@ export class AuthStorage {
 		const source = entries.find(entry => entry.id === credentialId);
 		if (source === undefined || source.credential.type !== "oauth") return;
 		const sourceKey = resolveCredentialIdentityKey(provider, source.credential);
+		const sourceAccount = source.credential.accountId?.trim();
 		const providerKey = this.#getProviderTypeKey(provider, "oauth");
 		for (let index = 0; index < entries.length; index += 1) {
 			const entry = entries[index]!;
 			if (entry.id === credentialId || entry.credential.type !== "oauth") continue;
 			const key = resolveCredentialIdentityKey(provider, entry.credential);
-			// Match only by organization-qualified identity keys. A shared accountId
-			// across different orgId workspaces must not fan out deactivated_workspace.
-			const sameIdentity = sourceKey !== null && key !== null && sourceKey === key;
+			const account = entry.credential.accountId?.trim();
+			const sameIdentity =
+				(sourceKey !== null && key !== null && sourceKey === key) ||
+				(sourceAccount !== undefined && account !== undefined && sourceAccount === account);
 			if (!sameIdentity) continue;
 			if (retryAfter) this.#probeLeases.noteRetryAfterBlock(entry.id, "", blockedUntil);
 			this.#markCredentialBlocked(provider, providerKey, index, blockedUntil);
@@ -2034,15 +2001,6 @@ export class AuthStorage {
 		return blockedUntil;
 	}
 
-	/** Re-apply Retry-After provenance from durable blocks after restart / peer reload. */
-	#hydrateRetryAfterProvenanceFromStore(credentialId: number): void {
-		for (const block of this.listCredentialBlocks([credentialId])) {
-			if (!block.retryAfter) continue;
-			if (block.blockedUntilMs <= Date.now()) continue;
-			this.#probeLeases.noteRetryAfterBlock(credentialId, block.blockScope, block.blockedUntilMs);
-		}
-	}
-
 	#readPersistedCredentialBlock(
 		credentialId: number,
 		providerKey: string,
@@ -2111,16 +2069,12 @@ export class AuthStorage {
 
 		const credentialId = this.#getStoredCredentials(provider)[credentialIndex]?.id;
 		if (credentialId === undefined) return blockedUntil;
-		this.#hydrateRetryAfterProvenanceFromStore(credentialId);
 		const persistedGlobalBlockedUntil = this.#readPersistedCredentialBlock(credentialId, providerKey, "");
 		if (
 			persistedGlobalBlockedUntil !== undefined &&
 			(blockedUntil === undefined || persistedGlobalBlockedUntil > blockedUntil)
 		) {
 			blockedUntil = persistedGlobalBlockedUntil;
-			// Restarts lose in-memory Retry-After provenance; treat still-active persisted
-			// blocks as Retry-After-sourced so allowBlocked cannot bypass probe leases.
-			this.#probeLeases.noteRetryAfterBlock(credentialId, "", persistedGlobalBlockedUntil);
 		}
 		for (const blockScope of scopes) {
 			const persistedScopedBlockedUntil = this.#readPersistedCredentialBlock(credentialId, providerKey, blockScope);
@@ -2129,7 +2083,6 @@ export class AuthStorage {
 				(blockedUntil === undefined || persistedScopedBlockedUntil > blockedUntil)
 			) {
 				blockedUntil = persistedScopedBlockedUntil;
-				this.#probeLeases.noteRetryAfterBlock(credentialId, blockScope, persistedScopedBlockedUntil);
 			}
 		}
 		const incarnation = this.#credentialIncarnation.get(credentialId) ?? 1;
@@ -2214,7 +2167,6 @@ export class AuthStorage {
 		this.#credentialBackoffProviderTimed.set(backoffKey, timedMap);
 		const probeAfterMap = this.#credentialBackoffProbeAfter.get(backoffKey) ?? new Map<number, number>();
 		probeAfterMap.set(credentialIndex, Math.min(nextBlockedUntil, Date.now() + USAGE_REPORT_TTL_MS));
-		this.#credentialBackoffProbeAfter.set(backoffKey, probeAfterMap);
 		this.#invalidateUsageReportCache(provider);
 
 		const credentialId = this.#getStoredCredentials(provider)[credentialIndex]?.id;
@@ -2233,7 +2185,6 @@ export class AuthStorage {
 				providerKey,
 				blockScope: blockScope ?? "",
 				blockedUntilMs: nextBlockedUntil,
-				retryAfter: this.#probeLeases.isRetryAfterSourced(credentialId, blockScope ?? ""),
 			});
 		} catch (err) {
 			if (this.#handlePersistedBlockStoreError(err)) return;
@@ -2538,6 +2489,22 @@ export class AuthStorage {
 		return this.#orderUsageRankedCandidates(ranked, "none");
 	}
 
+	/** Acquire an exclusive turn reservation for a stored API-key row when requestId is set. */
+	#tryReserveApiKeySelection(
+		provider: string,
+		selection: ApiKeySelection,
+		requestId: string | undefined,
+	): boolean {
+		if (!requestId) return true;
+		const reserveId = this.#getStoredCredentials(provider)[selection.index]?.id;
+		if (reserveId === undefined) return true;
+		return this.tryAcquireTurnReservation({
+			credentialId: reserveId,
+			incarnation: this.getCredentialIncarnation(reserveId),
+			requestId,
+		}).ok;
+	}
+
 	async #selectApiKeyCredential(
 		provider: string,
 		sessionId: string | undefined,
@@ -2559,15 +2526,21 @@ export class AuthStorage {
 
 		const providerKey = this.#getProviderTypeKey(provider, "api_key");
 		const order = this.#getCredentialOrder(providerKey, sessionId, credentials.length);
+		const fallback = credentials[order[0]];
 		const strategy = this.#rankingStrategyResolver?.(provider);
 		if (!strategy) {
 			for (const idx of order) {
 				const candidate = credentials[idx];
-				if (!this.#isCredentialBlocked(provider, providerKey, candidate.index, undefined, options?.requestId)) {
-					if (this.#tryReserveApiKeySelection(provider, candidate, options?.requestId)) return candidate;
+				if (
+					!this.#isCredentialBlocked(provider, providerKey, candidate.index, undefined, options?.requestId) &&
+					this.#tryReserveApiKeySelection(provider, candidate, options?.requestId)
+				) {
+					return candidate;
 				}
 			}
-			return undefined;
+			return fallback && this.#tryReserveApiKeySelection(provider, fallback, options?.requestId)
+				? fallback
+				: undefined;
 		}
 
 		const rankingContext: CredentialRankingContext = {
@@ -2586,52 +2559,9 @@ export class AuthStorage {
 			blockScope,
 			blockScopes,
 		});
-		for (const ranked of candidates) {
-			// Recheck quota/usage blocks before reserving: ranking still returns blocked
-			// rows after healthy ones, and reservation conflicts must not promote them.
-			if (
-				this.#isCredentialBlocked(provider, providerKey, ranked.selection.index, blockScopes, options?.requestId)
-			) {
-				continue;
-			}
-			if (this.#tryReserveApiKeySelection(provider, ranked.selection, options?.requestId)) {
-				return ranked.selection;
-			}
-		}
+		const picked = candidates[0]?.selection ?? fallback;
+		if (picked && this.#tryReserveApiKeySelection(provider, picked, options?.requestId)) return picked;
 		return undefined;
-	}
-
-	/** Resolve a reserved API-key selection; release the turn hold if the helper yields no secret. */
-	async #resolveReservedApiKey(
-		provider: string,
-		sessionId: string | undefined,
-		selection: ApiKeySelection,
-		requestId: string | undefined,
-	): Promise<string | undefined> {
-		try {
-			const resolved = await this.#configValueResolver(selection.credential.key);
-			if (resolved === undefined || resolved === "") {
-				if (requestId) this.releaseTurnReservation(requestId);
-				return undefined;
-			}
-			this.#recordSessionCredential(provider, sessionId, "api_key", selection.index);
-			return resolved;
-		} catch (error) {
-			if (requestId) this.releaseTurnReservation(requestId);
-			throw error;
-		}
-	}
-
-	/** Acquire an exclusive turn reservation for a stored API-key row when requestId is set. */
-	#tryReserveApiKeySelection(provider: string, selection: ApiKeySelection, requestId: string | undefined): boolean {
-		if (!requestId) return true;
-		const reserveId = this.#getStoredCredentials(provider)[selection.index]?.id;
-		if (reserveId === undefined) return true;
-		return this.tryAcquireTurnReservation({
-			credentialId: reserveId,
-			incarnation: this.getCredentialIncarnation(reserveId),
-			requestId,
-		}).ok;
 	}
 
 	#clearProviderSessionCredentialCache(provider: string): void {
@@ -5135,77 +5065,8 @@ export class AuthStorage {
 		return reportResetAtMs === undefined ? rotation : { ...rotation, reportResetAtMs };
 	}
 
-	/**
-	 * Prefer the scope that actually holds an active Retry-After (global `""` wins
-	 * over a derived chat/spark scope) so probes cannot bypass a workspace-wide wait.
-	 */
-	#resolveQuotaProbeLeaseScope(credentialId: number, blockScope: string): string {
-		if (this.#probeLeases.isRetryAfterSourced(credentialId, blockScope)) return blockScope;
-		if (blockScope !== "" && this.#probeLeases.isRetryAfterSourced(credentialId, "")) return "";
-		return blockScope;
-	}
-
-	/**
-	 * Prefer the block scope that is actually active for this credential (global
-	 * `""` and Retry-After provenance win over a derived chat/spark request scope).
-	 */
-	#resolveBlockingProbeScope(
-		provider: string,
-		providerKey: string,
-		credentialIndex: number,
-		credentialId: number,
-		blockScope: string | undefined,
-		blockScopes: readonly string[] | undefined,
-		requestId: string | undefined,
-	): string {
-		const candidates: string[] = [""];
-		if (blockScope) candidates.push(blockScope);
-		for (const scope of blockScopes ?? []) {
-			if (scope && !candidates.includes(scope)) candidates.push(scope);
-		}
-		for (const scope of candidates) {
-			if (
-				this.#probeLeases.isRetryAfterSourced(credentialId, scope) &&
-				this.#getCredentialBlockedUntil(provider, providerKey, credentialIndex, scope || undefined, requestId) !==
-					undefined
-			) {
-				return scope;
-			}
-		}
-		for (const scope of candidates) {
-			if (
-				this.#getCredentialBlockedUntil(provider, providerKey, credentialIndex, scope || undefined, requestId) !==
-				undefined
-			) {
-				return scope;
-			}
-		}
-		return blockScope ?? "";
-	}
-
 	tryAcquireQuotaProbeLease(credentialId: number, blockScope: string): string | null {
 		return this.#probeLeases.tryAcquire(credentialId, blockScope);
-	}
-
-	/**
-	 * Acquire a probe lease for `requestId`, or reuse the request-owned lease when
-	 * auth retry re-enters while the same request still holds it (tryAcquire would
-	 * otherwise return null and clearQuotaProbe would be unreachable).
-	 */
-	#acquireOrReuseQuotaProbeLease(requestId: string, credentialId: number, probeScope: string): boolean {
-		const existing = this.#inflightProbes.get(requestId);
-		if (existing && existing.credentialId === credentialId && existing.blockScope === probeScope) {
-			return true;
-		}
-		const lease = this.tryAcquireQuotaProbeLease(credentialId, probeScope);
-		if (!lease) return false;
-		this.clearQuotaProbe(requestId);
-		this.#inflightProbes.set(requestId, {
-			credentialId,
-			blockScope: probeScope,
-			leaseId: lease,
-		});
-		return true;
 	}
 
 	recordQuotaProbeSuccess(credentialId: number, blockScope: string, leaseId: string | null): boolean {
@@ -5278,9 +5139,7 @@ export class AuthStorage {
 	renewTurnReservation(requestId: string, ttlMs: number = DEFAULT_TURN_RESERVATION_TTL_MS): void {
 		const expiresAtMs = Date.now() + ttlMs;
 		for (const [key, held] of this.#turnReservations) {
-			if (held.requestId === requestId) {
-				this.#turnReservations.set(key, { ...held, expiresAtMs });
-			}
+			if (held.requestId === requestId) this.#turnReservations.set(key, { ...held, expiresAtMs });
 		}
 	}
 
@@ -5301,18 +5160,6 @@ export class AuthStorage {
 		if (!probe) return false;
 		this.#inflightProbes.delete(requestId);
 		return this.recordQuotaProbeSuccess(probe.credentialId, probe.blockScope, probe.leaseId);
-	}
-
-	clearAnonymousQuotaProbe(credentialId: number, blockScope: string): void {
-		const key = anonymousProbeRequestKey(credentialId, blockScope);
-		if (!this.#inflightProbes.has(key)) return;
-		this.clearQuotaProbe(key);
-	}
-
-	settleAnonymousQuotaProbe(credentialId: number, blockScope: string): boolean {
-		const key = anonymousProbeRequestKey(credentialId, blockScope);
-		if (!this.#inflightProbes.has(key)) return false;
-		return this.settleQuotaProbeSuccess(key);
 	}
 
 	#resolveWindowResetAt(window: UsageLimit["window"]): number | undefined {
@@ -6147,10 +5994,8 @@ export class AuthStorage {
 			blockScopes,
 			allowFallback = true,
 		} = usageOptions;
-		// Stable credential id for anonymous probe cleanup — retain the id used when
-		// the lease was acquired (and refreshed after prepare), never re-read by index.
-		let credentialId: number | undefined;
 		if (
+			!allowBlocked &&
 			this.#isCredentialBlocked(
 				provider,
 				providerKey,
@@ -6162,6 +6007,10 @@ export class AuthStorage {
 			const entries = this.#getStoredCredentials(provider);
 			const blockedId = entries[selection.index]?.id;
 			if (blockedId === undefined) return undefined;
+			// A live block must never hijack rotation: while any same-type sibling
+			// is still usable, fall through so the caller rotates to it. Probing a
+			// cooled-down credential is a last resort for requests that have no
+			// unblocked sibling at all (one lease per cooldown generation).
 			const hasUsableSibling = entries.some(
 				(entry, index) =>
 					index !== selection.index &&
@@ -6171,33 +6020,27 @@ export class AuthStorage {
 			if (hasUsableSibling) return undefined;
 			const held = this.#activeTurnReservation(blockedId, this.getCredentialIncarnation(blockedId));
 			if (held && held.requestId !== options?.requestId) return undefined;
-			const probeScope = this.#resolveBlockingProbeScope(
-				provider,
-				providerKey,
-				selection.index,
-				blockedId,
-				blockScope,
-				blockScopes,
-				options?.requestId,
-			);
+			// Probe leases only release via request-keyed #inflightProbes.
+			if (!options?.requestId) return undefined;
+			const probeScope = blockScope ?? "";
 			const lease = this.tryAcquireQuotaProbeLease(blockedId, probeScope);
 			if (!lease) return undefined;
-			credentialId = blockedId;
-			const probeRequestKey = options?.requestId ?? anonymousProbeRequestKey(blockedId, probeScope);
-			this.#inflightProbes.set(probeRequestKey, {
+			this.#inflightProbes.set(options.requestId, {
 				credentialId: blockedId,
 				blockScope: probeScope,
 				leaseId: lease,
 			});
-			// Exclusive turn reservation only for cooldown probes — normal OAuth
-			// selections must remain concurrently usable across request ids.
-			if (options?.requestId) {
+		}
+		if (options?.requestId) {
+			const reserveId = this.#getStoredCredentials(provider)[selection.index]?.id;
+			if (reserveId !== undefined) {
 				const acquired = this.tryAcquireTurnReservation({
-					credentialId: blockedId,
-					incarnation: this.getCredentialIncarnation(blockedId),
+					credentialId: reserveId,
+					incarnation: this.getCredentialIncarnation(reserveId),
 					requestId: options.requestId,
 				});
 				if (!acquired.ok) {
+					// Probe may already be recorded; drop it without treating as success.
 					this.clearQuotaProbe(options.requestId);
 					return undefined;
 				}
@@ -6211,27 +6054,11 @@ export class AuthStorage {
 			if (!(await this.#prepareOAuthCredentialForRequest(provider, selection, options))) {
 				return undefined;
 			}
-			// Capture / refresh the row id once, immediately after #prepareOAuthCredentialForRequest
+			// Capture the row id once, immediately after #prepareOAuthCredentialForRequest
 			// resynced selection.index from the store. A concurrent disable during the
 			// usage/refresh awaits below can shift positional indices, so every later
 			// refresh / persist / CAS-disable addresses the row by this stable id.
-			credentialId = this.#getStoredCredentials(provider)[selection.index]?.id;
-			// prepare/broker refresh may bump incarnation and purge the prior reservation;
-			// reacquire against the post-prepare incarnation before vending the bearer.
-			if (options?.requestId && credentialId !== undefined) {
-				const held = this.#activeTurnReservation(credentialId, this.getCredentialIncarnation(credentialId));
-				if (!held || held.requestId !== options.requestId) {
-					const acquired = this.tryAcquireTurnReservation({
-						credentialId,
-						incarnation: this.getCredentialIncarnation(credentialId),
-						requestId: options.requestId,
-					});
-					if (!acquired.ok) {
-						this.clearQuotaProbe(options.requestId);
-						return undefined;
-					}
-				}
-			}
+			const credentialId = this.#getStoredCredentials(provider)[selection.index]?.id;
 
 			const planRequirement =
 				providedPlanRequirement ?? resolveOpenAICodexPlanRequirement(provider, options?.modelId);
@@ -6406,31 +6233,10 @@ export class AuthStorage {
 
 			return undefined;
 		} finally {
-			const finishId = credentialId;
-			const finishScope = blockScope ?? "";
-			if (!keepReservation) {
-				if (options?.requestId) {
-					this.releaseTurnReservation(options.requestId);
-					this.clearQuotaProbe(options.requestId);
-				} else if (finishId !== undefined) {
-					this.clearAnonymousQuotaProbe(finishId, finishScope);
-				}
-			} else if (!options?.requestId && finishId !== undefined) {
-				this.settleAnonymousQuotaProbe(finishId, finishScope);
+			if (!keepReservation && options?.requestId) {
+				this.releaseTurnReservation(options.requestId);
 			}
 		}
-	}
-
-	/**
-	 * Sync peek of runtime/config override credentials only.
-	 *
-	 * Mirrors the first two legs of {@link peekApiKey} / {@link getApiKey}
-	 * (CLI `--api-key`, then `models.yml` `providers.*.apiKey`) so synchronous
-	 * callers — e.g. credential-scoped startup cache hashing — share the same
-	 * precedence without inventing a second ordering.
-	 */
-	peekApiKeyOverrides(provider: string): string | undefined {
-		return this.#runtimeOverrides.get(provider) ?? this.#configOverrides.get(provider);
 	}
 
 	/**
@@ -6439,37 +6245,15 @@ export class AuthStorage {
 	 * and get a best-effort token. For GitHub Copilot we preserve enterprise
 	 * routing metadata so discovery can hit the correct host.
 	 */
-
-	/**
-	 * True when the provider has stored credentials but every candidate is under
-	 * an active backoff / Retry-After / probe-lease hold (so getApiKey returned
-	 * undefined for quota reasons rather than missing auth).
-	 */
-	hasCoolingDownCredentials(provider: string, modelId?: string): boolean {
-		const entries = this.#getStoredCredentials(provider);
-		if (entries.length === 0) return false;
-		const rankingContext = { modelId };
-		const strategy = this.#rankingStrategyResolver?.(provider);
-		for (const credType of ["oauth", "api_key"] as const) {
-			const typed = entries
-				.map((entry, index) => ({ entry, index }))
-				.filter(item => item.entry.credential.type === credType);
-			if (typed.length === 0) continue;
-			const providerKey = this.#getProviderTypeKey(provider, credType);
-			const blockScope = strategy?.blockScope?.(rankingContext);
-			const blockScopes = credentialBlockScopesForRequest(provider, strategy, rankingContext, blockScope);
-			const anyUnblocked = typed.some(
-				item => !this.#isCredentialBlocked(provider, providerKey, item.index, blockScopes ?? blockScope),
-			);
-			if (!anyUnblocked) return true;
-		}
-		return false;
-	}
-
 	async peekApiKey(provider: string): Promise<string | undefined> {
-		const overrideKey = this.peekApiKeyOverrides(provider);
-		if (overrideKey) {
-			return overrideKey;
+		const runtimeKey = this.#runtimeOverrides.get(provider);
+		if (runtimeKey) {
+			return runtimeKey;
+		}
+
+		const configKey = this.#configOverrides.get(provider);
+		if (configKey) {
+			return configKey;
 		}
 
 		// Precedence: a deliberate OAuth/login credential wins, then an explicit env var,
@@ -6550,13 +6334,8 @@ export class AuthStorage {
 			credential => credential.source === "login",
 		);
 		if (loginApiKeySelection) {
-			const resolved = await this.#resolveReservedApiKey(
-				provider,
-				sessionId,
-				loginApiKeySelection,
-				options?.requestId,
-			);
-			if (resolved !== undefined) return resolved;
+			this.#recordSessionCredential(provider, sessionId, "api_key", loginApiKeySelection.index);
+			return this.#configValueResolver(loginApiKeySelection.credential.key);
 		}
 
 		// Past OAuth: the session sticky (if any) is stale — the request authenticates via
@@ -6573,8 +6352,8 @@ export class AuthStorage {
 			credential => credential.source !== "login",
 		);
 		if (apiKeySelection) {
-			const resolved = await this.#resolveReservedApiKey(provider, sessionId, apiKeySelection, options?.requestId);
-			if (resolved !== undefined) return resolved;
+			this.#recordSessionCredential(provider, sessionId, "api_key", apiKeySelection.index);
+			return this.#configValueResolver(apiKeySelection.credential.key);
 		}
 
 		// Fall back to custom resolver (e.g., models.json custom providers)
@@ -7476,13 +7255,8 @@ export class AuthStorage {
 					credentialId: options?.credentialId,
 					apiKey: options?.apiKey,
 				});
-				let credentialId =
+				const credentialId =
 					options?.credentialId ?? (target ? this.#getStoredCredentials(provider)[target.index]?.id : undefined);
-				// Delayed deactivated_workspace can arrive after bearer rotation; reuse the
-				// same durable fingerprint history markUsageLimitReached already consults.
-				if (credentialId === undefined && options?.apiKey) {
-					credentialId = this.#findOAuthCredentialIdForBearer(provider, options.apiKey);
-				}
 				if (credentialId !== undefined) {
 					const sourceIndex = this.#getStoredCredentials(provider).findIndex(entry => entry.id === credentialId);
 					const providerKey = this.#getProviderTypeKey(provider, "oauth");
@@ -7492,11 +7266,6 @@ export class AuthStorage {
 								Date.now() + AuthStorage.#defaultBackoffMs)
 							: Date.now() + AuthStorage.#defaultBackoffMs;
 					this.#probeLeases.noteRetryAfterBlock(credentialId, "", until);
-					// markUsageLimitReached is chat/spark scoped for openai-codex; workspace
-					// deactivation must also block the source credential globally.
-					if (sourceIndex >= 0) {
-						this.#markCredentialBlocked(provider, providerKey, sourceIndex, until);
-					}
 					this.#fanOutWorkspaceDeactivation(provider, credentialId, until, true);
 				}
 			}

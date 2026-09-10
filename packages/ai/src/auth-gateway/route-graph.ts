@@ -70,6 +70,7 @@ export class RouteRegistry {
 	#generation = 1;
 	#resolveModel: ResolveModel;
 	#routes = new Map<string, CompiledRoute>();
+	#roundRobinPositions = new Map<string, number>();
 
 	constructor(resolveModel: ResolveModel) {
 		this.#resolveModel = resolveModel;
@@ -81,9 +82,13 @@ export class RouteRegistry {
 
 	/** Register/replace a virtual route. Bumps generation. Rejects cycles and empty fallback children. */
 	register(definition: RouteDefinition): void {
+		if (definition.id === "." || definition.id === "..") {
+			throw new AIError.ValidationError("Route id cannot be a dot segment");
+		}
 		const compiled = compileDefinition(definition, id => this.#routes.get(id)?.root, this.#generation + 1);
 		this.#generation += 1;
 		this.#routes.set(definition.id, compiled);
+		this.#roundRobinPositions.delete(definition.id);
 	}
 
 	/**
@@ -103,6 +108,7 @@ export class RouteRegistry {
 		}
 		this.#generation = nextGeneration;
 		this.#routes = pending;
+		this.#roundRobinPositions.clear();
 	}
 
 	/** Registered virtual routes in insertion order. Concrete catalog wraps are omitted. */
@@ -118,8 +124,19 @@ export class RouteRegistry {
 	/** Unregister a virtual route. Bumps generation on success. Returns false if not registered. */
 	unregister(id: string): boolean {
 		if (!this.#routes.delete(id)) return false;
+		this.#roundRobinPositions.delete(id);
 		this.#generation += 1;
 		return true;
+	}
+
+	/** Advance a per-route cursor, shared by all endpoint formats in this gateway. */
+	pickInitialTarget(compiled: CompiledRoute): string | undefined {
+		if (compiled.root.type !== "balance" || compiled.root.strategy !== "rr") return pickInitialRouteTarget(compiled);
+		const position = this.#roundRobinPositions.get(compiled.id) ?? 0;
+		const target = pickInitialRouteTarget(compiled, position);
+		if (compiled.targets.length > 0)
+			this.#roundRobinPositions.set(compiled.id, (position + 1) % compiled.targets.length);
+		return target;
 	}
 
 	resolve(modelId: string, facts?: RouteRequestFacts): CompiledRoute | undefined {
@@ -138,32 +155,6 @@ export class RouteRegistry {
 			fallbacks: {},
 		};
 	}
-}
-
-/**
- * Choose the first dispatch target, honouring a root balance strategy when present.
- * `salt` rotates `rr` across concurrent requests; `weighted` prefers the highest
- * child weight (default 1). Conditional `when` / domain grouping remain on `root`
- * for runtime policy; targets stay the DFS union for failover listing.
- */
-export function pickInitialRouteTarget(compiled: CompiledRoute, salt = 0): string | undefined {
-	if (compiled.targets.length === 0) return undefined;
-	if (compiled.root.type !== "balance") return compiled.targets[0];
-	if (compiled.root.strategy === "weighted") {
-		let best: string | undefined;
-		let bestWeight = Number.NEGATIVE_INFINITY;
-		for (const child of compiled.root.children) {
-			if (child.type !== "target") continue;
-			const weight = child.weight ?? 1;
-			if (weight > bestWeight) {
-				bestWeight = weight;
-				best = child.model;
-			}
-		}
-		return best ?? compiled.targets[0];
-	}
-	const idx = Math.abs(salt) % compiled.targets.length;
-	return compiled.targets[idx];
 }
 
 export interface RouteRequestFacts {
@@ -363,4 +354,26 @@ function freezeFallbacks(
 		out[key] = Object.freeze([...list]);
 	}
 	return Object.freeze(out);
+}
+
+/** Choose the first dispatch target, honouring a root balance strategy when present. */
+export function pickInitialRouteTarget(compiled: CompiledRoute, salt = 0): string | undefined {
+	if (compiled.targets.length === 0) return undefined;
+	if (compiled.root.type !== "balance") return compiled.targets[0];
+	if (compiled.root.strategy === "weighted") {
+		let best: string | undefined;
+		let bestWeight = -Infinity;
+		for (const child of compiled.root.children) {
+			if (child.type !== "target") continue;
+			const weight = child.weight ?? 1;
+			if (weight > bestWeight) {
+				bestWeight = weight;
+				best = child.model;
+			}
+		}
+		return best ?? compiled.targets[0];
+	}
+	// Round-robin: rotate by salt so concurrent requests spread across children.
+	const idx = Math.abs(salt) % compiled.targets.length;
+	return compiled.targets[idx];
 }
