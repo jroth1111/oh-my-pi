@@ -12,8 +12,8 @@ import {
 	GetDefaultModelForCliResponseSchema,
 	GetUsableModelsResponseSchema,
 	ModelDetailsSchema,
-} from "../src/discovery/cursor-gen/agent_pb";
-import { create, toBinary } from "@bufbuild/protobuf";
+} from "../src/discovery/cursor-proto";
+import { create, toBinary } from "../src/discovery/protobuf";
 import { resolveProviderModels } from "../src/model-manager";
 import { cursorModelManagerOptions } from "../src/provider-models/special";
 import type { ModelSpec } from "../src/types";

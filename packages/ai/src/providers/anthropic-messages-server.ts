@@ -712,8 +712,6 @@ export function encodeStream(
 			};
 
 			const processEvent = (ev: AssistantMessageEvent): "continue" | "return" => {
-				if ("partial" in ev) lastPartial = ev.partial;
-				if ("message" in ev) lastPartial = ev.message;
 				switch (ev.type) {
 					case "start":
 						// Defer while Cursor auto routing is unresolved so clients see
@@ -814,16 +812,20 @@ export function encodeStream(
 						closeBlock(ev.contentIndex);
 						break;
 					case "done": {
-						for (const idx of [...open.keys()]) closeBlock(idx);
+						for (const idx of Array.from(open.keys())) closeBlock(idx);
 						emitServerToolBlocksBefore(ev.message, ev.message.content.length);
-						// Auto-mode may have deferred start with no content events.
-						ensureStart(ev.message);
 						controller.enqueue(
 							sseFrame("message_delta", {
 								type: "message_delta",
 								// TODO: surface matched stop sequence once pi-ai
 								// propagates it on the `done` event.
-								delta: { stop_reason: mapStopReasonOut(ev.reason), stop_sequence: null },
+								delta: {
+									stop_reason: mapStopReasonOut(ev.reason),
+									stop_sequence: null,
+								},
+								...(bindingControlsRequested
+									? { input_transformations: ev.message.inputTransformations ?? [] }
+									: {}),
 								usage: encodeUsage(ev.message),
 							}),
 						);
@@ -833,7 +835,9 @@ export function encodeStream(
 					}
 					case "error": {
 						const msg = ev.error.errorMessage ?? "stream error";
-						controller.enqueue(sseFrame("error", { type: "error", error: { type: "api_error", message: msg } }));
+						controller.enqueue(
+							sseFrame("error", { type: "error", error: { type: "api_error", message: msg } }),
+						);
 						controller.close();
 						return "return";
 					}
@@ -889,6 +893,7 @@ export function encodeStream(
 					if (flushPending()) return;
 					if (processEvent(ev) === "return") return;
 				}
+
 				if (flushPending()) return;
 				// Stream ended without an explicit done: emit a complete envelope
 				// (message_start + message_delta carrying a stop_reason) so strict

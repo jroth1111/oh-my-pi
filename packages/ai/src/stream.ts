@@ -2446,9 +2446,10 @@ function mapOptionsForApi<TApi extends Api>(
 				...base,
 				execHandlers,
 				onToolResult,
-				externalToolExecutor: options?.cursorExternalToolExecutor,
 				toolChoice: options?.toolChoice,
-				cursorToolPassthrough: options?.cursorToolPassthrough,
+				// Upstream renamed the flag; accept the PR spelling as fallback
+				// for older callers until the option is removed.
+				externalToolExecutor: options?.cursorExternalToolExecutor ?? options?.cursorToolPassthrough,
 				cursorExcludeTools: options?.cursorExcludeTools,
 				cursorLocalCliMode: options?.cursorLocalCliMode,
 				cursorDevExperimentOverrides: options?.cursorDevExperimentOverrides,

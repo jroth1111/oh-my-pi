@@ -69,9 +69,9 @@ import {
 	WebFetchAllowlistPrecheckArgsSchema,
 	WriteShellStdinArgsSchema,
 } from "@oh-my-pi/pi-catalog/discovery/cursor-proto";
-import { create as createBufMessage } from "@bufbuild/protobuf";
 import { RoutedModelUpdateSchema } from "@oh-my-pi/pi-catalog/discovery/cursor-gen/agent_pb";
 import { create, fromBinary, toBinary } from "@oh-my-pi/pi-catalog/discovery/protobuf";
+import { create as createProtoMessage } from "@bufbuild/protobuf";
 
 /**
  * Drive one `ExecServerMessage` through the real dispatcher and decode every
@@ -88,7 +88,7 @@ async function dispatchExec(
 		execHandlers?: CursorExecHandlers;
 		requestContextTools?: McpToolDefinition[];
 		requestContextRules?: CursorRule[];
-		cursorToolPassthrough?: boolean;
+		externalToolExecutor?: boolean;
 	} = {},
 ): Promise<{ frames: AgentClientMessage[]; output: AssistantMessage; results: ToolResultMessage[] }> {
 	const output = cursorAssistantMessage();
@@ -117,9 +117,9 @@ async function dispatchExec(
 		},
 		{ sawTokenDelta: false },
 		options.requestContextTools ?? [],
-		options.requestContextRules ?? [],
+		options.requestContextRules,
 		undefined,
-		options.cursorToolPassthrough,
+		options.externalToolExecutor,
 	);
 
 	return { frames: written.map(decodeClientFrame), output, results };
@@ -2086,7 +2086,7 @@ describe("Cursor MCP frame: approval-only probes", () => {
 				}),
 			}),
 			{
-				cursorToolPassthrough: true,
+				externalToolExecutor: true,
 				requestContextTools: [mcpTool("deploy", "ops")],
 			},
 		);
@@ -2108,7 +2108,7 @@ describe("Cursor MCP frame: approval-only probes", () => {
 					smartModeApprovalOnly: true,
 				}),
 			}),
-			{ cursorToolPassthrough: true, requestContextTools: [mcpTool("other", "ops")] },
+			{ externalToolExecutor: true, requestContextTools: [mcpTool("other", "ops")] },
 		);
 		const answer = soleResult(frames);
 		if (answer.case !== "mcpResult") throw new Error(`got ${answer.case}`);
@@ -2177,7 +2177,7 @@ describe("Cursor InteractionUpdate.routedModel", () => {
 			{
 				message: {
 					case: "routedModel",
-					value: createBufMessage(RoutedModelUpdateSchema, {
+					value: createProtoMessage(RoutedModelUpdateSchema, {
 						modelId: "cursor-grok-4.5-high",
 						displayName: "Grok 4.5 High",
 					}),
@@ -2199,7 +2199,7 @@ describe("Cursor InteractionUpdate.routedModel", () => {
 			{
 				message: {
 					case: "routedModel",
-					value: createBufMessage(RoutedModelUpdateSchema, { modelId: "  ", displayName: "x" }),
+					value: createProtoMessage(RoutedModelUpdateSchema, { modelId: "  ", displayName: "x" }),
 				},
 			},
 			output,
@@ -2222,7 +2222,7 @@ describe("Cursor backgroundShellSpawnArgs passthrough", () => {
 					toolCallId: "bg1",
 				}),
 			}),
-			{ cursorToolPassthrough: true },
+			{ externalToolExecutor: true },
 		);
 		const answer = soleResult(frames);
 		if (answer.case !== "backgroundShellSpawnResult") throw new Error(`got ${answer.case}`);
@@ -2264,7 +2264,7 @@ describe("Cursor writeShellStdin and redactedRead passthrough", () => {
 				case: "writeShellStdinArgs",
 				value: create(WriteShellStdinArgsSchema, { shellId: 1, chars: "y\n" }),
 			}),
-			{ cursorToolPassthrough: true },
+			{ externalToolExecutor: true },
 		);
 		expect(output.stopReason).toBe("toolUse");
 		expect(output.content.some(b => b.type === "toolCall" && b.name === "bash")).toBe(true);
@@ -2278,7 +2278,7 @@ describe("Cursor writeShellStdin and redactedRead passthrough", () => {
 				case: "redactedReadArgs",
 				value: create(ReadArgsSchema, { path: "/repo/.env", toolCallId: "rr-1" }),
 			}),
-			{ cursorToolPassthrough: true },
+			{ externalToolExecutor: true },
 		);
 		expect(output.stopReason).toBe("toolUse");
 		expect(output.content.some(b => b.type === "toolCall" && b.name === "read")).toBe(true);
@@ -2299,7 +2299,7 @@ describe("Cursor grep passthrough: empty pattern", () => {
 					toolCallId: "g1",
 				}),
 			}),
-			{ cursorToolPassthrough: true },
+			{ externalToolExecutor: true },
 		);
 		const answer = soleResult(frames);
 		if (answer.case !== "grepResult") throw new Error(`got ${answer.case}`);

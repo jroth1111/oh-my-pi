@@ -386,18 +386,17 @@ export interface CursorOptions extends StreamOptions {
 	conversationId?: string;
 	execHandlers?: CursorExecHandlers;
 	onToolResult?: CursorToolResultHandler;
-	/** Treat unhandled MCP calls as accepted handoffs to an external executor. */
-	externalToolExecutor?: boolean;
-	/** Wire model id selected after thinking-effort routing (`resolveWireModelId`). */
-	wireModelId?: string;
 	/**
+	 * Treat unhandled MCP calls as accepted handoffs to an external executor.
 	 * When true, tool calls from Cursor's backend are surfaced as `ToolCall`
 	 * blocks in the output and the stream ends with `stopReason: "toolUse"`
 	 * after the first tool call batch. No exec handler responses are sent back
 	 * to Cursor; the caller executes tools and replays results as
 	 * `role: "tool"` messages on the next request.
 	 */
-	cursorToolPassthrough?: boolean;
+	externalToolExecutor?: boolean;
+	/** Wire model id selected after thinking-effort routing (`resolveWireModelId`). */
+	wireModelId?: string;
 	/**
 	 * Restricts `x-cursor-agent-allowed-tools` under tool passthrough
 	 * (`"none"` → `__none__`, named force → that name alone).
@@ -834,7 +833,7 @@ function streamCursorWithWireMode(
 			// name alone (even when absent from context.tools — Cursor decides).
 			// Cursor has no required-call signal, so `toolChoice: "required"` would
 			// silently weaken to auto — reject it instead of advertising the full list.
-			if (options?.cursorToolPassthrough) {
+			if (options?.externalToolExecutor) {
 				if (options.toolChoice === "required" || options.toolChoice === "any") {
 					throw new AIError.ValidationError(
 						`Cursor passthrough does not support toolChoice "${options.toolChoice}"; use a named tool choice or omit toolChoice`,
@@ -992,7 +991,7 @@ function streamCursorWithWireMode(
 							requestContextTools,
 							requestContextRules,
 							onConversationCheckpoint,
-							options?.cursorToolPassthrough,
+							options?.externalToolExecutor,
 							autoModeActive,
 						).catch(error => {
 							log("error", "handleServerMessage", { error: String(error) });
@@ -1289,7 +1288,7 @@ export async function handleServerMessage(
 	requestContextTools: McpToolDefinition[],
 	requestContextRules: CursorRule[] = [],
 	onConversationCheckpoint?: (checkpoint: ConversationStateStructure) => void,
-	cursorToolPassthrough?: boolean,
+	externalToolExecutor = false,
 	autoModeActive?: boolean,
 ): Promise<void> {
 	const msgCase = msg.message.case;
@@ -1297,7 +1296,7 @@ export async function handleServerMessage(
 	log("serverMessage", msgCase, msg.message.value);
 
 	if (msgCase === "interactionUpdate") {
-		processInteractionUpdate(msg.message.value, output, stream, state, usageState, cursorToolPassthrough);
+		processInteractionUpdate(msg.message.value, output, stream, state, usageState, externalToolExecutor);
 	} else if (msgCase === "kvServerMessage") {
 		handleKvServerMessage(msg.message.value as KvServerMessage, blobStore, h2Request);
 	} else if (msgCase === "execServerMessage") {
@@ -1316,13 +1315,13 @@ export async function handleServerMessage(
 				output,
 				stream,
 				state,
-				cursorToolPassthrough,
+				externalToolExecutor,
 			),
 		);
 		// End passthrough only when this exec actually synthesized/deferred a
 		// caller-facing tool — not when an approval-only mcpArgs probe ran while
 		// a prior toolCallStarted announcement already sits in output.content.
-		if (cursorToolPassthrough && deferredToCaller) {
+		if (externalToolExecutor && deferredToCaller) {
 			output.stopReason = "toolUse";
 		}
 	} else if (msgCase === "interactionQuery") {
@@ -1485,9 +1484,9 @@ async function handleShellStreamArgs(
 	h2Request: http2.ClientHttp2Stream,
 	execHandlers: CursorExecHandlers | undefined,
 	onToolResult: CursorToolResultHandler | undefined,
-	cursorToolPassthrough?: boolean,
+	externalToolExecutor?: boolean,
 ): Promise<void> {
-	if (cursorToolPassthrough) {
+	if (externalToolExecutor) {
 		const rejected = buildShellRejectedResult(
 			(args as { command?: string }).command ?? "",
 			args.workingDirectory || process.cwd(),
@@ -1758,19 +1757,19 @@ async function handleExecServerMessage(
 	output: AssistantMessage,
 	stream: AssistantMessageEventStream,
 	state: BlockState,
-	cursorToolPassthrough?: boolean,
+	externalToolExecutor: boolean,
 ): Promise<boolean> {
 	const execCase = execMsg.message.case;
 	log("exec", "dispatch", { execCase, execId: execMsg.execId, hasHandlers: !!execHandlers });
 	/** Set when this frame synthesized a ToolCall for the external passthrough caller. */
 	let deferredToCaller = false;
 	const markDeferredToCaller = (): void => {
-		if (cursorToolPassthrough) deferredToCaller = true;
+		if (externalToolExecutor) deferredToCaller = true;
 	};
 	// In passthrough mode, synthesize the ToolCall (call sites below) then reject
 	// the exec back to Cursor without running local handlers — the caller executes
 	// the surfaced tool and replays the result on the next request.
-	const resolveExec = cursorToolPassthrough
+	const resolveExec = externalToolExecutor
 		? async <TArgs, TResult>(
 				_args: TArgs,
 				_handler: ((args: TArgs) => Promise<CursorExecHandlerResult<TResult>>) | undefined,
@@ -1893,7 +1892,7 @@ async function handleExecServerMessage(
 			// synthesized block has already been persisted with a placeholder pattern.
 			// Passthrough must still surface the declared call to the external caller
 			// before local-executor validation — they decide how to handle it.
-			const emptyPatternError = cursorToolPassthrough ? null : emptyGrepPatternRejection(args.pattern, args.glob);
+			const emptyPatternError = externalToolExecutor ? null : emptyGrepPatternRejection(args.pattern, args.glob);
 			if (emptyPatternError !== null) {
 				sendExecClientMessage(h2Request, execMsg, "grepResult", buildGrepErrorResult(emptyPatternError));
 				return deferredToCaller;
@@ -2016,12 +2015,12 @@ async function handleExecServerMessage(
 				timeout: shellStreamTimeout,
 			});
 			markDeferredToCaller();
-			await handleShellStreamArgs(args, execMsg, h2Request, execHandlers, onToolResult, cursorToolPassthrough);
+			await handleShellStreamArgs(args, execMsg, h2Request, execHandlers, onToolResult, externalToolExecutor);
 			return deferredToCaller;
 		}
 		case "backgroundShellSpawnArgs": {
 			const args = execMsg.message.value;
-			if (cursorToolPassthrough) {
+			if (externalToolExecutor) {
 				// Same bash surface as shellArgs / shellStreamArgs — synthesize for the
 				// external caller and reject the exec so Cursor does not wait on us.
 				if (!args.toolCallId) args.toolCallId = crypto.randomUUID();
@@ -2072,7 +2071,7 @@ async function handleExecServerMessage(
 		}
 		case "writeShellStdinArgs": {
 			const args = execMsg.message.value;
-			if (cursorToolPassthrough) {
+			if (externalToolExecutor) {
 				// No dedicated OpenAI tool for stdin-to-background-shell; surface as
 				// bash with the written chars so the caller still gets toolUse.
 				const toolCallId = crypto.randomUUID();
@@ -2116,7 +2115,7 @@ async function handleExecServerMessage(
 		}
 		case "fetchArgs": {
 			const args = execMsg.message.value;
-			if (cursorToolPassthrough) {
+			if (externalToolExecutor) {
 				// FetchResult has no rejected variant — synthesize + error-defer so the
 				// caller still receives a ToolCall and stopReason becomes toolUse.
 				const toolCallId = crypto.randomUUID();
@@ -2199,7 +2198,7 @@ async function handleExecServerMessage(
 				// Gateway passthrough has no exec handlers: approve probes for tools the
 				// caller already declared so Cursor proceeds to the real invocation and
 				// the external caller can authorize/execute it.
-				if (!approved && cursorToolPassthrough) {
+				if (!approved && externalToolExecutor) {
 					const declaredName = mcpCall.toolName || mcpCall.name;
 					approved = requestContextTools.some(
 						tool => tool.name === declaredName || tool.toolName === declaredName,
@@ -2228,7 +2227,7 @@ async function handleExecServerMessage(
 			// arrive before toolCallStarted, and without a ToolCall the caller never
 			// receives the custom tool invocation. Without either path, leave the
 			// streamed announcement unpaired so agent-loop executes it locally.
-			const synthesizeMcp = !!execHandlers?.mcp || !!cursorToolPassthrough;
+			const synthesizeMcp = !!execHandlers?.mcp || !!externalToolExecutor;
 			if (synthesizeMcp) {
 				const existingBlock = output.content.find(
 					(block): block is ToolCallState => block.type === "toolCall" && block.id === mcpCall.toolCallId,
@@ -2275,7 +2274,7 @@ async function handleExecServerMessage(
 			// handler the honest answer is an explicit empty success. An
 			// unset-oneof result would read as "the call produced nothing".
 			const args = execMsg.message.value;
-			if (cursorToolPassthrough) {
+			if (externalToolExecutor) {
 				const toolCallId = crypto.randomUUID();
 				synthesizeCursorExecToolCall(output, stream, state, toolCallId, "list_mcp_resources", {
 					server: args.server,
@@ -2368,7 +2367,7 @@ async function handleExecServerMessage(
 		}
 		case "readMcpResourceExecArgs": {
 			const args = execMsg.message.value;
-			if (cursorToolPassthrough) {
+			if (externalToolExecutor) {
 				const toolCallId = crypto.randomUUID();
 				synthesizeCursorExecToolCall(output, stream, state, toolCallId, "read_mcp_resource", {
 					server: args.server,
@@ -2698,7 +2697,7 @@ async function handleExecServerMessage(
 			// implemented here, and serving a plain read would hand back exactly the
 			// unredacted bytes the frame exists to withhold.
 			const args = execMsg.message.value;
-			if (cursorToolPassthrough) {
+			if (externalToolExecutor) {
 				if (!args.toolCallId) args.toolCallId = crypto.randomUUID();
 				synthesizeCursorExecToolCall(output, stream, state, args.toolCallId, "read", {
 					path: piReadDisplayPath(args.path, args.offset, args.limit),
@@ -4616,7 +4615,7 @@ export function processInteractionUpdate(
 	stream: AssistantMessageEventStream,
 	state: BlockState,
 	usageState: UsageState,
-	cursorToolPassthrough?: boolean,
+	externalToolExecutor?: boolean,
 ): void {
 	const updateCase = update.message?.case;
 
@@ -4670,7 +4669,7 @@ export function processInteractionUpdate(
 		// Passthrough: already excluded from the allowlist; if Cursor still emits
 		// one, ignore it so we neither re-surface a server-finished call nor end
 		// the turn with a ToolCall the OpenAI client cannot execute.
-		if (cursorToolPassthrough) {
+		if (externalToolExecutor) {
 			log("passthrough", "ignoredServerOnlyConnectScm");
 			return;
 		}
@@ -4747,7 +4746,7 @@ export function processInteractionUpdate(
 			// turn with a ToolCall the OpenAI client cannot execute.
 			const todoCalls = selectTodoCalls(toolCall);
 			if (todoCalls.update || todoCalls.read) {
-				if (cursorToolPassthrough) {
+				if (externalToolExecutor) {
 					log("passthrough", "ignoredServerOnlyTodo");
 					return;
 				}
@@ -4777,7 +4776,7 @@ export function processInteractionUpdate(
 				// Passthrough: exclude from the allowlist; if Cursor still emits one,
 				// ignore it so we neither re-surface a server-finished call nor end the
 				// turn with a ToolCall the OpenAI client would execute again.
-				if (cursorToolPassthrough) {
+				if (externalToolExecutor) {
 					log("passthrough", "ignoredServerOnlyHostedFetch");
 					return;
 				}
