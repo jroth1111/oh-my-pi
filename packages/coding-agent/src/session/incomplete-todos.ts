@@ -45,7 +45,8 @@ export function encodeIncompleteTodoTitle(title: string): string {
 		.replace(/</g, "\\<")
 		.replace(/\r\n/g, "\\r\\n")
 		.replace(/\r/g, "\\r")
-		.replace(/\n/g, "\\n");
+		.replace(/\n/g, "\\n")
+		.replace(/[ \t]+$/g, whitespace => whitespace.replace(/ /g, "\\s").replace(/\t/g, "\\t"));
 }
 
 /** Inverse of {@link encodeIncompleteTodoTitle}. */
@@ -54,6 +55,11 @@ export function decodeIncompleteTodoTitle(title: string): string {
 	for (let i = 0; i < title.length; i++) {
 		if (title[i] === "\\" && i + 1 < title.length) {
 			const next = title[i + 1];
+			if (next === "s" || next === "t") {
+				out += next === "s" ? " " : "\t";
+				i++;
+				continue;
+			}
 			if (next === "r" && title[i + 2] === "\\" && title[i + 3] === "n") {
 				out += "\r\n";
 				i += 3;
