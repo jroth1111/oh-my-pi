@@ -2538,6 +2538,18 @@ export class AuthStorage {
 		return this.#orderUsageRankedCandidates(ranked, "none");
 	}
 
+	/** Acquire an exclusive turn reservation for a stored API-key row when requestId is set. */
+	#tryReserveApiKeySelection(provider: string, selection: ApiKeySelection, requestId: string | undefined): boolean {
+		if (!requestId) return true;
+		const reserveId = this.#getStoredCredentials(provider)[selection.index]?.id;
+		if (reserveId === undefined) return true;
+		return this.tryAcquireTurnReservation({
+			credentialId: reserveId,
+			incarnation: this.getCredentialIncarnation(reserveId),
+			requestId,
+		}).ok;
+	}
+
 	async #selectApiKeyCredential(
 		provider: string,
 		sessionId: string | undefined,

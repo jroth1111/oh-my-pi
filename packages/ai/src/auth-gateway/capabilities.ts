@@ -61,9 +61,8 @@ export function capabilitiesFor(model: Model<Api>): ModelCapabilities {
 		tools: model.supportsTools !== false,
 		parallelTools: model.supportsTools !== false,
 		reasoning: model.reasoning,
-		responsesApi:
-			model.api.includes("responses") || model.api === "openai-codex-responses" || model.api === "openai-responses",
-		messagesApi: model.api.includes("anthropic"),
+		responsesApi: surfaceAllowsApi("openai-responses", model.api),
+		messagesApi: surfaceAllowsApi("anthropic-messages", model.api),
 	};
 }
 

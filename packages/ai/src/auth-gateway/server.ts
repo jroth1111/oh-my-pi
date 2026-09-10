@@ -133,6 +133,9 @@ export interface AuthGatewayBootOptions extends AuthGatewayServerOptions {
 // `parseBind` lives in ../utils/parse-bind so the gateway and broker can't
 // drift on accepted inputs (e.g. empty hostname, IPv6 brackets).
 
+/** Native Gemini paths carry the model in the URL (`/v1beta/models/{model}:generateContent`). */
+const GEMINI_MODEL_PATH = /^\/v1beta\/models\/([^/]+):(stream)?generateContent$/;
+
 export const FORMAT_ROUTES: Record<string, { module: FormatModule; label: string }> = {
 	"/v1/chat/completions": { module: openaiChat, label: "openai-chat" },
 	"/v1/grok/chat/completions": { module: openaiChat, label: "openai-chat" },
@@ -469,6 +472,12 @@ function resolveFirstAvailableTarget(
 		if (next.type !== "dispatch") return { target: current, model: undefined };
 		current = next.targetModelId;
 	}
+}
+
+function hashString(value: string): number {
+	let h = 0;
+	for (let i = 0; i < value.length; i++) h = (h * 31 + value.charCodeAt(i)) | 0;
+	return h;
 }
 
 function unknownModelResponse(formatError: FormatErrorFn, modelId: string): Response {
@@ -1236,6 +1245,29 @@ async function handleFormatEndpoint(
 			disposition: "dispatched",
 		});
 		logger.debug("auth-gateway route decision", redactedDecisionSummary(dispatched));
+		// Identity-scoped portability (account/deployment) can only be verified
+		// now that the credential is known: skip targets from the wrong account
+		// instead of dispatching cross-account continuations.
+		const identity = bootOpts.storage.getOAuthAccountIdentity(model.provider, sessionId);
+		if (
+			!candidateAllowed(
+				compiled.portability,
+				{ id: currentTarget, provider: model.provider, accountId: identity?.accountId, deployment: model.baseUrl },
+				compiled.affinity ?? "preferred",
+			)
+		) {
+			attemptedTargets.add(currentTarget);
+			const skipped = traces.record({
+				requestId,
+				routeId: compiled.id,
+				generation: compiled.generation,
+				selectedTarget: currentTarget,
+				disposition: "skipped",
+				reason: "state_incompatible",
+			});
+			logger.debug("auth-gateway route decision", redactedDecisionSummary(skipped));
+			return { type: "retry" };
+		}
 		return { type: "key", apiKey };
 	};
 
@@ -1820,6 +1852,29 @@ async function handlePiNative(
 			disposition: "dispatched",
 		});
 		logger.debug("auth-gateway route decision", redactedDecisionSummary(dispatched));
+		// Identity-scoped portability (account/deployment) can only be verified
+		// now that the credential is known: skip targets from the wrong account
+		// instead of dispatching cross-account continuations.
+		const identity = bootOpts.storage.getOAuthAccountIdentity(model.provider, sessionId);
+		if (
+			!candidateAllowed(
+				compiled.portability,
+				{ id: currentTarget, provider: model.provider, accountId: identity?.accountId, deployment: model.baseUrl },
+				compiled.affinity ?? "preferred",
+			)
+		) {
+			attemptedTargets.add(currentTarget);
+			const skipped = traces.record({
+				requestId,
+				routeId: compiled.id,
+				generation: compiled.generation,
+				selectedTarget: currentTarget,
+				disposition: "skipped",
+				reason: "state_incompatible",
+			});
+			logger.debug("auth-gateway route decision", redactedDecisionSummary(skipped));
+			return { type: "retry" };
+		}
 		return { type: "key", apiKey };
 	};
 
@@ -2431,6 +2486,42 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 						await handleFormatEndpoint(formatRoute, boot, req, peer, health, cacheStore, pathModel, geminiStream),
 						req,
 					);
+				}
+
+				// Native Gemini paths carry the model in the URL. Inject it (and
+				// the endpoint's streaming mode) so the module sees a complete body.
+				if (req.method === "POST") {
+					const geminiPath = GEMINI_MODEL_PATH.exec(pathname);
+					if (geminiPath) {
+						let pathModel: string;
+						try {
+							pathModel = decodeURIComponent(geminiPath[1]!);
+						} catch {
+							return withCors(json(400, { error: "invalid model path encoding" }), req);
+						}
+						const streaming = geminiPath[2] !== undefined;
+						const module = {
+							...geminiV1beta,
+							parseRequest: (body: unknown, headers?: Headers) => {
+								if (!isRecord(body)) return geminiV1beta.parseRequest(body, headers);
+								let injected = body;
+								if (typeof injected.model !== "string") injected = { ...injected, model: pathModel };
+								if (typeof injected.stream !== "boolean") injected = { ...injected, stream: streaming };
+								return geminiV1beta.parseRequest(injected, headers);
+							},
+						};
+						return withCors(
+							await handleFormatEndpoint(
+								{ module, label: "gemini-v1beta" },
+								boot,
+								req,
+								peer,
+								health,
+								cacheStore,
+							),
+							req,
+						);
+					}
 				}
 
 				// Pi-native fast path. Same auth + provider plumbing as the
