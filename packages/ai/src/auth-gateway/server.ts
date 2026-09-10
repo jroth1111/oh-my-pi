@@ -82,6 +82,7 @@ import { parseRouteDefinition } from "./route-definitions";
 import { type CompiledRoute, type RouteDefinition, RouteRegistry, pickInitialRouteTarget } from "./route-graph";
 import {
 	commitGateObservesDownstreamSse,
+	holdSseUntilCommitOutcome,
 	observeSseCommit,
 	StreamCommitGate,
 	type StreamCommitState,
@@ -436,7 +437,11 @@ function clientClosedResponse(route: { module: FormatModule }): Response {
 
 type FormatErrorFn = (status: number, type: string, message: string) => Response;
 
-type AttemptPrep = { type: "key"; apiKey: string } | { type: "retry" } | { type: "respond"; response: Response };
+type AttemptPrep =
+	| { type: "key"; apiKey: string }
+	| { type: "retry" }
+	| { type: "skip" }
+	| { type: "respond"; response: Response };
 
 /**
  * Resolve the first viable dispatch target for a compiled route. A primary
@@ -467,6 +472,36 @@ function resolveFirstAvailableTarget(
 
 function unknownModelResponse(formatError: FormatErrorFn, modelId: string): Response {
 	return formatError(404, "invalid_request_error", `Unknown model: ${modelId}`);
+}
+
+function unavailableModel(target: string): GatewayErrorClassification {
+	return {
+		status: 404,
+		type: "invalid_request_error",
+		message: `Unknown model: ${target}`,
+		owner: "model",
+		disposition: "model_unavailable",
+	};
+}
+
+function initialAvailableTarget(
+	compiled: CompiledRoute,
+	resolve: (id: string) => Model<Api> | undefined,
+	attempted: Set<string>,
+): { target: string; model: Model<Api> } | undefined {
+	let target: string | undefined = compiled.targets[0];
+	while (target !== undefined) {
+		const model = resolve(target);
+		if (model) return { target, model };
+		attempted.add(target);
+		target = fallbackTargetId(
+			compiled,
+			conductorExecutionState(compiled, attempted, 0, 0, target, "probing"),
+			unavailableModel(target),
+			"probing",
+		);
+	}
+	return undefined;
 }
 
 function conductorExecutionState(
@@ -539,14 +574,6 @@ function messageHasBillableUsage(message: AssistantMessage): boolean {
 	const usage = message.usage;
 	return usage.input + usage.output + usage.cacheRead + usage.cacheWrite > 0;
 }
-
-const STREAM_PRELUDE_MAX_BYTES = 4 * 1024 * 1024;
-
-type SseRead = { done: boolean; value?: Uint8Array };
-
-type HeldSse =
-	| { type: "forward"; stream: ReadableStream<Uint8Array> }
-	| { type: "failed"; error: unknown; message?: AssistantMessage };
 
 function attachCommitGateSseObserver(
 	streamOpts: SimpleStreamOptions,
@@ -1178,6 +1205,8 @@ async function handleFormatEndpoint(
 				type: "respond",
 				response: formatError(classified.status, classified.type, classified.message),
 			};
+			if (considerFallback(unavailable)) return { type: "retry" };
+			return { type: "respond", response: lastEligibilityResponse };
 		}
 		const activeCredentialId = bootOpts.storage
 			.listOAuthAccounts(model.provider, sessionId)
@@ -1324,7 +1353,7 @@ async function handleFormatEndpoint(
 				}
 			}
 			if (lastClassified) return classifiedError(lastClassified);
-			return formatError(502, "upstream_error", "Upstream request failed");
+			return lastEligibilityResponse ?? formatError(502, "upstream_error", "Upstream request failed");
 		} finally {
 			bootOpts.storage.releaseTurnReservation(requestId);
 		}
@@ -1344,6 +1373,10 @@ async function handleFormatEndpoint(
 		const cred = await resolveCredential();
 		if (cred.type === "retry") {
 			await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
+			bootOpts.storage.releaseTurnReservation(requestId);
+			continue;
+		}
+		if (cred.type === "skip") {
 			bootOpts.storage.releaseTurnReservation(requestId);
 			continue;
 		}
@@ -1468,7 +1501,7 @@ async function handleFormatEndpoint(
 	}
 	bootOpts.storage.releaseTurnReservation(requestId);
 	if (lastClassified) return classifiedError(lastClassified);
-	return formatError(502, "upstream_error", "Upstream request failed");
+	return lastEligibilityResponse ?? formatError(502, "upstream_error", "Upstream request failed");
 }
 
 /**
@@ -1742,6 +1775,8 @@ async function handlePiNative(
 				type: "respond",
 				response: formatError(classified.status, classified.type, classified.message),
 			};
+			if (considerFallback(unavailable)) return { type: "retry" };
+			return { type: "respond", response: lastEligibilityResponse };
 		}
 		const activeCredentialId = bootOpts.storage
 			.listOAuthAccounts(model.provider, sessionId)
@@ -1895,7 +1930,7 @@ async function handlePiNative(
 				}
 			}
 			if (lastClassified) return classifiedError(lastClassified);
-			return formatError(502, "upstream_error", "Upstream request failed");
+			return lastEligibilityResponse ?? formatError(502, "upstream_error", "Upstream request failed");
 		} finally {
 			bootOpts.storage.releaseTurnReservation(requestId);
 		}
@@ -1915,6 +1950,10 @@ async function handlePiNative(
 		const cred = await resolveCredential();
 		if (cred.type === "retry") {
 			await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
+			bootOpts.storage.releaseTurnReservation(requestId);
+			continue;
+		}
+		if (cred.type === "skip") {
 			bootOpts.storage.releaseTurnReservation(requestId);
 			continue;
 		}
@@ -2034,7 +2073,7 @@ async function handlePiNative(
 	}
 	bootOpts.storage.releaseTurnReservation(requestId);
 	if (lastClassified) return classifiedError(lastClassified);
-	return formatError(502, "upstream_error", "Upstream request failed");
+	return lastEligibilityResponse ?? formatError(502, "upstream_error", "Upstream request failed");
 }
 
 /**

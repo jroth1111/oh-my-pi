@@ -2,10 +2,12 @@ import { describe, expect, it } from "bun:test";
 import {
 	commitGateObservesDownstreamSse,
 	holdSseUntilCommit,
+	holdSseUntilCommitOutcome,
 	observeSseCommit,
 	PreludeAbortedError,
 	StreamCommitGate,
 } from "@oh-my-pi/pi-ai/auth-gateway";
+import type { AssistantMessage } from "@oh-my-pi/pi-ai/types";
 
 const FOUR_MIB = 4 * 1024 * 1024;
 
