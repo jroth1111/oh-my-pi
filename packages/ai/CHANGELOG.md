@@ -193,6 +193,8 @@
 - Auth gateway can load virtual routes from a JSON/JSON5 file.
 
 - Fixed gateway stream cleanup to release reservations on read failures and cancellations, settle probes only from successful canonical results, and continue through unresolved configured fallback targets.
+- Fixed concurrent credential probes and prevented nested fallback routes from selecting targets in unrelated branches.
+
 
 ## [18.1.14] - 2026-09-07
 
