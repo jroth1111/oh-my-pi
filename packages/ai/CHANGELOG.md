@@ -240,6 +240,8 @@
 - Fixed pi-native virtual routes dispatching compiled.targets[0], suffix fallback edges per sibling, and a parse→wire Responses options contract test.
 - Fixed nested fallback edges scoped per source target, turn reservations for selected API-key rows, and rejection of unsupported Codex `previous_response_id` over the gateway.
 - Fixed strict-tools Responses retries preserving caller `store`/`previous_response_id`, denied allowBlocked bypass of foreign turn reservations, and reacquired reservations after broker prepare.
+- Fixed auth-gateway dispatch through compiled route targets, preserved upstream Responses IDs for continuation, and classified bare model-unavailable errors as model failover.
+## [18.1.14] - 2026-09-07
 
 - Gateway error classifications now carry a failure owner and retry/failover disposition (`credential_permanent`, `provider_transient`, `policy_terminal`, …); provider status codes stay authoritative over message wording, and context-overflow detection reuses the central classifier.
 - Gateway requests now forward `previous_response_id`, `parallel_tool_calls`, `logit_bias`, `user`, and `response_format` to providers instead of dropping them; Responses requests map `response_format` JSON-schema to the flat `text.format` shape and never send Chat-Completions-only `seed`.
