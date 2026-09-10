@@ -174,6 +174,8 @@
 - Fixed OpenAI Responses continuation pairing a caller-supplied `previous_response_id` with an internally computed delta from a different stored response, and restricted stale-baseline recovery to internally owned chain ids so a stale caller id can no longer silently drop prior context.
 - Fixed OpenAI Responses gateway retries to preserve caller storage through strict-tool fallback, retain structured-output descriptions, and treat top-level `event: error` SSE frames as terminal failures.
 
+- Fixed auth-gateway decision traces accepting `credential_lookup_failed` as a skipped reason when `getApiKey` throws.
+- Fixed caller-owned Responses continuations to store each response, and returned matching `x-request-id` trace headers for credential lookup failures.
 ## [18.1.14] - 2026-09-07
 
 ### Fixed
