@@ -450,3 +450,10 @@ describe("RouteRegistry", () => {
 		expect(registry.get("copied")?.portability).toEqual({ scope: "provider", origin: "openai" });
 	});
 });
+
+it("rejects route IDs erased by URL normalization", () => {
+	const registry = new RouteRegistry(() => undefined);
+	for (const id of [".", ".."])
+		expect(() => registry.register({ id, root: { type: "target", model: "target" } })).toThrow(/dot segment/);
+	expect(registry.list()).toEqual([]);
+});

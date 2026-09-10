@@ -184,6 +184,7 @@
 
 - Fixed gateway SSE holds to share the canonical commit-aware implementation and flush EOF metadata, while unresolved or credentialless route targets now advance to the next eligible target.
 - Fixed concurrent credential probes and permanent-credential fallback; stateful continuations keep their target and reject ambiguous account selection.
+- Fixed stateful continuations changing targets or accounts, and rejected route IDs that URL normalization would erase.
 
 - Gateway error classifications now carry a failure owner and retry/failover disposition (`credential_permanent`, `provider_transient`, `policy_terminal`, …); provider status codes stay authoritative over message wording, and context-overflow detection reuses the central classifier.
 - Gateway requests now forward `previous_response_id`, `parallel_tool_calls`, `logit_bias`, `user`, and `response_format` to providers instead of dropping them; Responses requests map `response_format` JSON-schema to the flat `text.format` shape and never send Chat-Completions-only `seed`.
@@ -194,6 +195,8 @@
 
 - Fixed gateway stream cleanup to release reservations on read failures and cancellations, settle probes only from successful canonical results, and continue through unresolved configured fallback targets.
 - Fixed concurrent credential probes and prevented nested fallback routes from selecting targets in unrelated branches.
+- Auth gateway `GET /v1/routes` lists registered virtual routes.
+- Auth gateway `GET /v1/routes/:id` returns a registered virtual route.
 
 
 ## [18.1.14] - 2026-09-07
