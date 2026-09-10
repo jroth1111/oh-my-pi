@@ -215,6 +215,10 @@
 - Fixed bare `balance` routes always dispatching the first child; initial pick now rotates across children.
 - Fixed Anthropic count-tokens ignoring `system`/`tools` and accepting non-array `messages`.
 - Fixed quota-share DRR picking by weight when the first finalist already holds higher deficit than the second.
+- Fixed fair-share ties, round-robin target selection, conditional vision routes, and recovery when a preferred fallback becomes unavailable.
+
+- Quota probes require a requestId; balance routes pick the initial target via rr/weighted strategy.
+- Fixed auth-gateway credential disable returning success before a remote broker disable completed; the handler now awaits the remote path when present.
 ## [18.1.14] - 2026-09-07
 
 ### Fixed

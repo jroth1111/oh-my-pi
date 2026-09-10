@@ -335,3 +335,14 @@ it("rotates initial dispatch across balance children", () => {
 	expect(first).toEqual({ type: "dispatch", targetModelId: "a" });
 	expect(second).toEqual({ type: "dispatch", targetModelId: "b" });
 });
+
+it("tries an unused primary when a remembered backup is unavailable", () => {
+	expect(
+		decideAttempt({
+			route: route({ targets: ["primary", "backup"], fallbacks: { provider_unavailable: ["backup"] } }),
+			state: state({ attemptedTargets: new Set(["backup"]), currentTarget: "backup" }),
+			classification: classification("provider_unavailable"),
+			commitState: "probing",
+		}),
+	).toEqual({ type: "fallback_target", targetModelId: "primary" });
+});
