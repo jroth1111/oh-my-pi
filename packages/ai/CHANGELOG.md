@@ -336,6 +336,11 @@
 - Stored Responses requests retain storage intent through gateway forwarding and strict-tool retries.
 - Fixed auth-gateway decision traces accepting `credential_lookup_failed` as a skipped reason when `getApiKey` throws.
 - Fixed caller-owned Responses continuations to store each response, and returned matching `x-request-id` trace headers for credential lookup failures.
+- Auth gateway can load virtual routes from a JSON/JSON5 file.
+- Unavailable models select model fallbacks, and empty stream preludes no longer prevent failover.
+- Fixed concurrent credential probes and permanent-credential fallback; stateful continuations keep their target and reject ambiguous account selection.
+
+
 ## [18.1.14] - 2026-09-07
 
 ### Fixed

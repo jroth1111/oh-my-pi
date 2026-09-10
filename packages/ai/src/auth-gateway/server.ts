@@ -521,6 +521,7 @@ function conductorExecutionState(
 		attemptedCredentials,
 		retryCount,
 		fallbackCount,
+		siblingsExhausted: false,
 		committed: commitState !== "probing",
 		currentTarget,
 		siblingsExhausted,
@@ -1151,6 +1152,16 @@ async function handleFormatEndpoint(
 	};
 
 	const resolveCredential = async (): Promise<AttemptPrep> => {
+		if (parsed.options.previousResponseId && bootOpts.storage.listStoredCredentials(model.provider).length > 1) {
+			return {
+				type: "respond",
+				response: formatError(
+					400,
+					"invalid_request_error",
+					"Responses continuations require an unambiguous single-credential provider; credential rotation is disabled",
+				),
+			};
+		}
 		let apiKey: string | undefined;
 		if (
 			parsed.options.previousResponseId &&
@@ -1721,6 +1732,16 @@ async function handlePiNative(
 	};
 
 	const resolveCredential = async (): Promise<AttemptPrep> => {
+		if (parsed.options.previousResponseId && bootOpts.storage.listStoredCredentials(model.provider).length > 1) {
+			return {
+				type: "respond",
+				response: formatError(
+					400,
+					"invalid_request_error",
+					"Responses continuations require an unambiguous single-credential provider; credential rotation is disabled",
+				),
+			};
+		}
 		let apiKey: string | undefined;
 		if (
 			parsed.options.previousResponseId &&

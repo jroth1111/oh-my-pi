@@ -6229,7 +6229,7 @@ export class AuthStorage {
 					entry.credential.type === selection.credential.type &&
 					!this.#isCredentialBlocked(provider, providerKey, index, blockScopes ?? blockScope),
 			);
-			if (hasUsableSibling) return undefined;
+			if (!allowBlocked && hasUsableSibling) return undefined;
 			const held = this.#activeTurnReservation(blockedId, this.getCredentialIncarnation(blockedId));
 			if (held && held.requestId !== options?.requestId) return undefined;
 			const probeScope = this.#resolveBlockingProbeScope(
@@ -6482,8 +6482,9 @@ export class AuthStorage {
 				if (options?.requestId) {
 					this.releaseTurnReservation(options.requestId);
 					this.clearQuotaProbe(options.requestId);
-				} else if (finishId !== undefined) {
-					this.clearAnonymousQuotaProbe(finishId, finishScope);
+				} else if (anonymousProbe) {
+					const key = anonymousProbeRequestKey(anonymousProbe.credentialId, anonymousProbe.blockScope);
+					if (this.#inflightProbes.get(key)?.leaseId === anonymousProbe.leaseId) this.clearQuotaProbe(key);
 				}
 			}
 		}
