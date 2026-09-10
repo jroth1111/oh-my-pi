@@ -18,6 +18,9 @@
 - Treat Anthropic message_start as stream metadata; restore Cloudflare and MCP OAuth notes to their released sections.
 - Authoritative HTTP status beats free-text aborted wording; Responses file_id refs are rejected on incompatible targets.
 - Fixed nested fallback ordering, permanent-credential recovery, and provider-scoped file attachment checks; model discovery blocks private addresses.
+- Auth gateway retries a sibling credential on quota errors before falling over to another model.
+- Fixed nested fallback ordering, permanent-credential recovery, and provider-scoped file attachment checks; model discovery blocks private addresses.
+
 - Fixed auth-gateway model discovery treating non-2xx responses with array/`data` bodies as successful catalogs.
 - Fixed auth-gateway SSE streams leaking turn reservations when `reader.read()` rejects after the response is returned.
 - Fixed OpenAI Responses file-id compatibility being checked only against the initial route target; fallback targets are revalidated before dispatch.

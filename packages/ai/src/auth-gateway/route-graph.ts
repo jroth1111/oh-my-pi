@@ -333,7 +333,21 @@ function compileFallback(node: FallbackNode, seenOnPath: ReadonlySet<string>): N
 		const existing = fallbacks[disposition];
 		fallbacks[disposition] = [...new Set([...afterPrimary, ...(existing ?? [])])];
 	}
-	return { targets, fallbacks };
+	for (let index = 0; index < parts.length; index++) {
+		const nextEntries = parts.slice(index + 1).flatMap(part => part.entries);
+		for (const from of parts[index]!.targets) {
+			const edges = byTarget.get(from)!;
+			for (const disposition of node.on)
+				edges[disposition] = [...new Set([...(edges[disposition] ?? []), ...nextEntries])].filter(
+					id => id !== from,
+				);
+		}
+	}
+	for (const disposition of Object.keys(fallbacks) as GatewayErrorDisposition[]) {
+		const included = new Set(fallbacks[disposition]);
+		fallbacks[disposition] = [...new Set(targets.filter(id => included.has(id)))];
+	}
+	return { targets, entries: parts[0]!.entries, byTarget, fallbacks };
 }
 
 function compileFlatten(children: readonly RouteNode[], seenOnPath: ReadonlySet<string>): NodeCompile {
