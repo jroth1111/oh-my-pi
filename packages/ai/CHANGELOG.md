@@ -183,6 +183,8 @@
 - Fixed gateway fallback routing through missing models and credentials while honoring each route’s configured failure conditions.
 
 - Fixed gateway SSE holds to share the canonical commit-aware implementation and flush EOF metadata, while unresolved or credentialless route targets now advance to the next eligible target.
+- Fixed concurrent credential probes and permanent-credential fallback; stateful continuations keep their target and reject ambiguous account selection.
+
 
 ## [18.1.14] - 2026-09-07
 
