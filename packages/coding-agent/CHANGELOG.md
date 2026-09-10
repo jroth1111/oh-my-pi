@@ -282,6 +282,7 @@
 ### Added
 
 - `omp auth-gateway serve --routes=<path>` loads virtual route definitions from a JSON/JSON5 file.
+- `omp auth-gateway serve` loads virtual routes from `auth.gateway.routesFile` in config.yml when `--routes` is omitted.
 
 - Added provider-reported credits and concrete routed-model counts to `/session` statistics ([#8590](https://github.com/can1357/oh-my-pi/pull/8590) by [@will-bogusz](https://github.com/will-bogusz)).
 - Added `CLINE_API_KEY` to the CLI environment help for native ClinePass subscription inference ([#7863](https://github.com/can1357/oh-my-pi/pull/7863) by [@will-bogusz](https://github.com/will-bogusz)).

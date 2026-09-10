@@ -513,6 +513,23 @@ function resolveFirstAvailableTarget(
 	}
 }
 
+function hashString(value: string): number {
+	let h = 0;
+	for (let i = 0; i < value.length; i++) h = (h * 31 + value.charCodeAt(i)) | 0;
+	return h;
+}
+
+/**
+ * Order route targets for initial selection: the balance strategy's pick
+ * first, then the remaining targets in compiled order so a catalog-absent
+ * primary falls through to viable siblings instead of 404ing the route.
+ */
+function orderedInitialTargets(compiled: CompiledRoute, salt: number): string[] {
+	const first = pickInitialRouteTarget(compiled, salt);
+	if (first === undefined) return [...compiled.targets];
+	return [first, ...compiled.targets.filter(target => target !== first)];
+}
+
 function unknownModelResponse(formatError: FormatErrorFn, modelId: string): Response {
 	return formatError(404, "invalid_request_error", `Unknown model: ${modelId}`);
 }
@@ -1091,6 +1108,13 @@ async function handleFormatEndpoint(
 	const classifiedError = (classified: GatewayErrorClassification): Response =>
 		formatError(classified.status, classified.type, classified.message);
 
+	const attemptHookCtx = () => ({
+		requestId,
+		routeId: compiled.id,
+		target: currentTarget,
+		generation: compiled.generation,
+	});
+
 	const considerFallback = (classified: GatewayErrorClassification): boolean => {
 		lastClassified = classified;
 		recordProviderHealthFailure(health, model, classified);
@@ -1129,6 +1153,11 @@ async function handleFormatEndpoint(
 	};
 
 	const bindCurrentTarget = (targetId: string): Response | undefined | "skipped" => {
+		if (targetId !== currentTarget) {
+			// Sibling-credential exhaustion is per-target: a fresh target gets
+			// its own credential siblings before the conductor moves on.
+			siblingsExhausted = false;
+		}
 		currentTarget = targetId;
 		const resolved = bootOpts.resolveModel(currentTarget);
 		if (!resolved) {
@@ -1414,6 +1443,7 @@ async function handleFormatEndpoint(
 					}
 					bootOpts.storage.settleQuotaProbeSuccess(requestId);
 					health.recordSuccess(model.provider, model.id);
+					await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: true });
 					rememberPromptCacheHit(cacheStore, fingerprint, model, sessionId, currentTarget);
 					await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: true });
 					await runHook(bootOpts.hooks?.afterRequest, {
@@ -1506,6 +1536,7 @@ async function handleFormatEndpoint(
 			}
 			await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
 			bootOpts.storage.releaseTurnReservation(requestId);
+			await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
 			return classifiedError(classified);
 		}
 		if (!commitGateObservesDownstreamSse(route.label)) observeAssistantCommit(events, commitGate);
@@ -1531,6 +1562,7 @@ async function handleFormatEndpoint(
 				if (held.message.stopReason === "aborted") {
 					await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
 					bootOpts.storage.releaseTurnReservation(requestId);
+					await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
 					return formatError(499, "request_aborted", errorMessage);
 				}
 				const classified = classifyAssistantFailure(held.message);
@@ -1552,6 +1584,7 @@ async function handleFormatEndpoint(
 			}
 			await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
 			bootOpts.storage.releaseTurnReservation(requestId);
+			await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
 			return classifiedError(classified);
 		}
 		if (controller.signal.aborted) {
@@ -1738,6 +1771,11 @@ async function handlePiNative(
 	};
 
 	const bindCurrentTarget = (targetId: string): Response | undefined | "skipped" => {
+		if (targetId !== currentTarget) {
+			// Sibling-credential exhaustion is per-target: a fresh target gets
+			// its own credential siblings before the conductor moves on.
+			siblingsExhausted = false;
+		}
 		currentTarget = targetId;
 		const resolved = bootOpts.resolveModel(currentTarget);
 		if (!resolved) {
@@ -2039,6 +2077,7 @@ async function handlePiNative(
 					}
 					bootOpts.storage.settleQuotaProbeSuccess(requestId);
 					health.recordSuccess(model.provider, model.id);
+					await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: true });
 					rememberPromptCacheHit(cacheStore, fingerprint, model, sessionId, currentTarget);
 					await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: true });
 					return json(200, { message }, gatewayResponseHeaders(model, { requestId, message, startedAt }));
@@ -2121,6 +2160,7 @@ async function handlePiNative(
 			}
 			await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
 			bootOpts.storage.releaseTurnReservation(requestId);
+			await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
 			return classifiedError(classified);
 		}
 		if (!commitGateObservesDownstreamSse("pi-native")) observeAssistantCommit(events, commitGate);
@@ -2144,6 +2184,7 @@ async function handlePiNative(
 				if (held.message.stopReason === "aborted") {
 					await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
 					bootOpts.storage.releaseTurnReservation(requestId);
+					await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
 					return formatError(499, "request_aborted", errorMessage);
 				}
 				const classified = classifyAssistantFailure(held.message);
@@ -2165,6 +2206,7 @@ async function handlePiNative(
 			}
 			await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
 			bootOpts.storage.releaseTurnReservation(requestId);
+			await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
 			return classifiedError(classified);
 		}
 		if (controller.signal.aborted) {

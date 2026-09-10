@@ -465,6 +465,7 @@
 - Fixed bare `balance` routes always dispatching the first child; initial pick now rotates across children.
 - Fixed Anthropic count-tokens ignoring `system`/`tools` and accepting non-array `messages`.
 - Fixed quota-share DRR picking by weight when the first finalist already holds higher deficit than the second.
+- Fallback respects deployment affinity, and successful sibling requests cannot clear another credential's cooldown.
 - Fixed duplicate Gemini tool calls, parallel result pairing, weighted routing, concurrent API-key reservations, and stream completion hooks; discovery validates resolved addresses.
 
 - Block private discovery hosts across RFC1918, CGNAT, link-local, and IPv6 ULA ranges when `allowPrivate` is unset.
