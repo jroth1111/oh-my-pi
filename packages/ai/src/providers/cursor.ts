@@ -5730,14 +5730,7 @@ function resolveCursorWireModel(
 	modelId: string;
 	parameters: RequestedModel_ModelParameterbytes[];
 } {
-	const rawWireModelId = requestModelId ?? model.requestModelId ?? model.id;
-	// Synthetic catalog id `auto` is the Cursor router sentinel; without roster
-	// proof the wire contract expects `default` (and gateway SSE already treats
-	// both as auto intent). An explicitly resolved `requestModelId` of "auto" —
-	// from discovery or an exact caller override — echoes the roster verbatim,
-	// matching what the CLI itself sends.
-	const rosterEchoedAuto = rawWireModelId === "auto" && (requestModelId === "auto" || model.requestModelId === "auto");
-	const wireModelId = !rosterEchoedAuto && rawWireModelId === "auto" ? "default" : rawWireModelId;
+	const wireModelId = requestModelId ?? model.requestModelId ?? model.id;
 	if (wireMode === "discovered") return { modelId: wireModelId, parameters: [] };
 	// `collapseVariantId` keeps the lane in the logical id (`-high-fast` →
 	// base `-fast`) and decodes the KDL effort (`-none` → `off`).

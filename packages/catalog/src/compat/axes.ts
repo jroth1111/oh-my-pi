@@ -322,6 +322,7 @@ export const AXES: Readonly<Record<string, AxisDef>> = {
 	 * working live id (`gemini-3-flash` → `gemini-3.8-flash`).
 	 */
 	"sand-wire-model-id": { key: "sandWireModelId", set: "catalog", shape: "scalar" },
+	"request-model-id": { key: "requestModelId", set: "catalog", shape: "scalar" },
 	/**
 	 * When to apply `sand-wire-model-id`. `tools` ⇒ rewrite only when the
 	 * request advertises tools (text-only keeps the selected AvailableModels id).

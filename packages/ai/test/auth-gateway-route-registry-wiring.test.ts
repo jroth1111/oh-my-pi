@@ -81,7 +81,7 @@ describe("auth-gateway RouteRegistry wiring", () => {
 					messages: [{ role: "user", content: "hi" }],
 				}),
 			});
-			expect(res.status).toBe(400);
+			expect(res.status).toBe(404);
 		} finally {
 			await handle.close();
 			storage.close();

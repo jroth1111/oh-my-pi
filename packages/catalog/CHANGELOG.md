@@ -5,6 +5,8 @@
 ### Added
 ### Fixed
 
+- Cursor automatic-model selection preserves its wire identity across live discovery and cached catalogs.
+- Grok Bot namespace overrides keep discovery requests on a matching client version.
 - Grok Bot Gemini 3 Flash tool requests stay on the selected model instead of switching to Gemini 3.8 Flash, which may be unavailable.
 - Cursor discovery preserves the roster model ID for automatic routing.
 - Updated Cursor protocol definitions for capability flags, session identifiers, and server updates.

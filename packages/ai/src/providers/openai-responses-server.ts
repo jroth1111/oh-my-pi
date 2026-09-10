@@ -902,7 +902,7 @@ export function encodeResponse(
 	return buildResponseEnvelope(
 		message,
 		resolveAuthGatewayWireModelId(message, requestedModelId, options),
-		makeRespId(),
+		message.responseId ?? makeRespId(),
 		responseStatusForStopReason(message),
 		items,
 		buildUsage(message),
@@ -959,7 +959,7 @@ export function encodeStream(
 	control?: AuthGatewayStreamControl,
 ): ReadableStream<Uint8Array> {
 	const encoder = new TextEncoder();
-	const responseId = makeRespId();
+	let responseId = makeRespId();
 	let sequenceNumber = 0;
 	let cancelled = control?.signal?.aborted === true;
 	const markCancelled = () => {
@@ -1272,7 +1272,7 @@ export function encodeStream(
 					switch (ev.type) {
 						case "start": {
 							createdAt = Math.floor((ev.partial.timestamp || Date.now()) / 1000);
-							ensureEnvelopes();
+							if (ev.partial.responseId) ensureEnvelopes();
 							break;
 						}
 						case "text_start": {
@@ -1476,6 +1476,11 @@ export function encodeStream(
 				};
 				for await (const ev of events) {
 					if (cancelled) return;
+					if (!envelopesStarted) {
+						const message =
+							"partial" in ev ? ev.partial : "message" in ev ? ev.message : "error" in ev ? ev.error : undefined;
+						if (message?.responseId) responseId = message.responseId;
+					}
 					if (ev.type === "routed_model") {
 						// Explicit InteractionUpdate.routedModel / checkpoint signal —
 						// never treat repeated partial.model observations as proof.

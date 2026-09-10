@@ -160,7 +160,7 @@ describe("auth-gateway GET /v1/routes", () => {
 				},
 				{
 					id: "virtual-b",
-					generation: 3,
+					generation: 2,
 					targets: [backupId],
 					fallbacks: {},
 				},

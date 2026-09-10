@@ -585,6 +585,7 @@ describe("auth-gateway conductor wiring", () => {
 				headers: { "Content-Type": "application/json", Authorization: "Bearer t" },
 				body: JSON.stringify({
 					model: "virtual-impl",
+					prompt_cache_key: crypto.randomUUID(),
 					messages: [{ role: "user", content: "hi" }],
 					stream: false,
 				}),
@@ -654,6 +655,7 @@ describe("auth-gateway conductor wiring", () => {
 				headers: { "Content-Type": "application/json", Authorization: "Bearer t" },
 				body: JSON.stringify({
 					model: "virtual-impl",
+					prompt_cache_key: crypto.randomUUID(),
 					messages: [{ role: "user", content: "hi" }],
 					stream: false,
 				}),

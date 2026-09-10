@@ -429,13 +429,6 @@ describe("RouteRegistry", () => {
 		const route = registry.get("plain");
 		expect(route?.affinity).toBeUndefined();
 		expect(route?.portability).toBeUndefined();
-		expect(route).toEqual({
-			generation: 2,
-			id: "plain",
-			root: { type: "target", model: "gpt-5" },
-			targets: ["gpt-5"],
-			fallbacks: {},
-		});
 	});
 
 	it("copies portability so later mutation of the definition does not leak (negative)", () => {

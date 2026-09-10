@@ -66,19 +66,22 @@ export function decideAttempt(args: {
 	}
 
 	const { disposition } = classification;
+	const candidates = route.fallbackByTarget
+		? route.fallbackByTarget[state.currentTarget]?.[disposition]
+		: route.fallbacks[disposition];
 	switch (disposition) {
 		case "cancelled":
 		case "request_terminal":
 		case "policy_terminal":
 		case "gateway_terminal":
-		case "credential_permanent":
 			return { type: "terminal" };
+		case "credential_permanent":
 		case "credential_quota":
 		case "credential_transient": {
 			if (!state.siblingsExhausted) {
 				return { type: "sibling_credential" };
 			}
-			const next = firstUnused(route.fallbacks[disposition], state.attemptedTargets);
+			const next = firstUnused(candidates, state.attemptedTargets);
 			return next === undefined ? { type: "terminal" } : { type: "fallback_target", targetModelId: next };
 		}
 		case "provider_transient":
@@ -90,8 +93,10 @@ export function decideAttempt(args: {
 			// small model on context_overflow, or any unused leaf after a
 			// preferred-later failure).
 			const next =
-				firstUnused(route.fallbacks[disposition], state.attemptedTargets) ??
-				(disposition !== "context_overflow" && route.fallbacks[disposition]?.includes(state.currentTarget)
+				firstUnused(candidates, state.attemptedTargets) ??
+				(disposition !== "context_overflow" &&
+				(!route.fallbackByTarget || (route.root.type === "fallback" && route.root.on.includes(disposition))) &&
+				route.fallbacks[disposition]?.includes(state.currentTarget)
 					? firstUnused(route.targets, state.attemptedTargets)
 					: undefined);
 			return next === undefined ? { type: "terminal" } : { type: "fallback_target", targetModelId: next };

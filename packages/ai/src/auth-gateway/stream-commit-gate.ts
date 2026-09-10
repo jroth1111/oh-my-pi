@@ -1,3 +1,5 @@
+import type { AssistantMessageEventStream } from "../utils/event-stream";
+
 /** Classification of one Responses SSE event for commit / failover. */
 export type CommitClass = "metadata" | "output" | "terminal-success" | "terminal-retryable" | "terminal-failure";
 
@@ -7,13 +9,20 @@ const DEFAULT_MAX_PRELUDE_BYTES = 4 * 1024 * 1024;
 
 /** Downstream SSE observer is used for Responses; upstream onSseEvent must not also feed the gate. */
 export function commitGateObservesDownstreamSse(formatLabel: string): boolean {
-	return formatLabel === "openai-responses";
+	return formatLabel === "openai-responses" || formatLabel === "pi-native";
 }
 
 const METADATA_EVENTS: Record<string, true> = {
 	"response.created": true,
 	"response.in_progress": true,
 	"response.queued": true,
+	"response.output_item.added": true,
+	"response.content_part.added": true,
+	start: true,
+	message_start: true,
+	text_start: true,
+	thinking_start: true,
+	toolcall_start: true,
 	heartbeat: true,
 	ping: true,
 };
@@ -134,10 +143,11 @@ export class PreludeAbortedError extends Error {
 export function classifyCommitEvent(eventType: string): CommitClass {
 	if (!eventType) return "output";
 	if (METADATA_EVENTS[eventType]) return "metadata";
-	if (eventType === "response.completed") return "terminal-success";
+	if (eventType === "response.completed" || eventType === "done" || eventType === "message_stop")
+		return "terminal-success";
 	if (eventType === "response.failed") return "terminal-retryable";
 	if (eventType === "response.incomplete") return "terminal-success";
-	if (eventType === "response.error") return "terminal-failure";
+	if (eventType === "response.error" || eventType === "error") return "terminal-failure";
 	return "output";
 }
 
@@ -196,10 +206,10 @@ export function holdSseUntilCommit(
 					const state = gate.classifyAndObserve(eventType, next.frame.length);
 					pending = next.rest;
 					next = nextSseFrame(pending);
-					if (state === "terminated") {
+					if (state === "terminated" && !gate.sawSuccessfulTerminal) {
 						throw new PreludeAbortedError(gate.takePrelude() ?? [], eventType);
 					}
-					if (state === "committed") {
+					if (state === "committed" || gate.sawSuccessfulTerminal) {
 						committed = true;
 						for (const held of gate.takePrelude() ?? []) controller.enqueue(held);
 						if (!buffered) controller.enqueue(chunk);
@@ -208,15 +218,18 @@ export function holdSseUntilCommit(
 				}
 				if (!buffered) {
 					// Cap crossed: force commit observation and keep the rejected chunk.
-					gate.classifyAndObserve("response.output_item.added", chunk.byteLength);
+					gate.classifyAndObserve("", chunk.byteLength);
 					committed = true;
 					for (const held of gate.takePrelude() ?? []) controller.enqueue(held);
 					controller.enqueue(chunk);
 				}
 			},
-			flush() {
-				// truncated tail without commit: treat as metadata-only commit so
-				// a holding consumer never stalls
+			flush(controller) {
+				if (committed) return;
+				const held = gate.takePrelude() ?? [];
+				if (held.length === 0) return;
+				gate.classifyAndObserve("", 0);
+				for (const chunk of held) controller.enqueue(chunk);
 			},
 		}),
 	);
@@ -251,4 +264,24 @@ export function observeSseCommit(
 			},
 		}),
 	);
+}
+
+export function observeAssistantCommit(
+	events: AssistantMessageEventStream,
+	gate: StreamCommitGate,
+): AssistantMessageEventStream {
+	const iterate = events[Symbol.asyncIterator].bind(events);
+	events[Symbol.asyncIterator] = async function* () {
+		for await (const event of { [Symbol.asyncIterator]: iterate }) {
+			if (
+				((event.type === "text_delta" || event.type === "thinking_delta" || event.type === "toolcall_delta") &&
+					event.delta.length > 0) ||
+				event.type === "toolcall_end"
+			) {
+				gate.classifyAndObserve("response.output_text.delta", 0);
+			}
+			yield event;
+		}
+	};
+	return events;
 }

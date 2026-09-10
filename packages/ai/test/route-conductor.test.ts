@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import type { CompiledRoute } from "@oh-my-pi/pi-ai/auth-gateway";
+import { RouteRegistry } from "@oh-my-pi/pi-ai/auth-gateway/route-graph";
 import { decideAttempt, type ExecutionState } from "@oh-my-pi/pi-ai/auth-gateway/route-conductor";
 import type { GatewayErrorClassification, GatewayErrorDisposition } from "@oh-my-pi/pi-ai/error";
 
@@ -255,6 +256,7 @@ describe("decideAttempt", () => {
 	});
 
 	it("rotates balance rr targets across fresh executions", () => {
+		const registry = new RouteRegistry(() => undefined);
 		const balanceRoute = {
 			generation: 1,
 			id: "balance-rr",
@@ -271,11 +273,13 @@ describe("decideAttempt", () => {
 		} as CompiledRoute;
 		const first = decideAttempt({
 			route: balanceRoute,
+			preferredTargetId: registry.pickInitialTarget(balanceRoute),
 			state: state({ routeId: "balance-rr", currentTarget: "a", attemptedTargets: new Set() }),
 			commitState: "probing",
 		});
 		const second = decideAttempt({
 			route: balanceRoute,
+			preferredTargetId: registry.pickInitialTarget(balanceRoute),
 			state: state({ routeId: "balance-rr", currentTarget: "a", attemptedTargets: new Set() }),
 			commitState: "probing",
 		});
@@ -284,6 +288,7 @@ describe("decideAttempt", () => {
 	});
 
 	it("prefers the highest-weight balance child on fresh dispatch", () => {
+		const registry = new RouteRegistry(() => undefined);
 		const balanceRoute = {
 			generation: 1,
 			id: "balance-weighted",
@@ -300,6 +305,7 @@ describe("decideAttempt", () => {
 		} as CompiledRoute;
 		const action = decideAttempt({
 			route: balanceRoute,
+			preferredTargetId: registry.pickInitialTarget(balanceRoute),
 			state: state({ routeId: "balance-weighted", currentTarget: "low", attemptedTargets: new Set() }),
 			commitState: "probing",
 		});
@@ -307,7 +313,9 @@ describe("decideAttempt", () => {
 	});
 });
 
-it("rotates initial dispatch across balance children", () => {
+it("keeps round-robin positions isolated between gateway registries", () => {
+	const firstRegistry = new RouteRegistry(() => undefined);
+	const secondRegistry = new RouteRegistry(() => undefined);
 	const balanceRoute = {
 		generation: 1,
 		id: "bal",
@@ -324,16 +332,18 @@ it("rotates initial dispatch across balance children", () => {
 	} satisfies CompiledRoute;
 	const first = decideAttempt({
 		route: balanceRoute,
+		preferredTargetId: firstRegistry.pickInitialTarget(balanceRoute),
 		state: state({ currentTarget: "a", attemptedTargets: new Set() }),
 		commitState: "probing",
 	});
 	const second = decideAttempt({
 		route: balanceRoute,
+		preferredTargetId: secondRegistry.pickInitialTarget(balanceRoute),
 		state: state({ currentTarget: "a", attemptedTargets: new Set() }),
 		commitState: "probing",
 	});
 	expect(first).toEqual({ type: "dispatch", targetModelId: "a" });
-	expect(second).toEqual({ type: "dispatch", targetModelId: "b" });
+	expect(second).toEqual({ type: "dispatch", targetModelId: "a" });
 });
 
 it("tries an unused primary when a remembered backup is unavailable", () => {
@@ -345,4 +355,73 @@ it("tries an unused primary when a remembered backup is unavailable", () => {
 			commitState: "probing",
 		}),
 	).toEqual({ type: "fallback_target", targetModelId: "primary" });
+});
+
+it("selects nested round-robin leaves and exhausts balanced siblings before the outer fallback", () => {
+	const registry = new RouteRegistry(() => undefined);
+	registry.register({
+		id: "nested",
+		root: {
+			type: "fallback",
+			on: ["provider_unavailable"],
+			children: [
+				{
+					type: "balance",
+					strategy: "rr",
+					children: [
+						{ type: "target", model: "a" },
+						{ type: "target", model: "b" },
+					],
+				},
+				{ type: "target", model: "c" },
+			],
+		},
+	});
+	const compiled = registry.get("nested")!;
+	expect(registry.pickInitialTarget(compiled)).toBe("a");
+	expect(registry.pickInitialTarget(compiled)).toBe("b");
+	for (const [current, attempted, expected] of [
+		["a", ["a"], "b"],
+		["b", ["b"], "a"],
+		["b", ["a", "b"], "c"],
+	] as const) {
+		expect(
+			decideAttempt({
+				route: compiled,
+				state: state({ currentTarget: current, attemptedTargets: new Set(attempted) }),
+				classification: classification("provider_unavailable"),
+				commitState: "probing",
+			}),
+		).toEqual({ type: "fallback_target", targetModelId: expected });
+	}
+});
+
+it("enters a nested fallback at its primary when handling context overflow", () => {
+	const registry = new RouteRegistry(() => undefined);
+	registry.register({
+		id: "nested",
+		root: {
+			type: "fallback",
+			on: ["context_overflow"],
+			children: [
+				{ type: "target", model: "a" },
+				{
+					type: "fallback",
+					on: ["context_overflow"],
+					children: [
+						{ type: "target", model: "b" },
+						{ type: "target", model: "c" },
+					],
+				},
+			],
+		},
+	});
+	expect(
+		decideAttempt({
+			route: registry.get("nested")!,
+			state: state({ currentTarget: "a", attemptedTargets: new Set(["a"]) }),
+			classification: classification("context_overflow"),
+			commitState: "probing",
+		}),
+	).toEqual({ type: "fallback_target", targetModelId: "b" });
 });

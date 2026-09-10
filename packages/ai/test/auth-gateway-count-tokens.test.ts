@@ -29,7 +29,7 @@ describe("handleCountTokens", () => {
 		const messages = [{ role: "user", content: "hello" }];
 		const res = await handleCountTokens(post(JSON.stringify({ model: "claude-sonnet", messages })), resolveKnown);
 		expect(res.status).toBe(200);
-		const expected = Math.ceil(JSON.stringify(messages).length / 4);
+		const expected = Math.ceil(JSON.stringify({ messages }).length / 4);
 		expect(expected).toBeGreaterThanOrEqual(0);
 		expect(await res.json()).toEqual({ input_tokens: expected });
 	});

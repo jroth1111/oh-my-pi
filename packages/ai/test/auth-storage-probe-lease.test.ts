@@ -169,6 +169,22 @@ describe("AuthStorage quota probe leases", () => {
 		expect(storage.tryAcquireQuotaProbeLease(blockedId, "")).toBeTypeOf("string");
 	});
 
+	it("does not credit a successful sibling to the original failed probe", async () => {
+		if (!storage) throw new Error("setup failed");
+		const provider = `${PROVIDER}-switch`;
+		await storage.set(provider, [{ type: "api_key", key: "blocked" }]);
+		const id = storage.listStoredCredentials(provider)[0]!.id;
+		await storage.markUsageLimitReached(provider, undefined, { credentialId: id });
+		expect(await storage.getApiKey(provider, "session", { requestId: "switch" })).toBe("blocked");
+		await storage.set(provider, [
+			{ type: "api_key", key: "blocked" },
+			{ type: "api_key", key: "healthy" },
+		]);
+		expect(await storage.getApiKey(provider, "session", { requestId: "switch" })).toBe("healthy");
+		expect(storage.settleQuotaProbeSuccess("switch")).toBe(false);
+		expect(storage.listCredentialBlocks([id])).toHaveLength(1);
+	});
+
 	it("leases an API-key probe under the ranking block scope", async () => {
 		if (!storage) throw new Error("setup failed");
 		const apiProvider = "openai-codex";

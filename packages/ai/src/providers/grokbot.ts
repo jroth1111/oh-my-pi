@@ -1150,12 +1150,10 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 
 				let openKind: "" | "text" | "thinking" = "";
 				let openIndex = -1;
-				let sendToUserArgsText = "";
-				let sendToUserLastContent = "";
 				/** Content indexes whose text came from synthetic SendToUser — never promote. */
 				const sendToUserTextIndexes = new Set<number>();
 				/** Open SendToUser correlation keys (`id:…` / `idx:…`) for name-less continuation frames. */
-				const openSendToUserKeys = new Set<string>();
+				const openSendToUserKeys = new Map<string, { argsText: string; lastContent: string; keys: Set<string> }>();
 				const toolStates = new Map<
 					string,
 					{ key: string; index: number; block: ToolCall; argsText: string; ended: boolean; isGrammar: boolean }
@@ -1242,16 +1240,23 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 				};
 
 				const handleSendToUser = (part: Record<string, unknown>) => {
-					for (const key of sendToUserKeysForPart(part)) openSendToUserKeys.add(key);
+					const keys = sendToUserKeysForPart(part);
+					const state = keys.map(key => openSendToUserKeys.get(key)).find(value => value !== undefined) ?? {
+						argsText: "",
+						lastContent: "",
+						keys: new Set<string>(),
+					};
+					for (const key of keys) {
+						state.keys.add(key);
+						openSendToUserKeys.set(key, state);
+					}
 					const argsText =
 						part.args == null ? "" : typeof part.args === "string" ? part.args : JSON.stringify(part.args);
-					if (argsText) sendToUserArgsText = argsText;
-					const parsed = parseSendToUserContent(sendToUserArgsText);
-					if (parsed !== undefined && parsed !== sendToUserLastContent) {
-						const delta = parsed.startsWith(sendToUserLastContent)
-							? parsed.slice(sendToUserLastContent.length)
-							: parsed;
-						sendToUserLastContent = parsed;
+					if (argsText) state.argsText = argsText;
+					const parsed = parseSendToUserContent(state.argsText);
+					if (parsed !== undefined && parsed !== state.lastContent) {
+						const delta = parsed.startsWith(state.lastContent) ? parsed.slice(state.lastContent.length) : parsed;
+						state.lastContent = parsed;
 						if (delta) {
 							const idx = ensureText();
 							sendToUserTextIndexes.add(idx);
@@ -1261,14 +1266,8 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 					}
 					if (part.isComplete ?? part.is_complete) {
 						closeOpen();
-						// Next SendToUser call must rebuild independently — do not
-						// suffix/dedupe against the previous message's content.
-						sendToUserArgsText = "";
-						sendToUserLastContent = "";
-						// Drop every correlation key for this call (id and/or index).
-						// Continuations may omit one side; clearing the whole set
-						// avoids leaving a stale id after an index-only final frame.
-						openSendToUserKeys.clear();
+						// Other interleaved calls retain their correlation and content state.
+						for (const key of state.keys) openSendToUserKeys.delete(key);
 					}
 				};
 

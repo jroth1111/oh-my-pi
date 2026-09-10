@@ -10,6 +10,7 @@ import {
 	buildSessionOptions,
 	rebuildScopedModelsAfterDiscovery,
 	refreshCredentialScopedModelIfMissing,
+	resolveCredentialScopedRefreshTarget,
 	resolveScopedModels,
 	type ScopedModelSink,
 	toSessionScopedModels,
@@ -17,6 +18,19 @@ import {
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
+
+it("refreshes a chained default role on cold startup while explicit selectors retain precedence", () => {
+	const roles: Record<string, string> = { default: "@smol", smol: "grokbot/live-only" };
+	const lookup = { getModelRole: (role: string) => roles[role] };
+	expect(resolveCredentialScopedRefreshTarget({}, lookup)).toEqual({
+		providerId: "grokbot",
+		selectors: { model: "grokbot/live-only", models: undefined },
+	});
+	expect(resolveCredentialScopedRefreshTarget({ model: "unqualified" }, lookup)).toBeUndefined();
+	expect(resolveCredentialScopedRefreshTarget({ provider: "cursor", model: "explicit" }, lookup)?.providerId).toBe(
+		"cursor",
+	);
+});
 
 function model(id: string): Model<Api> {
 	return buildModel({

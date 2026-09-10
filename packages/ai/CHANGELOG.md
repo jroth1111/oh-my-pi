@@ -2,6 +2,28 @@
 
 ### Fixed
 
+- Gateway fallbacks stay within the failing route branch and wait for meaningful streamed output.
+- Credential recovery probes and long-running requests retain correct reservation and cooldown state.
+- Azure structured responses retain their requested formats, and Gemini streamed tool calls are emitted once.
+- Grok Bot keeps interleaved assistant messages independent, and catalog smoke checks reject commands that do not perform the required operation.
+- Fixed concurrent credential probes and permanent-credential fallback; stateful continuations keep their target and reject ambiguous account selection.
+- Fixed stateful continuations changing targets or accounts, and rejected route IDs that URL normalization would erase.
+- Forward OpenRouter Responses `previous_response_id` / `parallel_tool_calls` and Chat Completions `parallel_tool_calls` through the API mapper.
+- Delay non-Responses stream commit until meaningful assistant events, and flush held SSE prelude frames when a probing stream ends without commit.
+- Keep the leased credential id for anonymous cooldown-probe cleanup when concurrent reorders shift selection indices.
+- Delay pi-native stream commit until text/thinking/tool deltas; keep Responses structural item/part events pre-commit.
+- Preserve upstream Responses ids across all response envelopes, observe non-SSE assistant output before committing, and forward explicit Azure parallel-tool settings.
+- Forward `previous_response_id` onto Azure Responses wire params and Chat Completions seed/logit_bias/user/response_format through the API mapper.
+- Treat Anthropic message_start as stream metadata; restore Cloudflare and MCP OAuth notes to their released sections.
+- Authoritative HTTP status beats free-text aborted wording; Responses file_id refs are rejected on incompatible targets.
+- Fixed nested fallback ordering, permanent-credential recovery, and provider-scoped file attachment checks; model discovery blocks private addresses.
+- Fixed auth-gateway model discovery treating non-2xx responses with array/`data` bodies as successful catalogs.
+- Fixed auth-gateway SSE streams leaking turn reservations when `reader.read()` rejects after the response is returned.
+- Fixed OpenAI Responses file-id compatibility being checked only against the initial route target; fallback targets are revalidated before dispatch.
+- Auth gateway can load virtual routes from a JSON/JSON5 file.
+- Auth gateway `GET /v1/routes/:id` returns a registered virtual route.
+- Auth gateway `DELETE /v1/routes/:id` unregisters a virtual route.
+- Auth gateway retries a sibling credential on quota errors before falling over to another model.
 - Grok Bot Gemini tool calls preserve their required arguments instead of returning empty objects.
 - Grok Bot parameterized model selectors no longer fail with an unknown-model error after resolving to a canonical model.
 - Grok Bot executes separate JSON tool calls reliably, preserves extension tool identities, and avoids executing mirrored thinking/text calls twice.
@@ -23,15 +45,7 @@
 - Cursor mints a fresh `runId` per request (linked to `x-request-id`, like the CLI) and defaults `conversationGroupId` to the conversation instead of sending empty ids.
 - Cursor auto mode echoes a roster-resolved `requestModelId` of `auto` verbatim on `requestedModel`/`modelDetails` (matching the CLI); the synthetic catalog id without roster proof keeps the `default` wire contract.
 - Cursor user messages default to `AgentMode.AGENT` (1) like the CLI instead of serializing `UNSPECIFIED` (0).
-- Forward OpenRouter Responses `previous_response_id` / `parallel_tool_calls` and Chat Completions `parallel_tool_calls` through the API mapper.
-- Delay non-Responses stream commit until meaningful assistant events, and flush held SSE prelude frames when a probing stream ends without commit.
-- Keep the leased credential id for anonymous cooldown-probe cleanup when concurrent reorders shift selection indices.
-- Delay pi-native stream commit until text/thinking/tool deltas; keep Responses structural item/part events pre-commit.
-- Preserve upstream Responses ids across all response envelopes, observe non-SSE assistant output before committing, and forward explicit Azure parallel-tool settings.
-- Forward `previous_response_id` onto Azure Responses wire params and Chat Completions seed/logit_bias/user/response_format through the API mapper.
-- Treat Anthropic message_start as stream metadata; restore Cloudflare and MCP OAuth notes to their released sections.
 
-- Authoritative HTTP status beats free-text aborted wording; Responses file_id refs are rejected on incompatible targets.
 - Fixed native tool promotion dropping distinct custom tools and disabled thinking inheriting effort defaults.
 
 - Grok Bot emits the remaining tool-arg suffix when an unbuffered complete JSON snapshot prefix-extends a partial accumulator (`{"path":` → `{"path":"/tmp/x"}`).
@@ -265,8 +279,6 @@
 - Fixed gateway fallback routing through missing models and credentials while honoring each route’s configured failure conditions.
 
 - Fixed gateway SSE holds to share the canonical commit-aware implementation and flush EOF metadata, while unresolved or credentialless route targets now advance to the next eligible target.
-- Fixed concurrent credential probes and permanent-credential fallback; stateful continuations keep their target and reject ambiguous account selection.
-- Fixed stateful continuations changing targets or accounts, and rejected route IDs that URL normalization would erase.
 
 - Gateway error classifications now carry a failure owner and retry/failover disposition (`credential_permanent`, `provider_transient`, `policy_terminal`, …); provider status codes stay authoritative over message wording, and context-overflow detection reuses the central classifier.
 - Gateway requests now forward `previous_response_id`, `parallel_tool_calls`, `logit_bias`, `user`, and `response_format` to providers instead of dropping them; Responses requests map `response_format` JSON-schema to the flat `text.format` shape and never send Chat-Completions-only `seed`.
@@ -278,14 +290,9 @@
 - Fixed gateway stream cleanup to release reservations on read failures and cancellations, settle probes only from successful canonical results, and continue through unresolved configured fallback targets.
 - Fixed concurrent credential probes and prevented nested fallback routes from selecting targets in unrelated branches.
 - Auth gateway `GET /v1/routes` lists registered virtual routes.
-- Auth gateway `GET /v1/routes/:id` returns a registered virtual route.
 
 
-- Fixed nested fallback ordering, permanent-credential recovery, and provider-scoped file attachment checks; model discovery blocks private addresses.
 
-- Fixed auth-gateway model discovery treating non-2xx responses with array/`data` bodies as successful catalogs.
-- Fixed auth-gateway SSE streams leaking turn reservations when `reader.read()` rejects after the response is returned.
-- Fixed OpenAI Responses file-id compatibility being checked only against the initial route target; fallback targets are revalidated before dispatch.
 - Fixed weighted target dispatch, deployment affinity, tool capability checks, and concurrent API-key reservations.
 
 - Fixed auth-gateway SSE streams leaking turn reservations when `reader.read()` rejects.
@@ -430,12 +437,8 @@
 - Fixed OpenAI Responses continuation pairing a caller-supplied `previous_response_id` with an internally computed delta from a different stored response, and restricted stale-baseline recovery to internally owned chain ids so a stale caller id can no longer silently drop prior context.
 - Auth gateway observes Responses SSE through a StreamCommitGate: metadata-only preludes stay failover-eligible, the first output event or 4 MiB cap commits, and post-commit terminals (`response.completed`/`response.failed`/`response.incomplete`/`response.error`) end failover eligibility instead of being misread as output.
 - Auth gateway virtual routes now fail over to a backup model when the primary is unavailable, as long as the response stream has not been committed.
-- Auth gateway can load virtual routes from a JSON/JSON5 file.
 - Auth gateway `GET /v1/routes` lists registered virtual routes.
-- Auth gateway `GET /v1/routes/:id` returns a registered virtual route.
 - Auth gateway `PUT /v1/routes/:id` registers or replaces a virtual route.
-- Auth gateway `DELETE /v1/routes/:id` unregisters a virtual route.
-- Auth gateway retries a sibling credential on quota errors before falling over to another model.
 - Auth gateway `GET /v1/executions/:id` returns redacted decision traces for an execution.
 - Auth gateway `GET /v1/health/routes` lists virtual route ids, generations, and targets without credentials.
 - Auth gateway `GET /v1/credentials` lists credential ids without tokens; `POST /v1/credentials/:id/disable` and `POST /v1/credentials/:id/pin` manage stored accounts.
@@ -703,12 +706,8 @@
 - Fixed OpenAI Responses continuation pairing a caller-supplied `previous_response_id` with an internally computed delta from a different stored response, and restricted stale-baseline recovery to internally owned chain ids so a stale caller id can no longer silently drop prior context.
 - Auth gateway observes Responses SSE through a StreamCommitGate: metadata-only preludes stay failover-eligible, the first output event or 4 MiB cap commits, and post-commit terminals (`response.completed`/`response.failed`/`response.incomplete`/`response.error`) end failover eligibility instead of being misread as output.
 - Auth gateway virtual routes now fail over to a backup model when the primary is unavailable, as long as the response stream has not been committed.
-- Auth gateway can load virtual routes from a JSON/JSON5 file.
 - Auth gateway `GET /v1/routes` lists registered virtual routes.
-- Auth gateway `GET /v1/routes/:id` returns a registered virtual route.
 - Auth gateway `PUT /v1/routes/:id` registers or replaces a virtual route.
-- Auth gateway `DELETE /v1/routes/:id` unregisters a virtual route.
-- Auth gateway retries a sibling credential on quota errors before falling over to another model.
 - Auth gateway `GET /v1/executions/:id` returns redacted decision traces for an execution.
 - Auth gateway `GET /v1/health/routes` lists virtual route ids, generations, and targets without credentials.
 - Auth gateway `GET /v1/credentials` lists credential ids without tokens; `POST /v1/credentials/:id/disable` and `POST /v1/credentials/:id/pin` manage stored accounts.

@@ -82,10 +82,16 @@ function expandReviewRoleSelector(selector: string | undefined, lookup: ModelRol
 }
 
 export function resolveCredentialScopedRefreshTarget(
-	parsed: Pick<Args, "model" | "models">,
+	parsed: Pick<Args, "provider" | "model" | "models">,
 	lookup: ModelRoleLookup,
 ): { providerId: string; selectors: Pick<Args, "model" | "models"> } | undefined {
-	const model = expandReviewRoleSelector(parsed.model, lookup);
+	const explicit = Boolean(
+		parsed.provider || parsed.model?.trim() || parsed.models?.some(selector => selector.trim()),
+	);
+	const model = expandReviewRoleSelector(parsed.model ?? (!explicit ? "@default" : undefined), lookup);
+	const models = parsed.models?.map(selector => expandReviewRoleSelector(selector, lookup) ?? selector);
+	const providerId = resolveCliRuntimeApiKeyProvider({ ...parsed, model, models });
+	if (providerId) return { providerId, selectors: { model, models } };
 	if (!model) return undefined;
 	const parsedModel = parseModelString(model);
 	if (!parsedModel?.provider) return undefined;
@@ -1669,13 +1675,14 @@ export async function runRootCommand(
 		// on a fresh profile until discovery runs. Refresh before --provider/--model
 		// resolve so buildSessionOptions does not exit on a cold miss — for env,
 		// secrets-file, models.yml, and --api-key credentials alike.
-		if (selectedProvider) {
+		const refreshTarget = resolveCredentialScopedRefreshTarget(parsedArgs, settingsInstance);
+		if (refreshTarget) {
 			await logger.time(
 				"refreshCredentialScopedModel",
 				refreshCredentialScopedModelIfMissing,
-				parsedArgs,
+				refreshTarget.selectors,
 				modelRegistry,
-				selectedProvider,
+				refreshTarget.providerId,
 			);
 		}
 		if (parsedArgs.noPty || parsedArgs.mode === "rpc-ui") {

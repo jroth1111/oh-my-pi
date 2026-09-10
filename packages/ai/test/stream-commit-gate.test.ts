@@ -22,6 +22,7 @@ describe("StreamCommitGate", () => {
 		expect(gate.classifyAndObserve("response.created", 64)).toBe("probing");
 		expect(gate.classifyAndObserve("response.in_progress", 32)).toBe("probing");
 		expect(gate.classifyAndObserve("heartbeat", 4)).toBe("probing");
+		expect(gate.classifyAndObserve("message_start", 16)).toBe("probing");
 	});
 
 	it("keeps structural Responses item/part events pre-commit", () => {

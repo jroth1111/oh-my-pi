@@ -221,6 +221,7 @@ describe("matrixProbeEffort", () => {
 				}),
 			),
 		).toEqual(["--thinking", Effort.Max]);
+		// Sand-only defaults like adaptive are not CLI ThinkingLevel values.
 		expect(
 			matrixOmpThinkingArgs(
 				probeModel({
@@ -228,7 +229,7 @@ describe("matrixProbeEffort", () => {
 					sandParameterDefaults: { effort: "adaptive" },
 				}),
 			),
-		).toEqual(["--thinking", "adaptive"]);
+		).toEqual([]);
 		expect(matrixOmpThinkingArgs(probeModel({ id: "no-effort" }))).toEqual([]);
 	});
 });
@@ -256,6 +257,8 @@ describe("toolSmokePrompt", () => {
 		expect(readLikeShellCommand("cat notes/grokbot-read-x.txt")).toBe(true);
 		expect(readLikeShellCommand("sed -n '1p' notes/grokbot-read-x.txt")).toBe(true);
 		expect(readLikeShellCommand("printf '%s\\n' x > notes/grokbot-write-x.txt")).toBe(false);
+		// Quoted `>` is not a redirect — must not look like a write.
+		expect(writeLikeShellCommand("echo 'tools-pong-write-x > notes/grokbot-write-x.txt'")).toBe(false);
 	});
 
 	test("requires bash smoke commands to echo/printf the ping, not comment it", () => {
@@ -274,6 +277,54 @@ describe("toolSmokePrompt", () => {
 		expect(echoLikeShellCommand(`echo ${ping} | tee /tmp/out.txt`, ping)).toBe(false);
 		expect(echoLikeShellCommand(`echo ${ping} | grep -v ${ping}`, ping)).toBe(false);
 		expect(echoLikeShellCommand(`echo ${ping} | cat`, ping)).toBe(false);
+		// Conditional arms after `&&` / `||` are unreachable for fabricated results.
+		expect(echoLikeShellCommand(`false && echo ${ping}`, ping)).toBe(false);
+		expect(echoLikeShellCommand(`true || echo ${ping}`, ping)).toBe(false);
+		// Earlier exit/return stops the shell before a later echo can run.
+		expect(echoLikeShellCommand(`exit 0; echo ${ping}`, ping)).toBe(false);
+		expect(echoLikeShellCommand(`return; echo ${ping}`, ping)).toBe(false);
+		// printf must emit the ping — unused args / zero-precision write nothing.
+		expect(echoLikeShellCommand(`printf '' ${ping}`, ping)).toBe(false);
+		expect(echoLikeShellCommand(`printf '%0.s' ${ping}`, ping)).toBe(false);
+		expect(echoLikeShellCommand(`printf '%s\\n' ${ping}`, ping)).toBe(true);
+		// `echo -e` enables escapes; bash `\\c` suppresses further output while
+		// runOneTool fabricates success from the literal argv — must not pass.
+		expect(echoLikeShellCommand(`echo -e '\\c${ping}'`, ping)).toBe(false);
+		expect(echoLikeShellCommand(`echo -e 'hi\\c${ping}'`, ping)).toBe(false);
+		expect(echoLikeShellCommand(`echo -E '\\c${ping}'`, ping)).toBe(true);
+		expect(echoLikeShellCommand(`echo -e 'pre${ping}'`, ping)).toBe(true);
+		// printf %b expands escapes; bash `\\c` suppresses further output.
+		expect(echoLikeShellCommand(`printf '%b' '\\c${ping}'`, ping)).toBe(false);
+		expect(echoLikeShellCommand(`printf '%b%s' '\\c' '${ping}'`, ping)).toBe(false);
+		expect(echoLikeShellCommand(`printf '%b' 'pre${ping}'`, ping)).toBe(true);
+		expect(echoLikeShellCommand(`printf '%s' '\\c${ping}'`, ping)).toBe(true);
+		// Numeric printf converts args — nonnumeric ping must not pass as literal.
+		expect(echoLikeShellCommand(`printf '%d' '${ping}'`, ping)).toBe(false);
+		expect(echoLikeShellCommand(`printf '%f' '${ping}'`, ping)).toBe(false);
+
+		// Command substitutions expand at runtime — lexical includes(ping) must not pass.
+		expect(echoLikeShellCommand(`echo "$(${ping})"`, ping)).toBe(false);
+		expect(echoLikeShellCommand(`echo "$(echo ${ping})"`, ping)).toBe(false);
+		expect(echoLikeShellCommand('echo "`' + ping + '`"', ping)).toBe(false);
+		expect(echoLikeShellCommand(`echo '$(${ping})'`, ping)).toBe(true);
+
+		expect(echoLikeShellCommand(`printf '%d' '42'`, "42")).toBe(true);
+		// Later non-zero exit fails the overall command; runOneTool fabricates isError:false.
+		expect(echoLikeShellCommand(`echo ${ping}; exit 1`, ping)).toBe(false);
+		expect(echoLikeShellCommand(`echo ${ping}; exit 0`, ping)).toBe(true);
+		// Unrecognized exit forms still fail the real shell (`exit -1` → 255, `exit foo` errors)
+		// while runOneTool fabricates success from the echo prefix — must not pass.
+		expect(echoLikeShellCommand(`echo ${ping}; exit -1`, ping)).toBe(false);
+		expect(echoLikeShellCommand(`echo ${ping}; exit foo`, ping)).toBe(false);
+		expect(echoLikeShellCommand(`echo ${ping}; return -1`, ping)).toBe(false);
+		// Trailing non-exit commands after a successful echo can fail while runOneTool
+		// fabricates success from the echo prefix alone.
+		expect(echoLikeShellCommand(`echo ${ping}; false`, ping)).toBe(false);
+		expect(echoLikeShellCommand(`echo ${ping}; true`, ping)).toBe(false);
+		// Conditional suffixes must stay reachable for validation — first-arm-only
+		// splitting previously dropped `&& false` / `&& rm` and fabricated success.
+		expect(echoLikeShellCommand(`echo ${ping} && false`, ping)).toBe(false);
+		expect(echoLikeShellCommand(`echo ${ping} && true`, ping)).toBe(false);
 	});
 
 	test("binds read/write shell smoke evidence to the operation statement", () => {
@@ -297,6 +348,103 @@ describe("toolSmokePrompt", () => {
 				id,
 			),
 		).toBe(true);
+		// Suffixed filenames must not count as the expected path.
+		expect(
+			matchesToolSmokeCall(
+				"read",
+				{ name: "Shell", arguments: { command: `cat ${readPath}.bak` } },
+				"tools-pong-read-x",
+				id,
+			),
+		).toBe(false);
+		// Pipelines can suppress file contents; fabricated tool results must not pass.
+		expect(
+			matchesToolSmokeCall(
+				"read",
+				{ name: "Shell", arguments: { command: `cat ${readPath} | grep -v tools-pong-read-x` } },
+				"tools-pong-read-x",
+				id,
+			),
+		).toBe(false);
+		expect(
+			matchesToolSmokeCall(
+				"read",
+				{ name: "Shell", arguments: { command: `cat ${readPath} | cat` } },
+				"tools-pong-read-x",
+				id,
+			),
+		).toBe(false);
+		// Earlier exit prevents a later matching read from running under fabricated tool results.
+		expect(
+			matchesToolSmokeCall(
+				"read",
+				{ name: "Shell", arguments: { command: `exit 0; cat ${readPath}` } },
+				"tools-pong-read-x",
+				id,
+			),
+		).toBe(false);
+		// Readers configured to emit nothing must not pass (fabricated tool results).
+		expect(
+			matchesToolSmokeCall(
+				"read",
+				{ name: "Shell", arguments: { command: `head -n 0 ${readPath}` } },
+				"tools-pong-read-x",
+				id,
+			),
+		).toBe(false);
+		// GNU head -n -1 drops the last line; tail -n +2 starts after line 1 —
+		// both yield empty stdout for the one-line fixture while runOneTool
+		// fabricates the ping.
+		expect(
+			matchesToolSmokeCall(
+				"read",
+				{ name: "Shell", arguments: { command: `head -n -1 ${readPath}` } },
+				"tools-pong-read-x",
+				id,
+			),
+		).toBe(false);
+		expect(
+			matchesToolSmokeCall(
+				"read",
+				{ name: "Shell", arguments: { command: `tail -n +2 ${readPath}` } },
+				"tools-pong-read-x",
+				id,
+			),
+		).toBe(false);
+		// Byte ranges can emit a truncated prefix/suffix while runOneTool
+		// fabricates the full fixture token.
+		expect(
+			matchesToolSmokeCall(
+				"read",
+				{ name: "Shell", arguments: { command: `head -c 1 ${readPath}` } },
+				"tools-pong-read-x",
+				id,
+			),
+		).toBe(false);
+		expect(
+			matchesToolSmokeCall(
+				"read",
+				{ name: "Shell", arguments: { command: `head -c -1 ${readPath}` } },
+				"tools-pong-read-x",
+				id,
+			),
+		).toBe(false);
+		expect(
+			matchesToolSmokeCall(
+				"read",
+				{ name: "Shell", arguments: { command: `sed -n '1d' ${readPath}` } },
+				"tools-pong-read-x",
+				id,
+			),
+		).toBe(false);
+		expect(
+			matchesToolSmokeCall(
+				"read",
+				{ name: "Shell", arguments: { command: `sed -n '1p' ${readPath}` } },
+				"tools-pong-read-x",
+				id,
+			),
+		).toBe(true);
 		expect(
 			matchesToolSmokeCall(
 				"write",
@@ -313,6 +461,176 @@ describe("toolSmokePrompt", () => {
 				id,
 			),
 		).toBe(true);
+		// Unused printf args are not written — empty format creates an empty file.
+		expect(
+			matchesToolSmokeCall(
+				"write",
+				{ name: "Shell", arguments: { command: `printf '' ${ping} > ${writePath}` } },
+				ping,
+				id,
+			),
+		).toBe(false);
+		expect(
+			matchesToolSmokeCall(
+				"write",
+				{ name: "Shell", arguments: { command: `printf '%s\\n' wrong ${ping} > ${writePath}` } },
+				ping,
+				id,
+			),
+		).toBe(false);
+		expect(
+			matchesToolSmokeCall(
+				"write",
+				{ name: "Shell", arguments: { command: `printf '%s\\n' ${ping} > ${writePath}.bak` } },
+				ping,
+				id,
+			),
+		).toBe(false);
+		// Quoted redirect character must not count as a write (no file is created).
+		expect(
+			matchesToolSmokeCall(
+				"write",
+				{ name: "Shell", arguments: { command: `echo '${ping} > ${writePath}'` } },
+				ping,
+				id,
+			),
+		).toBe(false);
+		// Earlier exit prevents a later matching write from running under fabricated tool results.
+		expect(
+			matchesToolSmokeCall(
+				"write",
+				{ name: "Shell", arguments: { command: `exit 0; printf '%s\\n' ${ping} > ${writePath}` } },
+				ping,
+				id,
+			),
+		).toBe(false);
+		// Trailing destructive commands after a matching write must not pass —
+		// runOneTool fabricates success from the write prefix and never executes `rm`.
+		expect(
+			matchesToolSmokeCall(
+				"write",
+				{ name: "Shell", arguments: { command: `printf '%s\\n' ${ping} > ${writePath}; rm ${writePath}` } },
+				ping,
+				id,
+			),
+		).toBe(false);
+		expect(
+			matchesToolSmokeCall(
+				"write",
+				{ name: "Shell", arguments: { command: `exit 0 && printf '%s\\n' ${ping} > ${writePath}` } },
+				ping,
+				id,
+			),
+		).toBe(false);
+		// `false && echo … > path` must not pass via the unreachable write arm.
+		expect(
+			matchesToolSmokeCall(
+				"write",
+				{ name: "Shell", arguments: { command: `false && echo ${ping} > ${writePath}` } },
+				ping,
+				id,
+			),
+		).toBe(false);
+		// Successful write followed by a destructive `&&` suffix must not pass —
+		// runOneTool fabricates success from the write prefix alone.
+		expect(
+			matchesToolSmokeCall(
+				"write",
+				{ name: "Shell", arguments: { command: `printf '%s\\n' ${ping} > ${writePath} && rm ${writePath}` } },
+				ping,
+				id,
+			),
+		).toBe(false);
+		// Quoted semicolons / redirects must not invent a second executable write.
+		expect(
+			matchesToolSmokeCall(
+				"write",
+				{
+					name: "Shell",
+					arguments: { command: `echo 'noop; echo ${ping} > ${writePath}'` },
+				},
+				ping,
+				id,
+			),
+		).toBe(false);
+		// Only the first redirect destination counts — `/dev/null` wins, not a trailing path arg.
+		expect(
+			matchesToolSmokeCall(
+				"write",
+				{
+					name: "Shell",
+					arguments: { command: `echo ${ping} > /dev/null ${writePath}` },
+				},
+				ping,
+				id,
+			),
+		).toBe(false);
+		expect(
+			matchesToolSmokeCall(
+				"write",
+				{
+					name: "Shell",
+					arguments: { command: `echo ${ping} > "${writePath}"` },
+				},
+				ping,
+				id,
+			),
+		).toBe(true);
+		// Command substitution must not count as write evidence (runOneTool fabricates the ping).
+		expect(
+			matchesToolSmokeCall(
+				"write",
+				{
+					name: "Shell",
+					arguments: { command: `echo "$(${ping})" > "${writePath}"` },
+				},
+				ping,
+				id,
+			),
+		).toBe(false);
+		// Relative suffix paths invent a different file (`backup/notes/...`).
+		expect(
+			matchesToolSmokeCall(
+				"read",
+				{ name: "Shell", arguments: { command: `cat backup/${readPath}` } },
+				"tools-pong-read-x",
+				id,
+			),
+		).toBe(false);
+		expect(
+			matchesToolSmokeCall(
+				"write",
+				{ name: "Shell", arguments: { command: `printf '%s\\n' ${ping} > backup/${writePath}` } },
+				ping,
+				id,
+			),
+		).toBe(false);
+		// Absolute paths ending in /${expectedRelative} are allowed (same as direct tools).
+		expect(
+			matchesToolSmokeCall(
+				"read",
+				{ name: "Shell", arguments: { command: `cat /tmp/${readPath}` } },
+				"tools-pong-read-x",
+				id,
+			),
+		).toBe(true);
+		expect(
+			matchesToolSmokeCall(
+				"write",
+				{ name: "Shell", arguments: { command: `printf '%s\\n' ${ping} > /tmp/${writePath}` } },
+				ping,
+				id,
+			),
+		).toBe(true);
+		// Trailing non-exit after a matching read must not pass fabricated gates.
+		expect(
+			matchesToolSmokeCall(
+				"read",
+				{ name: "Shell", arguments: { command: `cat ${readPath}; false` } },
+				"tools-pong-read-x",
+				id,
+			),
+		).toBe(false);
 	});
 
 	test("rejects tool calls that only match by name", () => {
@@ -343,6 +661,9 @@ describe("toolSmokePrompt", () => {
 		expect(matchesToolSmokeCall("bash", { name: "Shell", arguments: { command: `echo ${ping}` } }, ping, id)).toBe(
 			true,
 		);
+		expect(
+			matchesToolSmokeCall("bash", { name: "Shell", arguments: { command: `exit 0; echo ${ping}` } }, ping, id),
+		).toBe(false);
 		expect(matchesToolSmokeCall("bash", { name: "Shell", arguments: { command: `true # ${ping}` } }, ping, id)).toBe(
 			false,
 		);
@@ -384,10 +705,27 @@ describe("toolSmokePrompt", () => {
 				id,
 			),
 		).toBe(false);
+		// Relative path with a matching suffix still targets a different file.
+		expect(
+			matchesToolSmokeCall(
+				"read",
+				{ name: "Read", arguments: { path: `backup/${readPath}` } },
+				"tools-pong-read-x",
+				id,
+			),
+		).toBe(false);
 		expect(
 			matchesToolSmokeCall(
 				"write",
 				{ name: "Write", arguments: { path: `backup-${writePath}`, content: ping } },
+				ping,
+				id,
+			),
+		).toBe(false);
+		expect(
+			matchesToolSmokeCall(
+				"write",
+				{ name: "Write", arguments: { path: `backup/${writePath}`, content: ping } },
 				ping,
 				id,
 			),
@@ -459,6 +797,10 @@ describe("ompToolsExecutionEvidence", () => {
 });
 
 test("numeric printf conversions cannot fabricate bash or write evidence", () => {
+	expect(echoLikeShellCommand("printf '%x' '42'", "42")).toBe(false);
+	expect(echoLikeShellCommand("printf '%d' '4.2'", "4.2")).toBe(false);
+	expect(echoLikeShellCommand("printf '%.0d' '0'", "0")).toBe(false);
+
 	const ping = "tools-pong-write-x";
 	expect(echoLikeShellCommand(`printf '%d' ${ping}`, ping)).toBe(false);
 	expect(echoLikeShellCommand(`printf '%s %d' ${ping} bad`, ping)).toBe(false);

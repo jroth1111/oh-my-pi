@@ -12,11 +12,13 @@ import { discoveryFetch } from "../utils";
 import {
 	clearGrokbotTokenCache,
 	createGrokbotChecksum,
+	GROKBOT_STAMPED_CLIENT_VERSION,
 	grokbotClientHeaders,
 	joinGrokbotBackendUrl,
 	loadGrokbotConfig,
 	mergeGrokbotHeaders,
 	mintGrokbotAccessToken,
+	resolveGrokbotClientVersion,
 } from "./grokbot-auth";
 import {
 	decodeGrokbotAvailableModelsResponse,
@@ -72,8 +74,12 @@ export async function fetchGrokbotAvailableModels(
 		// catalog fetched under one namespace/version is never stored under another.
 		const cfg = {
 			...loaded,
-			...(overrideNs ? { namespace: overrideNs } : {}),
-			...(overrideVer ? { clientVersion: overrideVer } : {}),
+			namespace: overrideNs || loaded.namespace,
+			clientVersion: resolveGrokbotClientVersion(
+				overrideNs || loaded.namespace,
+				GROKBOT_STAMPED_CLIENT_VERSION,
+				overrideVer || loaded.explicitClientVersion,
+			),
 		};
 		const machineId = cfg.machineId;
 		if (!cfg.renewal || !machineId) {

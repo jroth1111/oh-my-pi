@@ -7700,7 +7700,22 @@
 				}
 			},
 			{
-				"source": "providers/cursor.kdl:6",
+				"source": "providers/cursor.kdl:5",
+				"providers": [
+					"cursor"
+				],
+				"models": [
+					{
+						"kind": "exact",
+						"value": "auto"
+					}
+				],
+				"catalog": {
+					"requestModelId": "default"
+				}
+			},
+			{
+				"source": "providers/cursor.kdl:10",
 				"class": "anthropic",
 				"providers": [
 					"cursor"
@@ -7711,7 +7726,7 @@
 				}
 			},
 			{
-				"source": "providers/cursor.kdl:14",
+				"source": "providers/cursor.kdl:18",
 				"class": "kimi",
 				"providers": [
 					"cursor"
@@ -7726,7 +7741,7 @@
 				}
 			},
 			{
-				"source": "providers/cursor.kdl:19",
+				"source": "providers/cursor.kdl:23",
 				"providers": [
 					"cursor"
 				],
@@ -7749,7 +7764,7 @@
 				}
 			},
 			{
-				"source": "providers/cursor.kdl:25",
+				"source": "providers/cursor.kdl:29",
 				"providers": [
 					"cursor"
 				],
@@ -7783,7 +7798,7 @@
 				}
 			},
 			{
-				"source": "providers/cursor.kdl:28",
+				"source": "providers/cursor.kdl:32",
 				"providers": [
 					"cursor"
 				],
@@ -7817,7 +7832,7 @@
 				}
 			},
 			{
-				"source": "providers/cursor.kdl:32",
+				"source": "providers/cursor.kdl:36",
 				"providers": [
 					"cursor"
 				],
@@ -7835,7 +7850,7 @@
 				}
 			},
 			{
-				"source": "providers/cursor.kdl:36",
+				"source": "providers/cursor.kdl:40",
 				"providers": [
 					"cursor"
 				],
@@ -7868,7 +7883,7 @@
 				}
 			},
 			{
-				"source": "providers/cursor.kdl:40",
+				"source": "providers/cursor.kdl:44",
 				"providers": [
 					"cursor"
 				],
@@ -7908,7 +7923,7 @@
 				}
 			},
 			{
-				"source": "providers/cursor.kdl:45",
+				"source": "providers/cursor.kdl:49",
 				"providers": [
 					"cursor"
 				],
@@ -7927,7 +7942,7 @@
 				}
 			},
 			{
-				"source": "providers/cursor.kdl:49",
+				"source": "providers/cursor.kdl:53",
 				"providers": [
 					"cursor"
 				],

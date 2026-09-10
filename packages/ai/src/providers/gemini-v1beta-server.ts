@@ -574,20 +574,9 @@ export function encodeStream(
 								);
 							}
 							break;
-						case "toolcall_start":
-						case "toolcall_delta":
 						case "toolcall_end": {
-							// Only toolcall_end carries the complete call; derive
-							// in-progress calls from the partial message like the
-							// OpenAI chat streamer does.
-							const call =
-								event.type === "toolcall_end"
-									? event.toolCall
-									: (() => {
-											const partial = event.partial.content[event.contentIndex];
-											return partial && partial.type === "toolCall" ? partial : undefined;
-										})();
-							if (call === undefined) break;
+							// Gemini functionCall parts are complete calls, not argument deltas.
+							const call = event.toolCall;
 							writeSse(
 								controller,
 								{
