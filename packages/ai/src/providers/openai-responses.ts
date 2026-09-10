@@ -520,6 +520,7 @@ const streamOpenAIResponsesOnce = (
 				params.store = true;
 			}
 			applyReasoningEffortFallbackForRequest(params);
+			if (options?.store === true || options?.previousResponseId) params.store = true;
 			// A caller-supplied `previous_response_id` names the client's own stored
 			// response; internal chain deltas are computed against a DIFFERENT
 			// baseline (the provider session's last response), so pairing them with
