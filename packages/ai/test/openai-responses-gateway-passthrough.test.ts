@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { buildParams } from "@oh-my-pi/pi-ai/providers/openai-responses";
+import { parseRequest } from "@oh-my-pi/pi-ai/providers/openai-responses-server";
 import type { Context } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 

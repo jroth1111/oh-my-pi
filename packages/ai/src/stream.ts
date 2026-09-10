@@ -2028,6 +2028,13 @@ function mapOptionsForApi<TApi extends Api>(
 		cursorClientSupportsPromptContextUsageRpc: options?.cursorClientSupportsPromptContextUsageRpc,
 		cursorRunId: options?.cursorRunId,
 		cursorAgentSessionId: options?.cursorAgentSessionId,
+		previousResponseId: options?.previousResponseId,
+		parallelToolCalls: options?.parallelToolCalls,
+		seed: options?.seed,
+		logitBias: options?.logitBias,
+		user: options?.user,
+		responseFormat: options?.responseFormat,
+		store: options?.store,
 		...simpleProviderOptions,
 	};
 
