@@ -165,6 +165,8 @@
 - GitHub Copilot sign-in uses the minimal-grant OpenCode OAuth app again (`read:user` only): GitHub renders each app's existing per-user grant on the consent page, so Enterprise organizations that block the Copilot CLI app's broad historic grant can log in as on 18.1.4. API request identity still mimics the Copilot CLI, and tokens minted by either app keep working ([#11280](https://github.com/can1357/oh-my-pi/pull/11280) by [@H4vC](https://github.com/H4vC)).
 - GitHub Copilot plan/model-policy 403s no longer count as credential failures for credential-lifetime decisions: the token is valid, so stored credentials are preserved instead of wiped ([#11280](https://github.com/can1357/oh-my-pi/pull/11280) by [@H4vC](https://github.com/H4vC)).
 - Fixed custom `google-generative-ai` providers failing mid-turn model fallback when Gemini 3 tool calls are replayed without their original thought signature ([#11270](https://github.com/can1357/oh-my-pi/issues/11270)).
+- Fixed gateway error classification swallowing retryable failures: authoritative statuses now outrank abort wording, 403 account caps rotate as quota, Trusted-Access/cyber-policy denials rotate credentials instead of terminating, 400 model-missing responses fail over by model, dead OAuth grants (`invalid_token` et al) retire permanently, and concurrency-cap 429s stay in provider backoff.
+- Fixed gateway classification for structurally flagged authentication failures and transient provider errors, including exhausted Anthropic 409 conflicts; strict-tool fallback now preserves storage overrides from the actual first request payload.
 
 ## [18.1.14] - 2026-09-07
 

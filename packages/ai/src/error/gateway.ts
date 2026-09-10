@@ -1,3 +1,4 @@
+import { ConfigurationError, ValidationError } from "./validation";
 import { Flag, is, isClinePassSurfaceGateMessage, isUsageLimit, matchesOverflowText } from "./flags";
 import { is402BillingCapBody, parseRateLimitReason } from "./rate-limit";
 
@@ -191,6 +192,9 @@ function classifyOwnerDisposition(
 	if (ownerProp === "gateway" || errName === "gateway_terminal" || GATEWAY_INVARIANT_PATTERN.test(errName)) {
 		return { owner: "gateway", disposition: "gateway_terminal" };
 	}
+	if (err instanceof ConfigurationError || err instanceof ValidationError || errName === "ConfigurationError") {
+		return { owner: "request", disposition: "request_terminal" };
+	}
 
 	// Structural content/policy flags are terminal even when the HTTP mapping
 	// is a synthetic 502 (message lacked POLICY_PATTERN). Retrying against a
@@ -211,6 +215,9 @@ function classifyOwnerDisposition(
 	}
 	if (is(errorId, Flag.ContentBlocked) || is(errorId, Flag.AccountPolicy) || kind === "content-blocked") {
 		return { owner: "policy", disposition: "policy_terminal" };
+	}
+	if (is(errorId, Flag.AuthFailed)) {
+		return { owner: "credential", disposition: "credential_transient" };
 	}
 
 	// Authoritative HTTP buckets first: message heuristics never rebrand a
