@@ -169,6 +169,7 @@ function nextSseFrame(pending: string): { frame: string; rest: string } | undefi
 }
 
 function eventTypeFromFrame(frame: string): string {
+	if (!frame.split(/\r?\n/).some(line => line.startsWith("data:") || line.startsWith("event:"))) return "heartbeat";
 	let eventType = "";
 	let data = "";
 	for (const line of frame.split(/\r?\n/)) {
