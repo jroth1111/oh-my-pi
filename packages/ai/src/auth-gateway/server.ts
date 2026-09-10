@@ -417,6 +417,19 @@ function buildGatewayApiKeyResolver(
 	};
 }
 
+function classifyAssistantFailure(message: AssistantMessage): GatewayErrorClassification {
+	return classifyGatewayError(
+		Object.assign(
+			new Error(message.errorClassificationMessage ?? message.errorMessage ?? "Upstream request failed"),
+			{
+				status: message.errorStatus,
+				errorId: message.errorId,
+				kind: "kind" in message ? message.kind : undefined,
+			},
+		),
+	);
+}
+
 function clientClosedResponse(route: { module: FormatModule }): Response {
 	return route.module.formatError(499, "request_aborted", "client closed request");
 }
@@ -692,7 +705,7 @@ export function releaseTurnOnStreamEnd(
 ): ReadableStream<Uint8Array> {
 	const reader = stream.getReader();
 	let released = false;
-	const release = (): void => {
+	const release = (successful: boolean): void => {
 		if (released) return;
 		released = true;
 		if (commitGate?.sawSuccessfulTerminal) {
@@ -717,7 +730,7 @@ export function releaseTurnOnStreamEnd(
 			}
 		},
 		cancel(reason) {
-			release();
+			release(false);
 			return reader.cancel(reason);
 		},
 	});
