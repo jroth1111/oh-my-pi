@@ -136,7 +136,7 @@ function isConservativeIdentityEnrichment(oldFingerprint: string, newFingerprint
 		const next = newFields.get(key);
 		if (next !== undefined && next !== value) return false;
 	}
-	return true;
+	return false;
 }
 
 function turnReservationKey(credentialId: number, incarnation: number): string {
@@ -5339,6 +5339,21 @@ export class AuthStorage {
 		if (!probe) return;
 		this.#inflightProbes.delete(requestId);
 		this.#probeLeases.release(probe.credentialId, probe.blockScope, probe.leaseId);
+	}
+
+	#acquireRequestQuotaProbe(requestId: string | undefined, credentialId: number, scope: string): boolean {
+		if (requestId) return this.#acquireOrReuseQuotaProbeLease(requestId, credentialId, scope);
+		const key = `anonymous-probe:${credentialId}:${scope}`;
+		if (this.#inflightProbes.has(key)) return false;
+		return this.#acquireOrReuseQuotaProbeLease(key, credentialId, scope);
+	}
+
+	settleAnonymousQuotaProbe(credentialId: number, scope: string): boolean {
+		return this.settleQuotaProbeSuccess(`anonymous-probe:${credentialId}:${scope}`);
+	}
+
+	clearAnonymousQuotaProbe(credentialId: number, scope: string): void {
+		this.clearQuotaProbe(`anonymous-probe:${credentialId}:${scope}`);
 	}
 
 	settleQuotaProbeSuccess(requestId: string): boolean {

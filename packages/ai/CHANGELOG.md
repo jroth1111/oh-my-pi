@@ -348,6 +348,7 @@
 - Fixed auth-gateway sibling-credential budget sticking across fallback targets (and raised the attempt cap).
 - Fixed multi-row stored API-key selection consulting turn reservations without acquiring one for the chosen key.
 - Fixed auth-gateway decision traces accepting `credential_lookup_failed` as a skipped reason when `getApiKey` throws.
+- Exhausted credential pools support isolated anonymous recovery probes, and older brokers retain cooldown updates.
 - Preserve older broker client compatibility by negotiating Retry-After snapshot fields, dispatch compiled gateway targets, and keep heartbeat-only streams eligible for failover.
 
 - Prefer healthy API-key siblings before leasing a cooldown probe, and acquire API-key probes under the ranking block scope that caused the cooldown.
