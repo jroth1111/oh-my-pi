@@ -1,5 +1,5 @@
 import * as AIError from "../error";
-import type { GatewayErrorDisposition } from "../error/gateway";
+import { type GatewayErrorDisposition, RETRYABLE_GATEWAY_DISPOSITIONS } from "../error/gateway";
 import type { Api, Model } from "../types";
 import type { AffinityLevel, StatePortability } from "./affinity";
 
@@ -297,8 +297,12 @@ function compileNode(node: RouteNode, seenOnPath: ReadonlySet<string>): NodeComp
 			return compileFallback(node, seenOnPath);
 		case "balance":
 		case "conditional":
-		case "domain":
 			return compileFlatten(node.children, seenOnPath);
+		case "domain":
+			return compileFallback(
+				{ type: "fallback", on: RETRYABLE_GATEWAY_DISPOSITIONS, children: node.children },
+				seenOnPath,
+			);
 	}
 }
 

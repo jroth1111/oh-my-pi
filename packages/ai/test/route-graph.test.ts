@@ -295,7 +295,7 @@ describe("RouteRegistry", () => {
 		expect(registry.resolve("vision")?.targets).toEqual(["vision-model", "text-model"]);
 	});
 
-	it("treats domain as compile-time grouping", () => {
+	it("retains domain grouping metadata", () => {
 		const registry = new RouteRegistry(() => undefined);
 		registry.register({
 			id: "coding",

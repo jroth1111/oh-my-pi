@@ -93,6 +93,29 @@ export async function safeDiscoverModels(url: string, opts?: SafeDiscoveryOption
 		}
 	}
 
+	const target = new URL(parsed.href);
+	if (opts?.allowPrivate !== true) {
+		const host = parsed.hostname.replace(/^\[|\]$/g, "");
+		if (net.isIP(host) === 0) {
+			let addresses: Bun.DNSLookup[];
+			try {
+				addresses = await untilAborted(init.signal, Bun.dns.lookup(host));
+			} catch (error) {
+				throw wrapDiscoveryError(error, "discovery DNS lookup failed");
+			}
+			if (
+				addresses.length === 0 ||
+				addresses.some(row => net.isIP(row.address) === 0 || isPrivateHostname(row.address))
+			) {
+				throw new SafeDiscoveryError("discovery hostname resolves to a private or invalid address");
+			}
+			const address = addresses[0]!.address;
+			target.hostname = net.isIP(address) === 6 ? `[${address}]` : address;
+			init.headers = { Host: parsed.host };
+			if (parsed.protocol === "https:") init.tls = { serverName: host };
+		}
+	}
+
 	let response: Response;
 	try {
 		response = await fetch(target.href, init);

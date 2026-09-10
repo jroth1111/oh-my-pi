@@ -37,6 +37,7 @@ import { requestNeeds } from "./capabilities";
  *   POST /v1beta/models/streamGenerateContent → Gemini v1beta streamGenerateContent
  */
 
+import { requestNeeds } from "./capabilities";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { extractHttpStatusFromError, extractRetryHint, isRecord, logger } from "@oh-my-pi/pi-utils";
 import type { ApiKeyResolver } from "../auth-retry";

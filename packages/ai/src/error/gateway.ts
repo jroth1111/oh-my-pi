@@ -72,6 +72,12 @@ const RETRYABLE_DISPOSITION: Record<GatewayErrorDisposition, boolean> = {
 	cancelled: false,
 };
 
+export const RETRYABLE_GATEWAY_DISPOSITIONS: readonly GatewayErrorDisposition[] = Object.freeze(
+	(Object.keys(RETRYABLE_DISPOSITION) as GatewayErrorDisposition[]).filter(
+		disposition => RETRYABLE_DISPOSITION[disposition],
+	),
+);
+
 /** True when a disposition may be retried against another credential or provider. */
 export function isRetryableGatewayDisposition(disposition: GatewayErrorDisposition): boolean {
 	return RETRYABLE_DISPOSITION[disposition];
@@ -126,6 +132,14 @@ export function classifyGatewayError(err: unknown): GatewayErrorClassification {
 	}
 	if (modelUnavailableCode(err) || MODEL_UNAVAILABLE_PATTERN.test(message)) {
 		return withOwnerDisposition(err, { status: 404, type: "invalid_request_error", message });
+	}
+
+	// Free-text abort wording sits below authoritative statuses on purpose: a
+	// provider-reported `HTTP 503: upstream request aborted` is a retryable
+	// outage, not a client cancellation. Genuine cancels arrive as AbortError
+	// (handled above) or structural Flag.Abort / status 499.
+	if (/\baborted\b|\babort signal\b/i.test(message)) {
+		return withOwnerDisposition(err, { status: 499, type: "request_aborted", message });
 	}
 
 	// Free-text abort wording sits below authoritative statuses on purpose: a

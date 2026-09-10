@@ -437,6 +437,7 @@
 - Fixed auth-gateway model discovery treating non-2xx responses with array/`data` bodies as successful catalogs.
 - Fixed auth-gateway SSE streams leaking turn reservations when `reader.read()` rejects after the response is returned.
 - Fixed OpenAI Responses file-id compatibility being checked only against the initial route target; fallback targets are revalidated before dispatch.
+- Route selection respects disabled tool support and nested balancing strategies.
 - Fixed conditional and domain routing, forward route references, Gemini multimodal requests, and token estimates that omitted system prompts or tools.
 
 - Honour balance rr/weighted strategies on first dispatch, and resolve replaceAll route-refs against the complete incoming definition set.
