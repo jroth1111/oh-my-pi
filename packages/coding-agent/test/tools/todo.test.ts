@@ -693,26 +693,22 @@ describe("TodoTool operations", () => {
 		const incoming = [
 			{
 				name: "Ship",
-				id: "phase-1",
+				...{ id: "phase-1" },
 				tasks: [
 					{
 						content: "host cancel",
-						status: "abandoned" as const,
-						id: "task-1",
-						notes: "host note",
-						details: "host details",
+						status: "abandoned",
+						...{ id: "task-1", notes: "host note", details: "host details" },
 					},
 					{
 						content: "model drop",
-						status: "abandoned" as const,
-						id: "task-2",
-						notes: "still model",
+						status: "abandoned",
+						...{ id: "task-2", notes: "still model" },
 					},
 					{
 						content: "open work",
-						status: "pending" as const,
-						id: "task-3",
-						details: "keep going",
+						status: "pending",
+						...{ id: "task-3", details: "keep going" },
 					},
 				],
 			},
