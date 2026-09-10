@@ -226,6 +226,7 @@ describe("RouteRegistry", () => {
 		expect(compiled?.root).toEqual({ type: "target", model: "openai/gpt-5" });
 		expect(compiled?.id).toBe("openai/gpt-5");
 	});
+});
 
 	it("get returns registered virtual routes and ignores catalog models (negative)", () => {
 		const registry = new RouteRegistry(id => (id === "gpt-5" ? fakeModel("gpt-5") : undefined));

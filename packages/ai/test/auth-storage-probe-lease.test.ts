@@ -1,8 +1,9 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { AuthStorage, type OAuthCredential, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai/auth-storage";
+import * as oauthUtils from "@oh-my-pi/pi-ai/registry/oauth";
 import { removeWithRetries } from "../../utils/src/temp";
 
 const PROVIDER = "unit-wave-a-probe";
@@ -30,6 +31,7 @@ describe("AuthStorage quota probe leases", () => {
 	});
 
 	afterEach(async () => {
+		vi.restoreAllMocks();
 		store?.close();
 		store = null;
 		storage = null;

@@ -489,6 +489,8 @@ export interface StreamOptions {
 	 * `x-grok-conv-id`; when omitted, they fall back to `sessionId`.
 	 */
 	promptCacheKey?: string;
+	/** Persist the response for later previous_response_id continuation (Responses-style APIs). */
+	store?: boolean;
 	/**
 	 * OpenAI GPT-5.6+ prompt-cache policy. Ignored by providers that do not
 	 * support explicit OpenAI cache breakpoints; explicit mode fails locally on
