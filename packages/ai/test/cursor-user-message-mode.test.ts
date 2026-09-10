@@ -1,8 +1,9 @@
 import { describe, expect, it } from "bun:test";
-import { streamCursor } from "@oh-my-pi/pi-ai/providers/cursor";
+import { buildGrpcRequest, type CursorOptions } from "@oh-my-pi/pi-ai/providers/cursor";
 import type { Context, Model } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import type { AgentRunRequest } from "@oh-my-pi/pi-catalog/discovery/cursor-proto";
+import { type AgentRunRequest, AgentClientMessageSchema } from "@oh-my-pi/pi-catalog/discovery/cursor-proto";
+import { fromBinary } from "@oh-my-pi/pi-catalog/discovery/protobuf";
 
 function cursorModel(): Model<"cursor-agent"> {
 	return buildModel({
@@ -19,20 +20,16 @@ function cursorModel(): Model<"cursor-agent"> {
 	});
 }
 
-function capture(): Promise<AgentRunRequest> {
-	const { promise, resolve, reject } = Promise.withResolvers<AgentRunRequest>();
-	streamCursor(cursorModel(), { messages: [{ role: "user", content: "pong", timestamp: 0 }] } satisfies Context, {
-		apiKey: "test-token",
-		onPayload: payload => {
-			if (payload && typeof payload === "object" && "conversationState" in payload) {
-				resolve(payload as AgentRunRequest);
-			} else {
-				reject(new Error("Cursor payload was not an AgentRunRequest"));
-			}
-			throw new Error("stop after capturing Cursor payload");
-		},
-	});
-	return promise;
+async function capture(options?: CursorOptions): Promise<AgentRunRequest> {
+	const { requestBytes } = await buildGrpcRequest(
+		cursorModel(),
+		{ messages: [{ role: "user", content: "pong", timestamp: 0 }] } satisfies Context,
+		options,
+		{ conversationId: "wire-test", blobStore: new Map() },
+	);
+	const message = fromBinary(AgentClientMessageSchema, requestBytes).message;
+	if (message.case !== "runRequest") throw new Error("Expected Cursor run request");
+	return message.value;
 }
 
 describe("Cursor user message wire shape", () => {
@@ -43,5 +40,24 @@ describe("Cursor user message wire shape", () => {
 		if (action?.case !== "userMessageAction") return;
 		expect(action.value.userMessage?.text).toBe("pong");
 		expect(action.value.userMessage?.mode).toBe(1);
+	});
+});
+
+// Losing these fields during encoding silently disables negotiated capabilities
+// and disconnects a run from the caller's session.
+it("encodes negotiated capabilities and caller session identity on the wire", async () => {
+	const payload = await capture({
+		cursorClientSupportsInlineImages: true,
+		cursorClientSupportsRoutedModelUpdate: true,
+		cursorClientSupportsPromptContextUsageRpc: true,
+		cursorRunId: "run-123",
+		cursorAgentSessionId: "session-456",
+	});
+	expect(payload).toMatchObject({
+		clientSupportsInlineImages: true,
+		clientSupportsRoutedModelUpdate: true,
+		clientSupportsPromptContextUsageRpc: true,
+		runId: "run-123",
+		agentSessionId: "session-456",
 	});
 });

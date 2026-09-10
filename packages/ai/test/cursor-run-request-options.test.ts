@@ -4,8 +4,8 @@ import { describe, expect, it } from "bun:test";
 import { buildGrpcRequest } from "@oh-my-pi/pi-ai/providers/cursor";
 import type { Context, Model } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import { AgentClientMessageSchema, type AgentRunRequest } from "@oh-my-pi/pi-catalog/discovery/cursor-gen/agent_pb";
-import { fromBinary } from "@bufbuild/protobuf";
+import { AgentClientMessageSchema, type AgentRunRequest } from "@oh-my-pi/pi-catalog/discovery/cursor-proto";
+import { fromBinary } from "@oh-my-pi/pi-catalog/discovery/protobuf";
 
 function cursorModel(): Model<"cursor-agent"> {
 	return buildModel({
@@ -36,9 +36,9 @@ async function capture(options: {
 		options,
 		{ conversationId: options.conversationId ?? "fixture-conversation", blobStore: new Map() },
 	);
-	const decoded = fromBinary(AgentClientMessageSchema, requestBytes);
-	if (decoded.message.case !== "runRequest") throw new Error("Expected serialized RunRequest");
-	return decoded.message.value;
+	const message = fromBinary(AgentClientMessageSchema, requestBytes).message;
+	if (message.case !== "runRequest") throw new Error("Expected serialized RunRequest");
+	return message.value;
 }
 
 describe("Cursor AgentRunRequest option wiring", () => {

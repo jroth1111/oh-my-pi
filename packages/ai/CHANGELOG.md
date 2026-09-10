@@ -169,6 +169,10 @@
 - Grok Bot product Read/Write property-alias descriptions load from static `.md` prompt assets.
 - Grok Bot parent-chat keeps concurrent SendToUser reconstruction state per call so interleaved name-less frames do not fall through to unknown tool calls.
 
+- Cursor requests generate distinct run IDs, share them with the request header, and preserve conversation grouping.
+- Cursor requests preserve caller-supplied capability flags and session identifiers.
+- Cursor user messages use agent mode consistently with the native CLI.
+
 ## [18.1.16] - 2026-09-09
 
 ### Fixed

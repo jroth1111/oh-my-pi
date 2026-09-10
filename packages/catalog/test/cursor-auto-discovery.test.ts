@@ -2,8 +2,8 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import * as http2 from "node:http2";
 import { fetchCursorUsableModels } from "../src/discovery/cursor";
 import { buildModel } from "../src/build";
-import { GetUsableModelsResponseSchema, ModelDetailsSchema } from "../src/discovery/cursor-gen/agent_pb";
-import { create, toBinary } from "@bufbuild/protobuf";
+import { GetUsableModelsResponseSchema, ModelDetailsSchema } from "../src/discovery/cursor-proto";
+import { create, toBinary } from "../src/discovery/protobuf";
 import type { ModelSpec } from "../src/types";
 
 let server: http2.Http2Server;
@@ -31,7 +31,9 @@ beforeAll(async () => {
 			stream.end(payload);
 		});
 	});
-	await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+	const listening = Promise.withResolvers<void>();
+	server.listen(0, "127.0.0.1", listening.resolve);
+	await listening.promise;
 	const address = server.address();
 	if (!address || typeof address === "string") {
 		throw new Error("expected http2 fixture server to bind a tcp port");
