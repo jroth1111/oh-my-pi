@@ -3,6 +3,12 @@
 ## [Unreleased]
 
 ### Added
+### Fixed
+
+- Cursor discovery preserves the roster model ID for automatic routing.
+- Updated Cursor protocol definitions for capability flags, session identifiers, and server updates.
+
+## [18.1.16] - 2026-09-09
 
 - Grok Bot (`grokbot`) catalog — model aliases (`sand-default`, `grok-4.5`, …) with image input and reasoning on `sand-default`; cost is $0 by design (renewer-billed). Distinct from `cursor` and `xai` / Grok CLI catalogs.
 - Grok Bot (`grokbot`) catalog — sand InferenceService model aliases (`sand-default`, `grok-4.5`, …) with image input; distinct from `cursor` and `xai` / Grok CLI catalogs. Catalog cost is intentionally $0 (sand usage meters on the renewer account). Reasoning seeds advertise sand effort including `xhigh`.

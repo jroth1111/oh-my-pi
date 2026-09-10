@@ -2,6 +2,13 @@
 
 ### Fixed
 
+- Cursor requests preserve caller-supplied capability flags and session identifiers.
+- Cursor user messages use agent mode consistently with the native CLI.
+
+## [18.1.16] - 2026-09-09
+
+### Fixed
+
 - Cursor can create new files after its destination probe reports a missing file.
 - Grok Bot inference uses the dedicated token returned by renewal, fixing authentication failures after successful model discovery.
 - Grok Bot Opus tool calls and late advisor follow-ups no longer fail with provider HTTP 400 errors.
