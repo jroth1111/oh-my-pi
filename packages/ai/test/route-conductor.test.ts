@@ -235,6 +235,26 @@ describe("decideAttempt", () => {
 		expect(action).toEqual({ type: "fallback_target", targetModelId: "tertiary" });
 	});
 
+	it("falls back to quota targets once siblings are exhausted", () => {
+		const action = decideAttempt({
+			route: route({ fallbacks: { credential_quota: ["claude", "gemini"] } }),
+			state: state({ attemptedTargets: new Set(["primary"]), siblingsExhausted: true }),
+			classification: classification("credential_quota"),
+			commitState: "probing",
+		});
+		expect(action).toEqual({ type: "fallback_target", targetModelId: "claude" });
+	});
+
+	it("falls back to configured targets after permanent credential failure exhausts siblings", () => {
+		const action = decideAttempt({
+			route: route({ fallbacks: { credential_permanent: ["foreign/provider-model"] } }),
+			state: state({ attemptedTargets: new Set(["primary"]), siblingsExhausted: true }),
+			classification: classification("credential_permanent"),
+			commitState: "probing",
+		});
+		expect(action).toEqual({ type: "fallback_target", targetModelId: "foreign/provider-model" });
+	});
+
 	it("returns terminal on request_terminal", () => {
 		const action = decideAttempt({
 			route: route(),

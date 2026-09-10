@@ -390,6 +390,7 @@
 - Fixed suffix fallback edges, rejected ambiguous cross-branch target reuse, distinguished failed terminals for probe settlement, and released reservations on abort.
 - Fixed nested route-graph fallback edges retaining their entry target via `fallbackByTarget` so unentered branches cannot steal failover.
 - Fixed caller-owned Responses continuations forcing `store: true`, and settled successful pi-native streaming probes without a commit gate.
+- Single saved API keys now honor cooldowns and concurrent request reservations.
 - Bump credential incarnation when a stored API-key row is replaced (or an OAuth row becomes an API key) so prior turn reservations cannot suppress the new key.
 - Settle gateway quota probes only on committed output or successful terminals, release pi-native reservations when abort wins lookup, lease probes against the active block scope, and skip cooldown-blocked API keys when healthy rows are reserved.
 

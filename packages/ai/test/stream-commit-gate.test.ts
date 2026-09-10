@@ -153,6 +153,20 @@ describe("holdSseUntilCommit (prelude replay buffer)", () => {
 		expect(gate.state).toBe("committed");
 	});
 
+	it("forwards held frames for a terminal-success-only Responses stream", async () => {
+		const gate = new StreamCommitGate();
+		const held = holdSseUntilCommit(
+			sse(["event: response.created\ndata: {}\n\n", "event: response.completed\ndata: {}\n\n"]),
+			gate,
+		);
+		const out = await collect(held);
+
+		expect(out).toContain("response.created");
+		expect(out).toContain("response.completed");
+		expect(gate.state).toBe("terminated");
+		expect(gate.sawSuccessfulTerminal).toBe(true);
+	});
+
 	it("records sawSuccessfulTerminal only for completed/incomplete terminals", () => {
 		const ok = new StreamCommitGate();
 		ok.classifyAndObserve("response.created", 10);
