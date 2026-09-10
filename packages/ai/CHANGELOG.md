@@ -321,6 +321,15 @@
 - Provider preludes remain eligible for fallback, and successful empty streams retain their response frames.
 - Fixed gateway error classification swallowing retryable failures: authoritative statuses now outrank abort wording, 403 account caps rotate as quota, Trusted-Access/cyber-policy denials rotate credentials instead of terminating, 400 model-missing responses fail over by model, dead OAuth grants (`invalid_token` et al) retire permanently, and concurrency-cap 429s stay in provider backoff.
 - Fixed OpenAI Responses gateway retries to preserve caller storage through strict-tool fallback, retain structured-output descriptions, and treat top-level `event: error` SSE frames as terminal failures.
+### Changed
+
+- Gateway error classifications now carry a failure owner and retry/failover disposition (`credential_permanent`, `provider_transient`, `policy_terminal`, …); provider status codes stay authoritative over message wording, and context-overflow detection reuses the central classifier.
+- Gateway requests now forward `previous_response_id`, `parallel_tool_calls`, `logit_bias`, `user`, and `response_format` to providers instead of dropping them; Responses requests map `response_format` JSON-schema to the flat `text.format` shape and never send Chat-Completions-only `seed`.
+- Auth gateway observes Responses SSE through a StreamCommitGate: metadata-only preludes stay failover-eligible, the first output event or 4 MiB cap commits, and post-commit terminals (`response.completed`/`response.failed`/`response.incomplete`/`response.error`) end failover eligibility instead of being misread as output.
+
+### Fixed
+
+- Fixed OpenAI Responses continuation pairing a caller-supplied `previous_response_id` with an internally computed delta from a different stored response, and restricted stale-baseline recovery to internally owned chain ids so a stale caller id can no longer silently drop prior context.
 
 ## [18.1.14] - 2026-09-07
 
@@ -525,9 +534,6 @@
 - Added GPT-6 Astra support for preserving prompt caching when changing the thinking level during a conversation across the OpenAI and OpenAI Codex providers.
 
 ### Changed
-- Gateway error classifications now carry a failure owner and retry/failover disposition (`credential_permanent`, `provider_transient`, `policy_terminal`, …); provider status codes stay authoritative over message wording, and context-overflow detection reuses the central classifier.
-- Gateway requests now forward `previous_response_id`, `parallel_tool_calls`, `logit_bias`, `user`, and `response_format` to providers instead of dropping them; Responses requests map `response_format` JSON-schema to the flat `text.format` shape and never send Chat-Completions-only `seed`.
-- Auth gateway observes Responses SSE through a StreamCommitGate: metadata-only preludes stay failover-eligible, the first output event or 4 MiB cap commits, and post-commit terminals (`response.completed`/`response.failed`/`response.incomplete`/`response.error`) end failover eligibility instead of being misread as output.
 
 - Provider request builders now read resolved model policy (`model.compat`, `model.identity`, `model.thinking`, behavior rules) for every model-conditional decision — Harmony escaping, vision stripping, thinking transports and ladders, Claude Code instruction injection, Google beta headers and thought-signature handling, Cloudflare gateway routing, Codex service-tier pricing, and quota metering — instead of matching model names.
 - Updated Devin auth, assignment, chat, and usage requests to the current released CLI identity, version `3000.6.2` ([#8590](https://github.com/can1357/oh-my-pi/pull/8590) by [@will-bogusz](https://github.com/will-bogusz)).
@@ -560,6 +566,8 @@
 - Auth gateway `GET /v1/routes/:id` returns a registered virtual route.
 - Auth gateway `PUT /v1/routes/:id` registers or replaces a virtual route.
 - Auth gateway `DELETE /v1/routes/:id` unregisters a virtual route.
+- Updated Devin auth, assignment, chat, and usage requests to the current released CLI identity, version `3000.6.2` ([#8590](https://github.com/can1357/oh-my-pi/pull/8590) by [@will-bogusz](https://github.com/will-bogusz)).
+- Devin auth, model assignment, and chat requests now send the native Devin CLI identity (`ideName: devin-cli`, `ideType: chisel`, `extensionName: chisel`, mapped `os`) instead of the Windsurf IDE identity; `ideType: chisel` is what the backend requires for router assignment ([#8590](https://github.com/can1357/oh-my-pi/pull/8590) by [@will-bogusz](https://github.com/will-bogusz)).
 - Devin parallel tool calls follow `compat.supportsParallelToolCalls` instead of being disabled unconditionally, so natively discovered configs that support parallelism can use it ([#8590](https://github.com/can1357/oh-my-pi/pull/8590) by [@will-bogusz](https://github.com/will-bogusz)).
 - Updated OpenAI Codex requests to improve routing by communicating the selected model and service tier across Responses, WebSocket, and remote-compaction requests.
 
@@ -745,6 +753,7 @@
 ### Fixed
 
 - Improved OAuth sign-in flows, including a fallback message when the browser cannot automatically close the OAuth success tab.
+- Fixed Cloudflare AI Gateway onboarding and routing so gateway account and endpoint configuration is preserved correctly while gateway credentials are not sent as upstream OpenAI authorization headers.
 - Fixed Codex OAuth quota handling so chat and Spark usage remain independent, legacy shared quota limits continue to work, and incomplete usage reports are not incorrectly treated as unlimited.
 
 ### Fixed
