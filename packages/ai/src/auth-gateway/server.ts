@@ -2452,6 +2452,15 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 					if (id.length === 0) {
 						return withCors(handleRoutesList(registry), req);
 					}
+					// Route ids may carry reserved characters; clients send
+					// them escaped (`virtual%2Fprimary`). Malformed escapes
+					// are a client error, not a missing route.
+					let id: string;
+					try {
+						id = decodeURIComponent(rawId);
+					} catch {
+						return withCors(json(400, { error: "invalid route id encoding" }), req);
+					}
 					return withCors(handleRouteGet(registry, id), req);
 				}
 				if (req.method === "PUT" && pathname.startsWith("/v1/routes/")) {

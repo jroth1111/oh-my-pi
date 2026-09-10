@@ -452,3 +452,10 @@ it("rejects route IDs erased by URL normalization", () => {
 		expect(() => registry.register({ id, root: { type: "target", model: "target" } })).toThrow(/dot segment/);
 	expect(registry.list()).toEqual([]);
 });
+
+it("rejects route IDs erased by URL normalization", () => {
+	const registry = new RouteRegistry(() => undefined);
+	for (const id of [".", ".."])
+		expect(() => registry.register({ id, root: { type: "target", model: "target" } })).toThrow(/dot segment/);
+	expect(registry.list()).toEqual([]);
+});

@@ -283,6 +283,8 @@
 - Fixed gateway fallback routing through missing models and credentials while honoring each route’s configured failure conditions.
 
 - Fixed gateway SSE holds to share the canonical commit-aware implementation and flush EOF metadata, while unresolved or credentialless route targets now advance to the next eligible target.
+- Nested fallback routes preserve target order and reject empty route IDs.
+- Fixed stateful continuations changing targets or accounts, and rejected route IDs that URL normalization would erase.
 
 - Gateway error classifications now carry a failure owner and retry/failover disposition (`credential_permanent`, `provider_transient`, `policy_terminal`, …); provider status codes stay authoritative over message wording, and context-overflow detection reuses the central classifier.
 - Gateway requests now forward `previous_response_id`, `parallel_tool_calls`, `logit_bias`, `user`, and `response_format` to providers instead of dropping them; Responses requests map `response_format` JSON-schema to the flat `text.format` shape and never send Chat-Completions-only `seed`.
@@ -341,6 +343,8 @@
 - Fixed concurrent credential probes and permanent-credential fallback; stateful continuations keep their target and reject ambiguous account selection.
 - Ambiguous duplicate route targets are rejected instead of creating unreachable fallback branches.
 - Fixed concurrent credential probes and prevented nested fallback routes from selecting targets in unrelated branches.
+- Auth gateway `GET /v1/routes` lists registered virtual routes.
+- Auth gateway `GET /v1/routes/:id` returns a registered virtual route.
 
 
 ## [18.1.14] - 2026-09-07
