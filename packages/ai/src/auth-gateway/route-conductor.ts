@@ -118,6 +118,7 @@ export function decideAttempt(args: {
 		case "policy_terminal":
 		case "gateway_terminal":
 			return { type: "terminal" };
+		case "credential_permanent":
 		case "credential_quota":
 		case "credential_transient":
 		case "credential_permanent": {
