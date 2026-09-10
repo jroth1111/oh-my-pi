@@ -8,6 +8,8 @@ import {
 	applyOllamaCloudOutputCap,
 	linkOpenAIPromotionTargets,
 } from "../scripts/generated-policies";
+import { mergePreviousSnapshotModels } from "../scripts/generate-models";
+import { isCredentialScopedCatalogProvider } from "../src/compat/resolve";
 import { buildModel } from "../src/build";
 import { resolveModelPolicy } from "../src/compat/resolve";
 import { buildGrokbotStaticSeed } from "../src/provider-models/grokbot";
@@ -943,6 +945,143 @@ describe("Grok Bot generated thinking policy", () => {
 	it("marks grokbot credential-scoped catalog via provider KDL", () => {
 		const [seed] = buildGrokbotStaticSeed();
 		expect(resolveModelPolicy(seed).catalog.credentialScopedCatalog).toBe(true);
+	});
+
+	it("assigns sand-tools-wire keep-model to Anthropic-class grokbot rows via provider KDL", () => {
+		const claude = buildModel({
+			id: "claude-opus-5",
+			name: "Claude Opus 5",
+			api: "grokbot-sand",
+			provider: "grokbot",
+			baseUrl: "https://api2.cursor.sh",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 100_000,
+			maxTokens: 8_000,
+		});
+		expect(claude.sandToolsWire).toBe("keep-model");
+		const grok = buildModel({
+			id: "grok-4.6",
+			name: "Grok 4.6",
+			api: "grokbot-sand",
+			provider: "grokbot",
+			baseUrl: "https://api2.cursor.sh",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 100_000,
+			maxTokens: 8_000,
+		});
+		expect(grok.sandToolsWire).toBeUndefined();
+	});
+
+	it("assigns sand-empty-tools-retry-wire keep-model to gemini-* via provider KDL", () => {
+		const gemini = buildModel({
+			id: "gemini-3-flash",
+			name: "gemini-3-flash",
+			api: "grokbot-sand",
+			provider: "grokbot",
+			baseUrl: "https://api2.cursor.sh",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 100_000,
+			maxTokens: 8_000,
+		});
+		expect(gemini.sandEmptyToolsRetryWire).toBe("keep-model");
+		expect(gemini.sandAcceptEmptyWriteFollowup).toBe(true);
+		expect(gemini.sandNativeToolSchema).toBe("google");
+		const openai = buildModel({
+			id: "gpt-5.4-luna",
+			name: "gpt-5.4-luna",
+			api: "grokbot-sand",
+			provider: "grokbot",
+			baseUrl: "https://api2.cursor.sh",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 100_000,
+			maxTokens: 8_000,
+		});
+		expect(openai.sandNativeToolSchema).toBe("strict");
+		const grok = buildModel({
+			id: "grok-4.6",
+			name: "grok-4.6",
+			api: "grokbot-sand",
+			provider: "grokbot",
+			baseUrl: "https://api2.cursor.sh",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 100_000,
+			maxTokens: 8_000,
+		});
+		expect(grok.sandEmptyToolsRetryWire).toBeUndefined();
+		expect(grok.sandAcceptEmptyWriteFollowup).toBeUndefined();
+		expect(grok.sandNativeToolSchema).toBeUndefined();
+	});
+
+	it("reapplies KDL Sand policy over stale cached sandEmptyToolsRetryWire values", () => {
+		// Cached live rows can retain a prior release's resolved Sand fields.
+		// buildModel must overwrite/clear them from the current KDL result rather
+		// than treating a cached value as authoritative forever.
+		const gemini = buildModel({
+			id: "gemini-3-flash",
+			name: "gemini-3-flash",
+			api: "grokbot-sand",
+			provider: "grokbot",
+			baseUrl: "https://api2.cursor.sh",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 100_000,
+			maxTokens: 8_000,
+			sandEmptyToolsRetryWire: "native",
+			sandToolsWire: "error",
+			sandAcceptEmptyWriteFollowup: undefined,
+		});
+		expect(gemini.sandEmptyToolsRetryWire).toBe("keep-model");
+		expect(gemini.sandToolsWire).toBeUndefined();
+		expect(gemini.sandAcceptEmptyWriteFollowup).toBe(true);
+		const grok = buildModel({
+			id: "grok-4.6",
+			name: "grok-4.6",
+			api: "grokbot-sand",
+			provider: "grokbot",
+			baseUrl: "https://api2.cursor.sh",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 100_000,
+			maxTokens: 8_000,
+			sandEmptyToolsRetryWire: "keep-model",
+			sandAcceptEmptyWriteFollowup: true,
+		});
+		expect(grok.sandEmptyToolsRetryWire).toBeUndefined();
+		expect(grok.sandAcceptEmptyWriteFollowup).toBeUndefined();
+	});
+
+	it("excludes grokbot from gen:models catalog discovery like other credential-scoped providers", () => {
+		// A renewer in the generator environment must not bake AvailableModels into models.json,
+		// and prior private roster rows must not resurrect from the previous snapshot.
+		expect(isCredentialScopedCatalogProvider("grokbot")).toBe(true);
+		expect(isCredentialScopedCatalogProvider("devin")).toBe(true);
+		expect(isCredentialScopedCatalogProvider("openai")).toBe(false);
+		const stale = buildModel({
+			id: "account-private-model",
+			name: "private",
+			api: "grokbot-sand",
+			provider: "grokbot",
+			baseUrl: "https://api2.cursor.sh",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 100_000,
+			maxTokens: 8_000,
+		});
+		const merged = mergePreviousSnapshotModels([], { grokbot: { [stale.id]: stale } }, new Set());
+		expect(merged.map(m => `${m.provider}/${m.id}`)).toEqual([]);
 	});
 
 	it("forces supportsTools false for grok-4.5 via provider KDL", () => {

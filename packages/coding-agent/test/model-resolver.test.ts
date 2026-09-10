@@ -1127,6 +1127,40 @@ describe("resolveAgentModelPatterns", () => {
 		expect(resolveAgentModelPatterns({ agentModel: "@slow", settings })).toEqual(["local/llama"]);
 	});
 
+	test("uses configured smol for unconfigured tiny before priority defaults", () => {
+		const settings = Settings.isolated({
+			modelRoles: {
+				default: "local/default",
+				smol: "baseten/custom-smol:max",
+			},
+		});
+
+		expect(resolveAgentModelPatterns({ agentModel: "@tiny", settings })).toEqual(["baseten/custom-smol:max"]);
+	});
+
+	test("breaks the tiny/smol fallback cycle via a default alias", () => {
+		const settings = Settings.isolated({ modelRoles: { default: "@tiny" } });
+		const baseline = resolveAgentModelPatterns({ agentModel: "@smol", settings: Settings.isolated() });
+
+		const tiny = resolveAgentModelPatterns({ agentModel: "@tiny", settings });
+		const smol = resolveAgentModelPatterns({ agentModel: "@smol", settings });
+
+		expect(baseline.length).toBeGreaterThan(0);
+		expect(tiny).not.toContain("@tiny");
+		expect(smol).not.toContain("@tiny");
+		expect(tiny).toEqual(baseline);
+		expect(smol).toEqual(tiny);
+	});
+
+	test("preserves thinking suffix when breaking the smol fallback cycle", () => {
+		const settings = Settings.isolated({ modelRoles: { smol: "@tiny:high" } });
+		const baseline = resolveAgentModelPatterns({ agentModel: "@smol", settings: Settings.isolated() });
+
+		const tiny = resolveAgentModelPatterns({ agentModel: "@tiny", settings });
+
+		expect(tiny).toEqual(baseline.map(pattern => `${pattern}:high`));
+	});
+
 	test("expands cross-role default aliases when inheriting for an unset role", () => {
 		const settings = Settings.isolated({
 			modelRoles: { default: "@slow", slow: "anthropic/claude-sonnet-4-5" },
@@ -1758,6 +1792,47 @@ describe("resolveModelScope", () => {
 		expect(scoped[0].model.id).toBe("gpt-5.5");
 	});
 
+	test("resolves bracketed Grok Bot variant selectors literally before glob", async () => {
+		// `default[]` contains `[` so a naive glob path treats `[]` as an empty
+		// character class and matches nothing — exact id/alias must win first.
+		const variant = {
+			...allModels[0]!,
+			id: "default[]",
+			provider: "grokbot" as const,
+			api: "grokbot-sand" as const,
+			name: "default[]",
+		};
+		const scoped = await resolveModelScope(["grokbot/default[]"], {
+			getAvailable: () => [variant as (typeof allModels)[number]],
+		});
+		expect(scoped).toHaveLength(1);
+		expect(scoped[0]!.model.id).toBe("default[]");
+		expect(scoped[0]!.model.provider).toBe("grokbot");
+	});
+
+	test("bracket character-class globs expand via Bun.Glob instead of fuzzy single-match", async () => {
+		const gpt5 = allModels.find(m => m.provider === "openai" && m.id === "gpt-5") ?? {
+			...allModels[0]!,
+			id: "gpt-5",
+			provider: "openai" as const,
+			name: "gpt-5",
+		};
+		const gpt4 = allModels.find(m => m.provider === "openai" && m.id === "gpt-4") ?? {
+			...allModels[0]!,
+			id: "gpt-4",
+			provider: "openai" as const,
+			name: "gpt-4",
+		};
+		const available = [gpt5, gpt4] as (typeof allModels)[number][];
+		// Fuzzy would pick gpt-5; Bun.Glob `gpt-[!5]` excludes that character.
+		const scoped = await resolveModelScope(["openai/gpt-[!5]"], {
+			getAvailable: () => available,
+		});
+		expect(scoped.map(s => s.model.id).sort()).toEqual(["gpt-4"]);
+		const filtered = filterAvailableModelsByEnabledPatterns(available, ["openai/gpt-[!5]"]);
+		expect(filtered.map(m => m.id).sort()).toEqual(["gpt-4"]);
+	});
+
 	test("resolves role aliases in --models scope to the role's model with its thinking level", async () => {
 		const settings = Settings.isolated({
 			modelRoles: { fable: "anthropic/claude-sonnet-4-5:high" },
@@ -2244,6 +2319,23 @@ describe("filterAvailableModelsByEnabledPatterns", () => {
 		expect(result).toHaveLength(1);
 		expect(result[0].provider).toBe("openai");
 		expect(result[0].id).toBe("gpt-5.5");
+	});
+
+	test("resolves bracketed Grok Bot variant selectors literally before glob", () => {
+		const variant = {
+			...allModels[0]!,
+			id: "default[]",
+			provider: "grokbot" as const,
+			api: "grokbot-sand" as const,
+			name: "default[]",
+		};
+		const result = filterAvailableModelsByEnabledPatterns(
+			[variant as (typeof allModels)[number]],
+			["grokbot/default[]"],
+		);
+		expect(result).toHaveLength(1);
+		expect(result[0]!.id).toBe("default[]");
+		expect(result[0]!.provider).toBe("grokbot");
 	});
 });
 

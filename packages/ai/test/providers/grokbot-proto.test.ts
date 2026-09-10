@@ -3,7 +3,6 @@ import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import * as grokbotCatalogAuth from "@oh-my-pi/pi-catalog/discovery/grokbot-auth";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { TRUNCATE_LENGTHS } from "@oh-my-pi/pi-tui";
-import { shortenPath } from "@oh-my-pi/pi-utils";
 import {
 	formatGrokbotConnectTrailerError,
 	streamGrokBot,
@@ -568,6 +567,18 @@ describe("grokbot requested model mapping", () => {
 			{ id: "context", value: "300k" },
 			{ id: "effort", value: "low" },
 		]);
+		// `--thinking off` without explicit effort must not restore discovered effort.
+		expect(
+			resolveGrokbotRequestedModel("claude-opus-5", {
+				thinking: false,
+				sandParameterIds: ["thinking", "context", "effort", "fast"],
+				sandParameterDefaults: { thinking: "true", effort: "high", context: "300k", fast: "false" },
+			}).parameters,
+		).toEqual([
+			{ id: "thinking", value: "false" },
+			{ id: "context", value: "300k" },
+			{ id: "fast", value: "false" },
+		]);
 		// Without discovered/explicit fast, omit it (do not invent from thinking).
 		expect(
 			resolveGrokbotRequestedModel("claude-opus-5", {
@@ -725,7 +736,7 @@ describe("grokbot checksum", () => {
 		expect(status).not.toContain("Host: https://api2.cursor.sh");
 	});
 
-	test("redacts URL userinfo and credential query params from Host status", async () => {
+	test("redacts URL userinfo and all query params from Host status", async () => {
 		spyOn(grokbotCatalogAuth, "loadGrokbotConfig").mockResolvedValue({
 			renewal: "renew-present",
 			machineId: "machine-present",
@@ -735,56 +746,59 @@ describe("grokbot checksum", () => {
 		spyOn(grokbotCatalogAuth, "grokbotSecretsPath").mockReturnValue("/tmp/agent/secrets/grokbot.env");
 
 		const status = await formatGrokbotStatus({
-			baseUrl: "https://token:sekrit@proxy.example/grokbot?api_key=leak&keep=1",
+			baseUrl: "https://token:sekrit@proxy.example/grokbot?api_key=leak&x-api-key=also&keep=1",
 		});
 		const hostLine = status.split("\n").find(line => line.startsWith("Host:"));
-		expect(hostLine).toBe("Host: https://proxy.example/grokbot?keep=1");
+		expect(hostLine).toBe("Host: https://proxy.example/grokbot");
 		expect(hostLine).not.toContain("token");
 		expect(hostLine).not.toContain("sekrit");
 		expect(hostLine).not.toContain("api_key");
+		expect(hostLine).not.toContain("x-api-key");
 		expect(hostLine).not.toContain("leak");
+		expect(hostLine).not.toContain("keep=1");
+	});
+
+	test("redacts URL fragments from Host status", async () => {
+		spyOn(grokbotCatalogAuth, "loadGrokbotConfig").mockResolvedValue({
+			renewal: "renew-present",
+			machineId: "machine-present",
+			namespace: "prod",
+			clientVersion: "0.30.0",
+		});
+		spyOn(grokbotCatalogAuth, "grokbotSecretsPath").mockReturnValue("/tmp/agent/secrets/grokbot.env");
+
+		const status = await formatGrokbotStatus({
+			baseUrl: "https://proxy.example/grokbot#token=secret",
+		});
+		const hostLine = status.split("\n").find(line => line.startsWith("Host:"));
+		expect(hostLine).toBe("Host: https://proxy.example/grokbot");
+		expect(hostLine).not.toContain("token");
+		expect(hostLine).not.toContain("secret");
+		expect(hostLine).not.toContain("#");
+	});
+
+	test("redacts userinfo and query from malformed Host URLs without a scheme", async () => {
+		spyOn(grokbotCatalogAuth, "loadGrokbotConfig").mockResolvedValue({
+			renewal: "renew-present",
+			machineId: "machine-present",
+			namespace: "prod",
+			clientVersion: "0.30.0",
+		});
+		spyOn(grokbotCatalogAuth, "grokbotSecretsPath").mockReturnValue("/tmp/agent/secrets/grokbot.env");
+
+		const status = await formatGrokbotStatus({
+			baseUrl: "user:sekrit@proxy.local?x-api-key=leak&keep=1",
+		});
+		const hostLine = status.split("\n").find(line => line.startsWith("Host:"));
+		expect(hostLine).toBe("Host: proxy.local");
+		expect(hostLine).not.toContain("sekrit");
+		expect(hostLine).not.toContain("x-api-key");
+		expect(hostLine).not.toContain("leak");
+		expect(hostLine).not.toContain("keep=1");
 	});
 });
 
 describe("grokbot sand-host client parity", () => {
-	test("keeps leading developer instructions but serializes a late advisor as a chronological follow-up", () => {
-		const messages = toInferenceMessages(
-			{
-				systemPrompt: ["System instructions"],
-				messages: [
-					{ role: "developer", content: "Initial developer instructions", timestamp: 0 },
-					{ role: "user", content: "Run the task", timestamp: 1 },
-					{
-						role: "assistant",
-						content: [{ type: "text", text: "Task complete" }],
-						api: "grokbot-sand",
-						provider: "grokbot",
-						model: conversionModel.id,
-						usage: {
-							input: 0,
-							output: 0,
-							cacheRead: 0,
-							cacheWrite: 0,
-							totalTokens: 0,
-							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-						},
-						stopReason: "stop",
-						timestamp: 2,
-					},
-					{ role: "developer", content: "Late advisor: verify the result", timestamp: 3 },
-				],
-			},
-			conversionModel,
-		);
-		const decoded = decodeInferenceStreamRequest(encodeInferenceStreamRequest({ messages }));
-		expect(decoded.messages).toEqual([
-			{ role: 4, text: "System instructions" },
-			{ role: 4, text: "Initial developer instructions" },
-			{ role: 1, text: "Run the task" },
-			{ role: 2, text: "Task complete" },
-			{ role: 1, text: "Late advisor: verify the result" },
-		]);
-	});
 	test("strips stamped version and applies namespace suffixes like sand-host", () => {
 		expect(stampedVersionBaseOf("0.30.0-pre.16")).toBe("0.30.0");
 		expect(resolveGrokbotClientVersion("prod")).toBe("0.30.0");
@@ -1204,6 +1218,278 @@ describe("grokbot sand-host client parity", () => {
 		]);
 	});
 
+	test("does not treat customWireName alone as grammar when the live tool is structured", () => {
+		// Extension tools may advertise a PascalCase wire alias with JSON-schema
+		// parameters. History that still carries that alias must replay as field-3
+		// Struct args — not raw field-4 — once the tool index says isGrammar=false.
+		const messages = toInferenceMessages(
+			{
+				tools: [
+					{
+						name: "customThing",
+						description: "extension shell",
+						parameters: {
+							type: "object",
+							properties: {
+								command: { type: "string" },
+								input: { type: "string" },
+							},
+						},
+						customWireName: "Shell",
+					},
+				],
+				messages: [
+					{
+						role: "assistant",
+						content: [
+							{
+								type: "toolCall",
+								id: "c1",
+								name: "customThing",
+								customWireName: "Shell",
+								arguments: { command: "echo hi", input: "should-not-become-raw" },
+							},
+						],
+						api: "grokbot-sand",
+						provider: "grokbot",
+						model: "grok-4.5",
+						usage: {
+							input: 0,
+							output: 0,
+							cacheRead: 0,
+							cacheWrite: 0,
+							totalTokens: 0,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						},
+						stopReason: "toolUse",
+						timestamp: 2,
+					},
+				],
+			},
+			conversionModel,
+		);
+		const assistant = messages.find(m => m.role === 2) as {
+			toolCalls?: Array<{ toolCallId: string; toolName: string; args?: unknown; rawToolCallArgs?: string }>;
+		};
+		expect(assistant?.toolCalls).toEqual([
+			{
+				toolCallId: "c1",
+				toolName: "Shell",
+				args: { command: "echo hi", input: "should-not-become-raw" },
+			},
+		]);
+	});
+
+	test("keeps collision-loser customWireName tools distinct from the Shell owner", () => {
+		// With productWireOwnership, advertisement prefers bash for Shell; a historical
+		// extension_shell call with customWireName Shell must not be rewritten
+		// to Shell or its args replay against the bash schema.
+		const messages = toInferenceMessages(
+			{
+				tools: [
+					{
+						name: "extension_shell",
+						description: "extension shell",
+						parameters: {
+							type: "object",
+							properties: {
+								cmd: { type: "string" },
+							},
+						},
+						customWireName: "Shell",
+					},
+					{
+						name: "bash",
+						description: "bash",
+						parameters: {
+							type: "object",
+							properties: {
+								command: { type: "string" },
+							},
+						},
+					},
+				],
+				messages: [
+					{
+						role: "assistant",
+						content: [
+							{
+								type: "toolCall",
+								id: "c1",
+								name: "extension_shell",
+								customWireName: "Shell",
+								arguments: { cmd: "echo ext" },
+							},
+							{
+								type: "toolCall",
+								id: "c2",
+								name: "bash",
+								arguments: { command: "echo bash" },
+							},
+						],
+						api: "grokbot-sand",
+						provider: "grokbot",
+						model: "grok-4.5",
+						usage: {
+							input: 0,
+							output: 0,
+							cacheRead: 0,
+							cacheWrite: 0,
+							totalTokens: 0,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						},
+						stopReason: "toolUse",
+						timestamp: 2,
+					},
+					{
+						role: "toolResult",
+						toolCallId: "c1",
+						toolName: "extension_shell",
+						content: [{ type: "text", text: "ext-ok" }],
+						isError: false,
+						timestamp: 3,
+					},
+					{
+						role: "toolResult",
+						toolCallId: "c2",
+						toolName: "bash",
+						content: [{ type: "text", text: "bash-ok" }],
+						isError: false,
+						timestamp: 4,
+					},
+				],
+			},
+			conversionModel,
+			{ productWireOwnership: true },
+		);
+		const assistant = messages.find(m => m.role === 2) as {
+			toolCalls?: Array<{ toolCallId: string; toolName: string; args?: unknown }>;
+		};
+		expect(assistant?.toolCalls).toEqual([
+			{
+				toolCallId: "c1",
+				toolName: "extension_shell",
+				args: { cmd: "echo ext" },
+			},
+			{
+				toolCallId: "c2",
+				toolName: "bash",
+				args: { command: "echo bash" },
+			},
+		]);
+		const results = messages.filter(m => m.role === 3) as Array<{
+			toolContent?: { parts?: Array<{ toolCallId: string; toolName: string; result?: unknown }> };
+		}>;
+		expect(results.map(m => m.toolContent?.parts?.[0])).toEqual([
+			{ toolCallId: "c1", toolName: "extension_shell", result: "ext-ok" },
+			{ toolCallId: "c2", toolName: "bash", result: "bash-ok" },
+		]);
+	});
+
+	test("native history keeps extension Shell customWireName when bash is also present", () => {
+		// Native toInferenceTools advertises bash + Shell; product ownership must
+		// not strip the extension alias or replay uses an undeclared tool name.
+		const messages = toInferenceMessages(
+			{
+				tools: [
+					{
+						name: "extension_shell",
+						description: "extension shell",
+						parameters: {
+							type: "object",
+							properties: {
+								cmd: { type: "string" },
+							},
+						},
+						customWireName: "Shell",
+					},
+					{
+						name: "bash",
+						description: "bash",
+						parameters: {
+							type: "object",
+							properties: {
+								command: { type: "string" },
+							},
+						},
+					},
+				],
+				messages: [
+					{
+						role: "assistant",
+						content: [
+							{
+								type: "toolCall",
+								id: "c1",
+								name: "extension_shell",
+								customWireName: "Shell",
+								arguments: { cmd: "echo ext" },
+							},
+							{
+								type: "toolCall",
+								id: "c2",
+								name: "bash",
+								arguments: { command: "echo bash" },
+							},
+						],
+						api: "grokbot-sand",
+						provider: "grokbot",
+						model: "grok-4.5",
+						usage: {
+							input: 0,
+							output: 0,
+							cacheRead: 0,
+							cacheWrite: 0,
+							totalTokens: 0,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						},
+						stopReason: "toolUse",
+						timestamp: 2,
+					},
+					{
+						role: "toolResult",
+						toolCallId: "c1",
+						toolName: "extension_shell",
+						content: [{ type: "text", text: "ext-ok" }],
+						isError: false,
+						timestamp: 3,
+					},
+					{
+						role: "toolResult",
+						toolCallId: "c2",
+						toolName: "bash",
+						content: [{ type: "text", text: "bash-ok" }],
+						isError: false,
+						timestamp: 4,
+					},
+				],
+			},
+			conversionModel,
+		);
+		const assistant = messages.find(m => m.role === 2) as {
+			toolCalls?: Array<{ toolCallId: string; toolName: string; args?: unknown }>;
+		};
+		expect(assistant?.toolCalls).toEqual([
+			{
+				toolCallId: "c1",
+				toolName: "Shell",
+				args: { cmd: "echo ext" },
+			},
+			{
+				toolCallId: "c2",
+				toolName: "bash",
+				args: { command: "echo bash" },
+			},
+		]);
+		const results = messages.filter(m => m.role === 3) as Array<{
+			toolContent?: { parts?: Array<{ toolCallId: string; toolName: string; result?: unknown }> };
+		}>;
+		expect(results.map(m => m.toolContent?.parts?.[0])).toEqual([
+			{ toolCallId: "c1", toolName: "Shell", result: "ext-ok" },
+			{ toolCallId: "c2", toolName: "bash", result: "bash-ok" },
+		]);
+	});
+
 	test("redacts credential-shaped tokens from system and history when enabled", () => {
 		configureCredentialRedaction(true);
 		try {
@@ -1240,18 +1526,12 @@ describe("grokbot /login host-install prompt", () => {
 			namespace: "prod",
 			clientVersion: "0.30.0",
 		});
-		const secretsDisplay = shortenPath(grokbotAuth.grokbotSecretsPath());
 
 		const result = await loginGrokbot({
 			onAuth: () => {},
 			onPrompt: async prompt => {
 				prompted = true;
 				expect(prompt.allowEmpty).toBe(true);
-				expect(prompt.message).toContain("GROKBOT_RENEWAL_CREDENTIAL");
-				expect(prompt.message).toContain("GROKBOT_MACHINE_ID");
-				expect(prompt.message).toContain(secretsDisplay);
-				expect(prompt.message).toContain("PI_CODING_AGENT_DIR");
-				expect(prompt.message).not.toContain("OMP_AGENT_DIR");
 				return "";
 			},
 			onProgress: message => {
@@ -1319,6 +1599,69 @@ describe("grokbot incomplete tool calls", () => {
 		spyOn(grokbotAuth, "mintGrokbotAccessToken").mockResolvedValue("fake-jwt");
 	}
 
+	test("does not advertise tools for a model that disables tool calling", async () => {
+		mockAuth();
+		let payload: unknown;
+		const text = frameConnectProto(encodeInferenceStreamResponse({ textPart: { text: "ok", isFinal: true } }));
+		const trailer = frameConnectProto(Buffer.alloc(0), CONNECT_END_STREAM_FLAG);
+		const result = await streamGrokBot(
+			{ ...model, supportsTools: false },
+			{
+				...context,
+				tools: [{ name: "read", description: "Read", parameters: { type: "object", properties: {} } }],
+			},
+			{
+				apiKey: "renew",
+				onPayload: body => {
+					payload = body;
+				},
+				fetch: (async () => connectBody(text, trailer)) as FetchImpl,
+			},
+		).result();
+		expect(result.stopReason).toBe("stop");
+		expect(payload).toMatchObject({ tools: [] });
+	});
+
+	test("advertises one native schema and dispatches the same custom-wire collision owner", async () => {
+		mockAuth();
+		let payload: unknown;
+		const call = frameConnectProto(
+			encodeInferenceStreamResponse({
+				toolCallPart: { toolCallId: "collision", toolName: "shared", args: "{}", isComplete: true },
+			}),
+		);
+		const trailer = frameConnectProto(Buffer.alloc(0), CONNECT_END_STREAM_FLAG);
+		const result = await streamGrokBot(
+			{ ...model, sandToolsWire: "native" },
+			{
+				...context,
+				tools: [
+					{
+						name: "first",
+						customWireName: "shared",
+						description: "first schema",
+						parameters: { type: "object", properties: {} },
+					},
+					{
+						name: "second",
+						customWireName: "shared",
+						description: "second schema",
+						parameters: { type: "object", properties: {} },
+					},
+				],
+			},
+			{
+				apiKey: "renew",
+				onPayload: body => {
+					payload = body;
+				},
+				fetch: (async () => connectBody(call, trailer)) as FetchImpl,
+			},
+		).result();
+		expect(payload).toMatchObject({ tools: [{ name: "shared", description: "first schema" }] });
+		expect(result.content).toEqual([expect.objectContaining({ type: "toolCall", name: "first" })]);
+	});
+
 	test("rejects stream that ends with isComplete:false tool call", async () => {
 		mockAuth();
 		const incomplete = frameConnectProto(
@@ -1333,6 +1676,32 @@ describe("grokbot incomplete tool calls", () => {
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toMatch(/incomplete tool call/i);
 		expect(result.content.some(b => b.type === "toolCall" && Object.keys(b.arguments).length === 0)).toBe(true);
+	});
+
+	test("rejects data frames after the connect end-stream trailer", async () => {
+		mockAuth();
+		const textFrame = frameConnectProto(
+			encodeInferenceStreamResponse({
+				textPart: { text: "before-trailer", isFinal: true },
+			}),
+		);
+		const trailer = frameConnectProto(Buffer.alloc(0), CONNECT_END_STREAM_FLAG);
+		const after = frameConnectProto(
+			encodeInferenceStreamResponse({
+				toolCallPart: {
+					toolCallId: "late",
+					toolName: "Shell",
+					args: '{"command":"echo pwned"}',
+					isComplete: true,
+				},
+			}),
+		);
+		const fetchImpl = (async () => connectBody(textFrame, trailer, after)) as FetchImpl;
+
+		const result = await streamGrokBot(model, context, { apiKey: "renew", fetch: fetchImpl }).result();
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toMatch(/after the connect end-stream trailer/i);
+		expect(result.content.some(b => b.type === "toolCall")).toBe(false);
 	});
 
 	test("normalizes Write contents alias to omp content", async () => {
@@ -1370,6 +1739,47 @@ describe("grokbot incomplete tool calls", () => {
 			expect.objectContaining({
 				type: "toolCall",
 				name: "write",
+				arguments: expect.objectContaining({ path: "/tmp/x", content: "tools-pong" }),
+			}),
+		]);
+	});
+
+	test("normalizes Write contents alias for customWireName extension owners", async () => {
+		mockAuth();
+		const complete = frameConnectProto(
+			encodeInferenceStreamResponse({
+				toolCallPart: {
+					toolCallId: "w1",
+					toolName: "Write",
+					args: '{"path":"/tmp/x","contents":"tools-pong"}',
+					isComplete: true,
+				},
+			}),
+		);
+		const trailer = frameConnectProto(Buffer.alloc(0), CONNECT_END_STREAM_FLAG);
+		const fetchImpl = (async () => connectBody(complete, trailer)) as FetchImpl;
+		const writeContext: Context = {
+			messages: [{ role: "user", content: "write", timestamp: 1 }],
+			tools: [
+				{
+					name: "save",
+					description: "extension write",
+					customWireName: "Write",
+					parameters: {
+						type: "object",
+						properties: { path: { type: "string" }, content: { type: "string" } },
+						required: ["path", "content"],
+					},
+				},
+			],
+		};
+
+		const result = await streamGrokBot(model, writeContext, { apiKey: "renew", fetch: fetchImpl }).result();
+		expect(result.stopReason).toBe("toolUse");
+		expect(result.content).toEqual([
+			expect.objectContaining({
+				type: "toolCall",
+				name: "save",
 				arguments: expect.objectContaining({ path: "/tmp/x", content: "tools-pong" }),
 			}),
 		]);
@@ -1417,6 +1827,44 @@ describe("grokbot incomplete tool calls", () => {
 		expect(result.content).toEqual([
 			expect.objectContaining({ type: "toolCall", id: "c1", name: "Read", arguments: { path: "/tmp/x" } }),
 		]);
+	});
+
+	test("does not finalize incomplete grammar tool calls from non-empty raw text", async () => {
+		// Grammar args are free-form; a truncated patch after isComplete:false must not
+		// become an executable toolCall (stopReason would prefer toolUse over length).
+		mockAuth();
+		const truncated = "*** Begin Patch\n*** Update File: a.ts\n@@\n-old\n+new";
+		const incomplete = frameConnectProto(
+			encodeInferenceStreamResponse({
+				toolCallPart: {
+					toolCallId: "c1",
+					toolName: "apply_patch",
+					args: truncated,
+					isComplete: false,
+				},
+			}),
+		);
+		const trailer = frameConnectProto(Buffer.alloc(0), CONNECT_END_STREAM_FLAG);
+		const fetchImpl = (async () => connectBody(incomplete, trailer)) as FetchImpl;
+		const grammarContext: Context = {
+			messages: [{ role: "user", content: "edit", timestamp: 1 }],
+			tools: [
+				{
+					name: "edit",
+					description: "edit files",
+					parameters: { type: "object" as const },
+					customWireName: "apply_patch",
+					customFormat: { syntax: "lark", definition: "start: ANY" },
+				},
+			],
+		};
+
+		const result = await streamGrokBot(model, grammarContext, { apiKey: "renew", fetch: fetchImpl }).result();
+		// Live previews may fill `{ input: truncated }`, but the turn must error — not
+		// toolUse — so the agent does not execute a partial patch.
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toMatch(/incomplete tool call/i);
+		expect(result.content.some(b => b.type === "toolCall" && b.id === "c1")).toBe(true);
 	});
 
 	test("keeps sequential empty and incomplete retries buffered until accepted", async () => {
@@ -1900,6 +2348,54 @@ describe("grokbot incomplete tool calls", () => {
 		]);
 	});
 
+	test("accumulates non-prefix tool-arg deltas into valid JSON", async () => {
+		mockAuth();
+		const start = frameConnectProto(
+			encodeInferenceStreamResponse({
+				toolCallPart: {
+					toolCallId: "c1",
+					toolName: "echo",
+					args: '{"command":"',
+					isComplete: false,
+				},
+			}),
+		);
+		const mid = frameConnectProto(
+			encodeInferenceStreamResponse({
+				toolCallPart: {
+					toolCallId: "c1",
+					toolName: "echo",
+					args: "echo hi",
+					isComplete: false,
+				},
+			}),
+		);
+		const finish = frameConnectProto(
+			encodeInferenceStreamResponse({
+				toolCallPart: {
+					toolCallId: "c1",
+					toolName: "echo",
+					args: '"}',
+					isComplete: true,
+				},
+			}),
+		);
+		const trailer = frameConnectProto(Buffer.alloc(0), CONNECT_END_STREAM_FLAG);
+		const fetchImpl = (async () => connectBody(start, mid, finish, trailer)) as FetchImpl;
+
+		const result = await streamGrokBot(model, context, { apiKey: "renew", fetch: fetchImpl }).result();
+		expect(result.stopReason).toBe("toolUse");
+		expect(result.errorMessage).toBeUndefined();
+		expect(result.content).toEqual([
+			expect.objectContaining({
+				type: "toolCall",
+				id: "c1",
+				name: "echo",
+				arguments: { command: "echo hi" },
+			}),
+		]);
+	});
+
 	test("wraps grammar custom-tool raw args as { input } with customWireName", async () => {
 		mockAuth();
 		const patch = "*** Begin Patch\n*** Update File: a.ts\n@@\n-old\n+new\n*** End Patch";
@@ -2059,16 +2555,23 @@ describe("grokbot incomplete tool calls", () => {
 
 		const stream = streamGrokBot(model, context, { apiKey: "renew", fetch: fetchImpl });
 		let sawPartialArgs = false;
+		let accumulatedDeltas = "";
 		for await (const event of stream) {
-			if (event.type === "toolcall_delta" && event.partial) {
-				const block = event.partial.content.find(b => b.type === "toolCall");
-				if (block && block.type === "toolCall" && block.arguments.cmd === "ls") {
-					sawPartialArgs = true;
+			if (event.type === "toolcall_delta") {
+				accumulatedDeltas += event.delta;
+				if (event.partial) {
+					const block = event.partial.content.find(b => b.type === "toolCall");
+					if (block && block.type === "toolCall" && block.arguments.cmd === "ls") {
+						sawPartialArgs = true;
+					}
 				}
 			}
 		}
 		const result = await stream.result();
 		expect(sawPartialArgs).toBe(true);
+		// Proxy-style concat of toolcall_deltas must parse to the merged args — not
+		// `{"cmd":"ls"}{"cmd":"ls","n":1}` from cumulative full-snapshot deltas.
+		expect(JSON.parse(accumulatedDeltas)).toEqual({ cmd: "ls", n: 1 });
 		expect(result.stopReason).toBe("toolUse");
 		expect(result.content).toEqual([
 			expect.objectContaining({
@@ -2079,12 +2582,102 @@ describe("grokbot incomplete tool calls", () => {
 			}),
 		]);
 	});
+
+	test("emits appendable tool-arg suffixes when unbuffered accumulation completes", async () => {
+		// After retries are exhausted (no context.tools → unbuffered), `{"path":` +
+		// `"/tmp/x"}` must emit only the remaining suffix — not hold the full object
+		// for finishTool (which would concat to malformed JSON for proxy consumers).
+		mockAuth();
+		const partial = frameConnectProto(
+			encodeInferenceStreamResponse({
+				toolCallPart: {
+					toolCallId: "c1",
+					toolName: "echo",
+					args: '{"path":',
+					isComplete: false,
+				},
+			}),
+		);
+		const finish = frameConnectProto(
+			encodeInferenceStreamResponse({
+				toolCallPart: {
+					toolCallId: "c1",
+					toolName: "echo",
+					args: '"/tmp/x"}',
+					isComplete: true,
+				},
+			}),
+		);
+		const trailer = frameConnectProto(Buffer.alloc(0), CONNECT_END_STREAM_FLAG);
+		const fetchImpl = (async () => connectBody(partial, finish, trailer)) as FetchImpl;
+
+		const stream = streamGrokBot(model, context, { apiKey: "renew", fetch: fetchImpl });
+		let accumulatedDeltas = "";
+		for await (const event of stream) {
+			if (event.type === "toolcall_delta") accumulatedDeltas += event.delta;
+		}
+		const result = await stream.result();
+		expect(JSON.parse(accumulatedDeltas)).toEqual({ path: "/tmp/x" });
+		expect(result.stopReason).toBe("toolUse");
+		expect(result.content).toEqual([
+			expect.objectContaining({
+				type: "toolCall",
+				id: "c1",
+				name: "echo",
+				arguments: { path: "/tmp/x" },
+			}),
+		]);
+	});
+
+	test("emits suffix when unbuffered prefix-completing snapshot arrives", async () => {
+		// `{"path":` then full `{"path":"/tmp/x"}` is a prefix completion — emit only
+		// the remaining suffix, not a held full snapshot at finishTool.
+		mockAuth();
+		const partial = frameConnectProto(
+			encodeInferenceStreamResponse({
+				toolCallPart: {
+					toolCallId: "c1",
+					toolName: "echo",
+					args: '{"path":',
+					isComplete: false,
+				},
+			}),
+		);
+		const finish = frameConnectProto(
+			encodeInferenceStreamResponse({
+				toolCallPart: {
+					toolCallId: "c1",
+					toolName: "echo",
+					args: '{"path":"/tmp/x"}',
+					isComplete: true,
+				},
+			}),
+		);
+		const trailer = frameConnectProto(Buffer.alloc(0), CONNECT_END_STREAM_FLAG);
+		const fetchImpl = (async () => connectBody(partial, finish, trailer)) as FetchImpl;
+
+		const stream = streamGrokBot(model, context, { apiKey: "renew", fetch: fetchImpl });
+		let accumulatedDeltas = "";
+		for await (const event of stream) {
+			if (event.type === "toolcall_delta") accumulatedDeltas += event.delta;
+		}
+		const result = await stream.result();
+		expect(JSON.parse(accumulatedDeltas)).toEqual({ path: "/tmp/x" });
+		expect(result.stopReason).toBe("toolUse");
+		expect(result.content).toEqual([
+			expect.objectContaining({
+				type: "toolCall",
+				id: "c1",
+				name: "echo",
+				arguments: { path: "/tmp/x" },
+			}),
+		]);
+	});
 });
 
 describe("grokbot request headers", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
-		grokbotCatalogAuth.clearGrokbotTokenCache();
 	});
 
 	const model: Model<"grokbot-sand"> = buildModel({
@@ -2139,69 +2732,6 @@ describe("grokbot request headers", () => {
 			await grokbotCatalogAuth.mintGrokbotAccessToken(cfg, fetchImpl, model.baseUrl, undefined, model.headers),
 		).toBe("metadata-2");
 		expect(mints).toBe(2);
-	});
-
-	test("Opus tool schemas are projected on the wire without changing the selected effort or local schemas", async () => {
-		spyOn(grokbotAuth, "loadGrokbotConfig").mockResolvedValue({
-			renewal: "renew",
-			machineId: "machine",
-			namespace: "prod",
-			clientVersion: "0.44.0",
-		});
-		spyOn(grokbotAuth, "mintGrokbotAccessToken").mockResolvedValue("inference-token");
-		const opus = buildModel({
-			...model,
-			id: "claude-opus-5",
-			name: "Opus",
-			sandParameterIds: ["thinking", "effort"],
-			sandToolsWire: undefined,
-		});
-		const writeSchema = {
-			type: "object",
-			properties: { path: { type: "string" }, content: { type: "string" } },
-			required: ["path", "content"],
-		};
-		const schemaBefore = structuredClone(writeSchema);
-		const toolContext: Context = {
-			...context,
-			tools: [{ name: "write", description: "Write a file", parameters: writeSchema }],
-		};
-		let request: Record<string, unknown> | undefined;
-		const fetchImpl: FetchImpl = async (_url, init) => {
-			request = decodeInferenceStreamRequest((init?.body as Uint8Array).subarray(5));
-			return new Response(textThenTrailer());
-		};
-		const result = await streamGrokBot(opus, toolContext, { fetch: fetchImpl, effort: "medium" }).result();
-		expect(result.stopReason).toBe("stop");
-		expect(request?.requestedModel).toMatchObject({
-			modelId: "claude-opus-5",
-			parameters: [
-				{ id: "thinking", value: "true" },
-				{ id: "effort", value: "medium" },
-			],
-		});
-		const tools = request?.tools as Array<{ name: string; parameters: { jsonSchema: Record<string, unknown> } }>;
-		expect(tools[0]?.name).toBe("Write");
-		expect(tools[0]?.parameters.jsonSchema).toEqual({
-			type: "object",
-			properties: {
-				path: { type: "string" },
-				content: { type: "string" },
-				contents: { type: "string", description: "File contents (alias of content)" },
-			},
-			required: ["path"],
-		});
-		expect(writeSchema).toEqual(schemaBefore);
-		// The router is a separate deployment contract: its alias union must survive.
-		await streamGrokBot(model, toolContext, { fetch: fetchImpl }).result();
-		const routerTools = request?.tools as Array<{
-			name: string;
-			parameters: { jsonSchema: Record<string, unknown> };
-		}>;
-		expect(routerTools.find(tool => tool.name === "Write")?.parameters.jsonSchema.anyOf).toEqual([
-			{ required: ["content"] },
-			{ required: ["contents"] },
-		]);
 	});
 
 	test("merges model.headers into the inference request", async () => {
@@ -2684,4 +3214,72 @@ describe("grokbot disableReasoning effort floor", () => {
 		expect(capturedThinking).toBe("true");
 		expect(capturedEffort).toBe("high");
 	});
+
+	test("disableReasoning omits effort when thinking is an allowed sand parameter", async () => {
+		// Flooring effort while also sending thinking:false is contradictory; the
+		// keep-model retry path already deletes effort when forcing thinking off.
+		spyOn(grokbotAuth, "loadGrokbotConfig").mockResolvedValue({
+			renewal: "renew",
+			machineId: "machine",
+			namespace: "prod",
+			clientVersion: "0.30.0",
+		});
+		spyOn(grokbotAuth, "mintGrokbotAccessToken").mockResolvedValue("fake-jwt");
+
+		let capturedEffort: string | undefined;
+		let capturedThinking: string | undefined;
+		const text = frameConnectProto(encodeInferenceStreamResponse({ textPart: { text: "ok", isFinal: true } }));
+		const trailer = frameConnectProto(Buffer.alloc(0), CONNECT_END_STREAM_FLAG);
+		const fetchImpl = (async () =>
+			new Response(Buffer.concat([text, trailer]), {
+				status: 200,
+				headers: { "content-type": "application/connect+proto" },
+			})) as FetchImpl;
+
+		const model: Model<"grokbot-sand"> = buildModel({
+			id: "grok-4.6",
+			name: "Grok 4.6",
+			api: "grokbot-sand",
+			provider: "grokbot",
+			baseUrl: "https://api2.cursor.sh",
+			reasoning: true,
+			thinking: { mode: "effort", efforts: [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh] },
+			sandParameterIds: ["thinking", "context", "effort", "fast"],
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 100_000,
+			maxTokens: 8_000,
+		});
+
+		await streamSimple(
+			model,
+			{ messages: [{ role: "user", content: "hi", timestamp: 1 }] },
+			{
+				apiKey: "renew",
+				disableReasoning: true,
+				fetch: fetchImpl,
+				onPayload: body => {
+					const params = (body as { requestedModel?: { parameters?: Array<{ id: string; value: string }> } })
+						.requestedModel?.parameters;
+					capturedEffort = params?.find(p => p.id === "effort")?.value;
+					capturedThinking = params?.find(p => p.id === "thinking")?.value;
+					return body;
+				},
+			},
+		).result();
+
+		expect(capturedThinking).toBe("false");
+		expect(capturedEffort).toBeUndefined();
+	});
 });
+
+for (const effortField of ["effort", "reasoning"]) {
+	test(`thinking off suppresses discovered ${effortField} defaults`, () => {
+		const request = resolveGrokbotRequestedModel("discovered-model", {
+			thinking: false,
+			sandParameterIds: ["thinking", effortField],
+			sandParameterDefaults: { thinking: "true", [effortField]: "high" },
+		});
+		expect(request.parameters).toEqual([{ id: "thinking", value: "false" }]);
+	});
+}

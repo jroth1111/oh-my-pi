@@ -24,17 +24,20 @@ import { GROKBOT_API } from "../packages/catalog/src/provider-models/grokbot.ts"
 import { applyAnthropicSandToolWire } from "../packages/ai/src/providers/grokbot/anthropic-sand-wire.ts";
 import { resolveGrokbotRequestedModel } from "../packages/ai/src/providers/grokbot/model-request.ts";
 import {
-	CONNECT_END_STREAM_FLAG,
-	decodeInferenceStreamResponse,
 	encodeInferenceStreamRequest,
 	frameConnectProto,
 } from "../packages/ai/src/providers/grokbot/proto.ts";
+import { parseConnectStreamFrames } from "./grokbot-probes/parse-connect-stream.mjs";
 import * as prompt from "../packages/utils/src/prompt.ts";
 import textSystemPrompt from "./grokbot-catalog-matrix/text-system.md" with { type: "text" };
 import textUserPrompt from "./grokbot-catalog-matrix/text-user.md" with { type: "text" };
 import matrixOpusSystemPrompt from "./grokbot-probes/matrix-opus-system.md" with { type: "text" };
 import matrixOpusShellUserPrompt from "./grokbot-probes/matrix-opus-shell-user.md" with { type: "text" };
 import matrixBashThenTokenUserPrompt from "./grokbot-probes/matrix-bash-then-token-user.md" with { type: "text" };
+import matrixToolReadDescription from "./grokbot-probes/matrix-tool-read-description.md" with { type: "text" };
+import matrixToolReadPathDescription from "./grokbot-probes/matrix-tool-read-path-description.md" with { type: "text" };
+import automationOmpToolBashDescription from "./grokbot-probes/automation-omp-tool-bash-description.md" with { type: "text" };
+import automationOmpToolReadDescription from "./grokbot-probes/automation-omp-tool-read-description.md" with { type: "text" };
 
 const ROOT = resolve(import.meta.dir, "..");
 const STREAM = "/aiserver.v1.InferenceService/Stream";
@@ -79,10 +82,14 @@ function matrixRowFromCatalog(id, byId) {
 			: efforts.includes("low")
 				? "low"
 				: efforts[0];
+	const sandParameterDefaults = built.sandParameterDefaults ? { ...built.sandParameterDefaults } : undefined;
+	const sandMaxMode = built.sandMaxMode === true;
 	return {
 		id,
 		sandParameterIds,
 		...(effort ? { effort } : {}),
+		...(sandParameterDefaults ? { sandParameterDefaults } : {}),
+		...(sandMaxMode ? { sandMaxMode: true } : {}),
 	};
 }
 
@@ -102,50 +109,13 @@ const mode = (() => {
 })();
 
 function parseFrames(buf) {
-	let o = 0;
-	let texts = "";
-	let end;
-	let responseModel = "";
-	const toolNames = [];
-	while (o + 5 <= buf.length) {
-		const flags = buf[o];
-		const len = buf.readUInt32BE(o + 1);
-		o += 5;
-		const bytes = buf.subarray(o, o + len);
-		o += len;
-		if (flags & CONNECT_END_STREAM_FLAG) {
-			try {
-				end = JSON.parse(bytes.toString("utf8"));
-			} catch {
-				end = { parseError: true };
-			}
-		} else {
-			try {
-				const msg = decodeInferenceStreamResponse(bytes);
-				if (msg.textPart?.text) texts += msg.textPart.text;
-				if (msg.responseInfo?.model) responseModel = String(msg.responseInfo.model);
-				if (msg.toolCallPart?.toolName) toolNames.push(String(msg.toolCallPart.toolName));
-			} catch {
-				/* ignore partial */
-			}
-		}
-	}
-	const dbg = end?.error?.details?.[0]?.debug;
-	return {
-		ok: end !== undefined && !end?.parseError && !end?.error && o === buf.length,
-		texts,
-		responseModel,
-		toolNames,
-		message: end?.error?.message,
-		status: dbg?.details?.additionalInfo?.providerStatusCode,
-		providerError: dbg?.error,
-		detail: dbg?.details?.detail,
-	};
+	return parseConnectStreamFrames(buf);
 }
 
-async function sandProbe({ id, sandParameterIds, effort, tools }) {
+
+async function sandProbe({ id, sandParameterIds, effort, sandParameterDefaults, sandMaxMode, tools }) {
 	const cfg = await loadGrokbotConfig();
-	const token = await mintGrokbotAccessToken(cfg, fetch, GROKBOT_BACKEND, undefined, undefined, "inference");
+	const token = await mintGrokbotAccessToken(cfg, fetch, GROKBOT_BACKEND);
 	const headers = {
 		...grokbotClientHeaders(cfg),
 		authorization: `Bearer ${token}`,
@@ -156,13 +126,13 @@ async function sandProbe({ id, sandParameterIds, effort, tools }) {
 		"connect-protocol-version": "1",
 		"x-request-id": crypto.randomUUID(),
 	};
-	// Omit `fast`/`thinking` so resolveGrokbotRequestedModel applies catalog defaults:
-	// thinking models → thinking=true when effort is set, fast=false;
-	// Grok/composer/etc → fast=true. Explicit fast=false on Grok+tools → HTTP 422.
+	// Omit explicit `fast`/`thinking`/`context` so resolveGrokbotRequestedModel
+	// applies live AvailableModels defaults (and sandMaxMode) from the catalog row.
 	const requestedModel = resolveGrokbotRequestedModel(id, {
 		effort,
 		sandParameterIds,
-		sandMaxMode: false,
+		sandParameterDefaults,
+		sandMaxMode: sandMaxMode === true,
 	});
 	const body = {
 		messages: [
@@ -173,10 +143,12 @@ async function sandProbe({ id, sandParameterIds, effort, tools }) {
 			? [
 					{
 						name: "read",
-						description: "Read a file from disk.",
+						description: matrixToolReadDescription.trim(),
 						parameters: {
 							type: "object",
-							properties: { path: { type: "string", description: "Absolute path" } },
+							properties: {
+								path: { type: "string", description: matrixToolReadPathDescription.trim() },
+							},
 							required: ["path"],
 						},
 					},
@@ -303,7 +275,7 @@ async function runTools(catalog) {
 const AUTOMATION_OMP_TOOLS = [
 	{
 		name: "bash",
-		description: "Run a shell command.",
+		description: automationOmpToolBashDescription.trim(),
 		parameters: {
 			type: "object",
 			properties: { command: { type: "string" } },
@@ -312,7 +284,7 @@ const AUTOMATION_OMP_TOOLS = [
 	},
 	{
 		name: "read",
-		description: "Read a file.",
+		description: automationOmpToolReadDescription.trim(),
 		parameters: {
 			type: "object",
 			properties: { path: { type: "string" } },
@@ -323,7 +295,7 @@ const AUTOMATION_OMP_TOOLS = [
 
 async function sandAutomationProbe(catalog) {
 	const cfg = await loadGrokbotConfig();
-	const token = await mintGrokbotAccessToken(cfg, fetch, GROKBOT_BACKEND, undefined, undefined, "inference");
+	const token = await mintGrokbotAccessToken(cfg, fetch, GROKBOT_BACKEND);
 	const headers = {
 		...grokbotClientHeaders(cfg),
 		authorization: `Bearer ${token}`,
@@ -340,7 +312,8 @@ async function sandAutomationProbe(catalog) {
 	const requestedModel = resolveGrokbotRequestedModel("claude-opus-5", {
 		effort: opus.effort,
 		sandParameterIds: opus.sandParameterIds,
-		sandMaxMode: false,
+		sandParameterDefaults: opus.sandParameterDefaults,
+		sandMaxMode: opus.sandMaxMode === true,
 	});
 	const wired = applyAnthropicSandToolWire(
 		{
@@ -371,7 +344,8 @@ async function sandAutomationProbe(catalog) {
 		body: frameConnectProto(encodeInferenceStreamRequest(body)),
 	});
 	const result = parseFrames(Buffer.from(await res.arrayBuffer()));
-	const sawShell = result.toolNames?.includes("Shell");
+	// Shipping decoder rejects incomplete toolCallPart; name-only is not enough.
+	const sawShell = result.completedShell === true;
 	const pass = res.ok && result.ok && sawShell;
 	return {
 		id: "claude-opus-5:automation",

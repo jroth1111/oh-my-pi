@@ -183,6 +183,113 @@ describe("resolveScopedModels", () => {
 		expect(registry.refreshCalls).toBe(1);
 		expect(scoped.map(entry => entry.model.id)).toEqual(["b"]);
 	});
+
+	it("refreshes built-in descriptor providers for an empty --models scope when getDiscoverableProviders is empty", async () => {
+		const settings = Settings.isolated();
+		const sandDefault = buildModel({
+			id: "sand-default",
+			name: "sand-default",
+			api: "grokbot-sand",
+			provider: "grokbot",
+			baseUrl: "https://api2.cursor.sh",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 8_192,
+		});
+		const registry = new FakeRegistry([sandDefault], () => {
+			registry.available = [
+				sandDefault,
+				buildModel({
+					id: "live-only",
+					name: "live-only",
+					api: "grokbot-sand",
+					provider: "grokbot",
+					baseUrl: "https://api2.cursor.sh",
+					reasoning: false,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 128_000,
+					maxTokens: 8_192,
+				}),
+			];
+		});
+		registry.discoverableProviders = [];
+
+		const scoped = await resolveScopedModels(parseArgs(["--models", "grokbot/live-only"]), registry, settings);
+
+		expect(registry.refreshCalls).toBe(0);
+		expect(registry.refreshProviderCalls).toEqual([{ providerId: "grokbot", strategy: "online-if-uncached" }]);
+		expect(scoped.map(entry => entry.model.id)).toEqual(["live-only"]);
+	});
+
+	it("refreshes credential-scoped wildcards even when offline seeds already match", async () => {
+		// `grokbot/*` matches bundled fallback seeds; without a forced refresh the
+		// session would capture only those six rows and miss live-only ids.
+		const settings = Settings.isolated();
+		const sandDefault = buildModel({
+			id: "sand-default",
+			name: "sand-default",
+			api: "grokbot-sand",
+			provider: "grokbot",
+			baseUrl: "https://api2.cursor.sh",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 8_192,
+		});
+		const registry = new FakeRegistry([sandDefault], () => {
+			registry.available = [
+				sandDefault,
+				buildModel({
+					id: "live-only",
+					name: "live-only",
+					api: "grokbot-sand",
+					provider: "grokbot",
+					baseUrl: "https://api2.cursor.sh",
+					reasoning: false,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 128_000,
+					maxTokens: 8_192,
+				}),
+			];
+		});
+		registry.discoverableProviders = [];
+
+		const scoped = await resolveScopedModels(parseArgs(["--models", "grokbot/*"]), registry, settings);
+
+		expect(registry.refreshProviderCalls).toEqual([{ providerId: "grokbot", strategy: "online-if-uncached" }]);
+		expect(scoped.map(entry => entry.model.id).sort()).toEqual(["live-only", "sand-default"]);
+	});
+
+	it("does not eagerly refresh ordinary built-ins when an exact cold-catalog scope already matches", async () => {
+		// `--models openai/gpt-5.5` with a present bundled row must not force
+		// discovery merely because openai has createModelManagerOptions.
+		const settings = Settings.isolated();
+		const gpt = buildModel({
+			id: "gpt-5.5",
+			name: "GPT-5.5",
+			api: "openai-responses",
+			provider: "openai",
+			baseUrl: "https://api.openai.com/v1",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 8_192,
+		});
+		const registry = new FakeRegistry([gpt]);
+		registry.discoverableProviders = [];
+
+		const scoped = await resolveScopedModels(parseArgs(["--models", "openai/gpt-5.5"]), registry, settings);
+
+		expect(registry.refreshCalls).toBe(0);
+		expect(registry.refreshProviderCalls).toEqual([]);
+		expect(scoped.map(entry => entry.model.id)).toEqual(["gpt-5.5"]);
+	});
 });
 
 describe("refreshCredentialScopedModelIfMissing", () => {
@@ -201,6 +308,42 @@ describe("refreshCredentialScopedModelIfMissing", () => {
 
 	afterEach(() => {
 		vi.restoreAllMocks();
+	});
+
+	it("resolveCredentialScopedRefreshTarget falls back to provider-qualified modelRoles.default", () => {
+		// No CLI model flags: still warm a live-only Grok Bot default before session build.
+		expect(resolveCredentialScopedRefreshTarget({}, "grokbot/live-only")).toEqual({
+			providerId: "grokbot",
+			selectors: { model: "grokbot/live-only" },
+		});
+		expect(resolveCredentialScopedRefreshTarget({}, "GrokBot/sand-default")).toEqual({
+			providerId: "grokbot",
+			selectors: { model: "GrokBot/sand-default" },
+		});
+		// Bare defaults and missing roles stay unbound (ownership indeterminate).
+		expect(resolveCredentialScopedRefreshTarget({}, "sand-default")).toBeUndefined();
+		expect(resolveCredentialScopedRefreshTarget({})).toBeUndefined();
+		// CLI selection still wins over the configured default.
+		expect(resolveCredentialScopedRefreshTarget({ model: "openai/gpt-4o" }, "grokbot/live-only")).toEqual({
+			providerId: "openai",
+			selectors: { model: "openai/gpt-4o", models: undefined },
+		});
+		// Bare / unbound CLI selectors must not fall through to the default role.
+		expect(resolveCredentialScopedRefreshTarget({ model: "composer-2.5" }, "grokbot/live-only")).toBeUndefined();
+		// `--model @default` / `*` must expand to the configured live-only default so
+		// AvailableModels still warms (unlike an unrelated bare selector).
+		expect(resolveCredentialScopedRefreshTarget({ model: "@default" }, "grokbot/live-only")).toEqual({
+			providerId: "grokbot",
+			selectors: { model: "grokbot/live-only", models: undefined },
+		});
+		expect(resolveCredentialScopedRefreshTarget({ model: "*" }, "grokbot/live-only")).toEqual({
+			providerId: "grokbot",
+			selectors: { model: "grokbot/live-only", models: undefined },
+		});
+		expect(resolveCredentialScopedRefreshTarget({ models: ["composer-2.5"] }, "grokbot/live-only")).toBeUndefined();
+		expect(
+			resolveCredentialScopedRefreshTarget({ models: ["openai/gpt-4o", "anthropic/claude"] }, "grokbot/live-only"),
+		).toBeUndefined();
 	});
 
 	it("refreshes a cold credential-scoped provider when --model is absent from startup catalog", async () => {
@@ -258,6 +401,49 @@ describe("refreshCredentialScopedModelIfMissing", () => {
 
 		expect(refreshed).toBe(true);
 		expect(registry.refreshProviderCalls).toEqual([{ providerId: "grokbot", strategy: "online-if-uncached" }]);
+	});
+
+	it("refreshes a single-provider --models scope when parsed.model is absent", async () => {
+		const registry = new FakeRegistry([], () => {
+			registry.available = [
+				buildModel({
+					id: "live-only",
+					name: "live-only",
+					api: "grokbot-sand",
+					provider: "grokbot",
+					baseUrl: "https://api2.cursor.sh",
+					reasoning: false,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 128_000,
+					maxTokens: 8_192,
+				}),
+			];
+		});
+		registry.discoverableProviders = ["grokbot"];
+
+		const refreshed = await refreshCredentialScopedModelIfMissing(
+			{ models: ["grokbot/live-only"] },
+			registry,
+			"grokbot",
+		);
+
+		expect(refreshed).toBe(true);
+		expect(registry.refreshProviderCalls).toEqual([{ providerId: "grokbot", strategy: "online-if-uncached" }]);
+	});
+
+	it("skips multi-provider --models scopes (ownership indeterminate)", async () => {
+		const registry = new FakeRegistry([]);
+		registry.discoverableProviders = ["grokbot"];
+
+		const refreshed = await refreshCredentialScopedModelIfMissing(
+			{ models: ["grokbot/live-only", "openai/gpt-5"] },
+			registry,
+			"grokbot",
+		);
+
+		expect(refreshed).toBe(false);
+		expect(registry.refreshProviderCalls).toEqual([]);
 	});
 
 	it("skips refresh when the provider is neither models.yml-discoverable nor a built-in manager", async () => {
@@ -325,40 +511,13 @@ describe("refreshCredentialScopedModelIfMissing", () => {
 		expect(registry.refreshProviderCalls).toEqual([]);
 	});
 
-	it("refreshes a cold single-provider --models scope without parsed.model", async () => {
-		const registry = new FakeRegistry([], () => {
-			registry.available = [
-				buildModel({
-					id: "live-only",
-					name: "live-only",
-					api: "grokbot-sand",
-					provider: "grokbot",
-					baseUrl: "https://api2.cursor.sh",
-					reasoning: false,
-					input: ["text"],
-					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-					contextWindow: 128_000,
-					maxTokens: 8_192,
-				}),
-			];
-		});
-		registry.discoverableProviders = ["grokbot"];
-
-		const refreshed = await refreshCredentialScopedModelIfMissing(
-			{ models: ["grokbot/live-only"] },
-			registry,
-			"grokbot",
-		);
-
-		expect(refreshed).toBe(true);
-		expect(registry.refreshProviderCalls).toEqual([{ providerId: "grokbot", strategy: "online-if-uncached" }]);
-	});
-
-	it("skips refresh when the --models scope is already in the startup catalog", async () => {
+	it("refreshes when a colon-bearing literal id is missing even if the base id is cold-cached", async () => {
+		// OpenRouter-style `:free` is not a thinking suffix — stripping it would
+		// falsely treat the base row as satisfying the requested tier.
 		const registry = new FakeRegistry([
 			buildModel({
-				id: "live-only",
-				name: "live-only",
+				id: "deepseek/deepseek-v4-flash",
+				name: "deepseek-v4-flash",
 				api: "grokbot-sand",
 				provider: "grokbot",
 				baseUrl: "https://api2.cursor.sh",
@@ -372,20 +531,52 @@ describe("refreshCredentialScopedModelIfMissing", () => {
 		registry.discoverableProviders = ["grokbot"];
 
 		const refreshed = await refreshCredentialScopedModelIfMissing(
-			{ models: ["grokbot/live-only"] },
+			{ model: "grokbot/deepseek/deepseek-v4-flash:free" },
 			registry,
 			"grokbot",
 		);
 
-		expect(refreshed).toBe(false);
-		expect(registry.refreshProviderCalls).toEqual([]);
+		expect(refreshed).toBe(true);
+		expect(registry.refreshProviderCalls).toEqual([{ providerId: "grokbot", strategy: "online-if-uncached" }]);
 	});
 
-	it("skips refresh when the --models scope names no qualified model for the provider", async () => {
-		const registry = new FakeRegistry([]);
+	it("skips cold refresh for ordinary descriptor providers without credential-scoped-catalog", async () => {
+		// openai has createModelManagerOptions but is not KDL credential-scoped —
+		// a typo must not block startup on an eager discovery pass.
+		const registry = new ModelRegistry(authStorage, tempDir.join("models-openai-cold.yml"));
+		expect(registry.hasProvider("openai")).toBe(true);
+		const spy = vi.spyOn(registry, "refreshProvider").mockResolvedValue();
+		const refreshed = await refreshCredentialScopedModelIfMissing(
+			{ model: "openai/definitely-not-a-real-model-xyz" },
+			registry,
+			"openai",
+		);
+		expect(refreshed).toBe(false);
+		expect(spy).not.toHaveBeenCalled();
+	});
+
+	it("still treats a recognized :high thinking suffix as present when the base id is cold-cached", async () => {
+		const registry = new FakeRegistry([
+			buildModel({
+				id: "sand-default",
+				name: "sand-default",
+				api: "grokbot-sand",
+				provider: "grokbot",
+				baseUrl: "https://api2.cursor.sh",
+				reasoning: true,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 128_000,
+				maxTokens: 8_192,
+			}),
+		]);
 		registry.discoverableProviders = ["grokbot"];
 
-		const refreshed = await refreshCredentialScopedModelIfMissing({ models: ["live-only"] }, registry, "grokbot");
+		const refreshed = await refreshCredentialScopedModelIfMissing(
+			{ model: "grokbot/sand-default:high" },
+			registry,
+			"grokbot",
+		);
 
 		expect(refreshed).toBe(false);
 		expect(registry.refreshProviderCalls).toEqual([]);
@@ -439,14 +630,37 @@ describe("buildSessionOptions --models scope selection", () => {
 		expect(options.rebindModelAfterDiscovery).toBe(true);
 		expect(options.scopedModels?.map(entry => entry.model.id)).toEqual(["a"]);
 	});
+});
 
-	it("selects the remembered default within a provider scope instead of crashing at startup", async () => {
-		const settings = Settings.isolated();
-		settings.overrideModelRoles({ default: "prov/b" });
-		const parsed = parseArgs(["--models", "prov/a,prov/b"]);
-		const scoped = await resolveModelScope(["prov/a", "prov/b"], { getAvailable: () => [model("a"), model("b")] });
-		const options = await buildSessionOptions(parsed, scoped, SessionManager.inMemory(), registry(), settings);
-		expect(options.model?.id).toBe("b");
-		expect(options.modelPattern).toBeUndefined();
+it("expands selected builtin, custom, and chained roles before credential-scoped refresh", () => {
+	const roles: Record<string, string> = {
+		default: "@smol",
+		smol: "grokbot/live-small",
+		slow: "grokbot/live-large",
+		research: "grokbot/live-custom",
+	};
+	const lookup = { getModelRole: (role: string) => roles[role] };
+	for (const [selector, expected] of [
+		["@smol", "grokbot/live-small"],
+		["@slow", "grokbot/live-large"],
+		["@research", "grokbot/live-custom"],
+		["@default", "grokbot/live-small"],
+	]) {
+		expect(resolveCredentialScopedRefreshTarget({ model: selector }, lookup)).toEqual({
+			providerId: "grokbot",
+			selectors: { model: expected, models: undefined },
+		});
+	}
+});
+
+it("expands chained modelRoles.default without a CLI model selector before credential-scoped refresh", () => {
+	const roles: Record<string, string> = {
+		default: "@smol",
+		smol: "grokbot/live-only",
+	};
+	const lookup = { getModelRole: (role: string) => roles[role] };
+	expect(resolveCredentialScopedRefreshTarget({}, lookup)).toEqual({
+		providerId: "grokbot",
+		selectors: { model: "grokbot/live-only" },
 	});
 });

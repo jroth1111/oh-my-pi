@@ -2,15 +2,15 @@
 /**
  * Live empirical probe: keep-model wire for Anthropic-labeled grokbot models.
  *
- * Auth helpers live in `grokbot-probe-config.mjs` (dependency-neutral mirror of
- * catalog/ai auth) so probes stay off the `@oh-my-pi/pi-utils` barrel.
+ * Auth helpers re-export shipping catalog `grokbot-auth` via `grokbot-probe-config.mjs`.
  * Imports wire/proto logic directly from source.
  *
  * Tests:
  *  1. keep-model on claude-fable-5, claude-opus-5, claude-sonnet-5, claude-haiku-4-5
  *     with full 6-tool set (bash/read/write/edit/grep/glob → Shell/Read/Write/Grep/Glob)
  *     2-turn round-trip: ask model to call Shell, feed result back, get final text.
- *  2. auto mode resolves to keep-model for Anthropic+tools.
+ *  2. auto mode resolves to keep-model when catalog sandToolsWire says so;
+ *     bare auto without catalog wire stays native.
  *  3. Explicit automation still rewrites to sand-automation + generalPurpose.
  *  4. Non-Anthropic (grok-4.6) + keep-model is a no-op.
  *
@@ -41,6 +41,7 @@ import automationShellUserPrompt from "./grokbot-probes/automation-shell-user.md
 import automationSystemPrompt from "./grokbot-probes/automation-system.md" with { type: "text" };
 import codingAgentSystemPrompt from "./grokbot-probes/coding-agent-system.md" with { type: "text" };
 import shellEchoUserPrompt from "./grokbot-probes/shell-echo-user.md" with { type: "text" };
+import { probeOmpTools } from "./grokbot-probes/probe-omp-tools.ts";
 
 import {
 	GROKBOT_BACKEND,
@@ -123,46 +124,7 @@ async function sendStream(token, cfg, body) {
 
 // ─── Tool set ───
 
-const ompTools = [
-	{
-		name: "bash",
-		description: "Run a shell command.",
-		parameters: { type: "object", properties: { command: { type: "string" } }, required: ["command"] },
-	},
-	{
-		name: "read",
-		description: "Read a file.",
-		parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
-	},
-	{
-		name: "write",
-		description: "Write a file.",
-		parameters: {
-			type: "object",
-			properties: { path: { type: "string" }, content: { type: "string" } },
-			required: ["path", "content"],
-		},
-	},
-	{
-		name: "edit",
-		description: "Patch a file.",
-		parameters: {
-			type: "object",
-			properties: { path: { type: "string" }, old: { type: "string" }, new: { type: "string" } },
-			required: ["path", "old", "new"],
-		},
-	},
-	{
-		name: "grep",
-		description: "Search files.",
-		parameters: { type: "object", properties: { pattern: { type: "string" } }, required: ["pattern"] },
-	},
-	{
-		name: "glob",
-		description: "Find files.",
-		parameters: { type: "object", properties: { glob: { type: "string" } }, required: ["glob"] },
-	},
-];
+const ompTools = probeOmpTools();
 
 // ─── Tests ───
 
@@ -323,20 +285,26 @@ async function testKeepModelRoundTrip(token, cfg, modelId) {
 }
 
 async function testAutoResolvesKeepModel() {
-	console.log(`\n=== auto resolves to keep-model for Anthropic+tools ===`);
-	const resolved = resolveAnthropicSandToolsWire(undefined, undefined, { modelId: "claude-fable-5", toolCount: 6 });
-	console.log(`  auto(fable, 6 tools) → ${resolved}`);
+	console.log(`\n=== auto resolves to keep-model when catalog sandToolsWire says so ===`);
+	// Catalog KDL owns Anthropic keep-model — pass the reviewed fact, matching
+	// resolveAnthropicSandToolsWire's catalog-first auto contract (no TS class invent).
+	const resolved = resolveAnthropicSandToolsWire(undefined, undefined, {
+		modelId: "claude-fable-5",
+		toolCount: 6,
+		sandToolsWire: "keep-model",
+	});
+	console.log(`  auto(fable, 6 tools, sandToolsWire=keep-model) → ${resolved}`);
 	const pass = resolved === "keep-model";
 	console.log(`  ${pass ? "PASS" : "FAIL"} auto→keep-model`);
 	return { pass, resolved };
 }
 
-async function testAutoNonAnthropicError() {
-	console.log(`\n=== auto for non-Anthropic+tools → error ===`);
+async function testAutoNonAnthropicNative() {
+	console.log(`\n=== auto for non-Anthropic+tools without catalog wire → native ===`);
 	const resolved = resolveAnthropicSandToolsWire(undefined, undefined, { modelId: "grok-4.6", toolCount: 2 });
 	console.log(`  auto(grok-4.6, 2 tools) → ${resolved}`);
-	const pass = resolved === "error";
-	console.log(`  ${pass ? "PASS" : "FAIL"} auto→error for non-Anthropic`);
+	const pass = resolved === "native";
+	console.log(`  ${pass ? "PASS" : "FAIL"} auto→native for non-Anthropic`);
 	return { pass, resolved };
 }
 
@@ -410,11 +378,11 @@ async function testKeepModelNoopOnGrok() {
 // ─── Main ───
 
 async function main() {
-	const cfg = loadGrokbotConfig();
+	const cfg = await loadGrokbotConfig();
 	console.log(
 		`config: machineId=${cfg.machineId.slice(0, 8)}… namespace=${cfg.namespace} client=${cfg.clientVersion}`,
 	);
-	const token = await mintGrokbotAccessToken(cfg, fetch, "inference");
+	const token = await mintGrokbotAccessToken(cfg);
 	console.log(`token minted ✓`);
 
 	const results = [];
@@ -423,7 +391,7 @@ async function main() {
 		results.push(await testKeepModelRoundTrip(token, cfg, modelId));
 	}
 	results.push(await testAutoResolvesKeepModel());
-	results.push(await testAutoNonAnthropicError());
+	results.push(await testAutoNonAnthropicNative());
 	results.push(await testAutomationStillGrok(token, cfg));
 	results.push(await testKeepModelNoopOnGrok());
 

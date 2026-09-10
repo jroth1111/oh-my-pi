@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { classifyModel } from "@oh-my-pi/pi-catalog/compat/taxonomy";
 import { applyAnthropicSandToolWire } from "../../src/providers/grokbot/anthropic-sand-wire";
 import { resolveGrokbotRequestedModel } from "../../src/providers/grokbot/model-request";
@@ -76,7 +77,20 @@ describe("grokbot family tool mapping", () => {
 	test("Anthropic class + auto advertises product Shell/Read/Write on the original requestedModel", () => {
 		for (const id of ["claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5", "claude-fable-5"]) {
 			expect(classifyModel("grokbot", id, { lenient: true }).class).toBe("anthropic");
-			const { policy, applied, names } = wireFor(id);
+			const built = buildModel({
+				id,
+				name: id,
+				api: "grokbot-sand",
+				provider: "grokbot",
+				baseUrl: "https://api2.cursor.sh",
+				reasoning: true,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 100_000,
+				maxTokens: 8_000,
+			});
+			expect(built.sandToolsWire).toBe("keep-model");
+			const { policy, applied, names } = wireFor(id, { sandToolsWire: "keep-model" });
 			expect(policy.kind).toBe("product");
 			expect(policy.wire).toBe("keep-model");
 			expect(applied.requestedModel.modelId).toBe(id);
@@ -270,6 +284,7 @@ describe("grokbot family tool mapping", () => {
 			modelId: "opaque-legacy-slug",
 			requestModelId: "claude-opus-5",
 			toolCount: OMP_CORE.length,
+			sandToolsWire: "keep-model",
 		});
 		expect(viaCanonical.kind).toBe("product");
 		expect(viaCanonical.wire).toBe("keep-model");
@@ -365,7 +380,7 @@ describe("grokbot family tool mapping", () => {
 			required: ["command"],
 			additionalProperties: true,
 		};
-		const gemini = nativeToolParametersForIdentity(raw, { class: "gemini" });
+		const gemini = nativeToolParametersForIdentity(raw, "google");
 		expect(gemini).toMatchObject({
 			jsonSchema: {
 				type: "object",
@@ -383,11 +398,53 @@ describe("grokbot family tool mapping", () => {
 			properties: { command: { type: "string" } },
 			required: ["command"],
 		};
-		const openai = nativeToolParametersForIdentity(raw, { class: "openai" });
+		const openai = nativeToolParametersForIdentity(raw, "strict");
 		expect(openai.additionalProperties).toBe(false);
 		expect(openai.required).toEqual(["command"]);
-		const xai = nativeToolParametersForIdentity(raw, { class: "xai" });
+		const xai = nativeToolParametersForIdentity(raw);
 		expect(xai).not.toHaveProperty("additionalProperties");
 		expect(xai).toEqual(raw);
+	});
+
+	test("catalog sandNativeToolSchema drives gemini/openai projections via KDL", () => {
+		const gemini = buildModel({
+			id: "gemini-3-flash",
+			name: "gemini-3-flash",
+			api: "grokbot-sand",
+			provider: "grokbot",
+			baseUrl: "https://api2.cursor.sh",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 100_000,
+			maxTokens: 8_000,
+		});
+		expect(gemini.sandNativeToolSchema).toBe("google");
+		const openai = buildModel({
+			id: "gpt-5.4-luna",
+			name: "gpt-5.4-luna",
+			api: "grokbot-sand",
+			provider: "grokbot",
+			baseUrl: "https://api2.cursor.sh",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 100_000,
+			maxTokens: 8_000,
+		});
+		expect(openai.sandNativeToolSchema).toBe("strict");
+		const grok = buildModel({
+			id: "grok-4.6",
+			name: "grok-4.6",
+			api: "grokbot-sand",
+			provider: "grokbot",
+			baseUrl: "https://api2.cursor.sh",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 100_000,
+			maxTokens: 8_000,
+		});
+		expect(grok.sandNativeToolSchema).toBeUndefined();
 	});
 });

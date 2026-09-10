@@ -155,6 +155,17 @@ function splitThinkingSuffix(
 	return level ? { base: pattern.slice(0, colonIdx), level } : { base: pattern };
 }
 
+/**
+ * Strip a trailing `:thinking` / `:max` / `:auto` suffix when recognized.
+ * Literal colon-bearing model ids (e.g. OpenRouter `:free`) are left intact.
+ */
+export function splitModelThinkingSuffix(pattern: string): {
+	base: string;
+	level?: ConfiguredThinkingLevel;
+} {
+	return splitThinkingSuffix(pattern, -1, MAX_THINKING_SUFFIX_OPTIONS);
+}
+
 function matchingGlobModels(pattern: string, availableModels: readonly Model<Api>[]): Model<Api>[] {
 	const glob = new Bun.Glob(pattern.toLowerCase());
 	return availableModels.filter(model => {
@@ -978,7 +989,7 @@ function parseModelPatternWithContext(
 	pattern: string,
 	availableModels: Model<Api>[],
 	context: ModelPreferenceContext,
-	options?: { allowInvalidThinkingSelectorFallback?: boolean },
+	options?: { allowInvalidThinkingSelectorFallback?: boolean; exactOnly?: boolean },
 ): ParsedModelResult {
 	// Exact match on the full pattern first (no fuzzy): a literal id that
 	const exactMatch = matchModel(pattern, availableModels, context, { exactOnly: true });
@@ -991,7 +1002,9 @@ function parseModelPatternWithContext(
 	// fuzzy results (e.g. `kimi-for-coding-highspeed`) cannot absorb the suffix.
 	const { base, level } = splitThinkingSuffix(pattern, -1, MAX_THINKING_SUFFIX_OPTIONS);
 	if (level) {
-		const literalSuffixMatch = matchModel(pattern, availableModels, context);
+		const literalSuffixMatch = options?.exactOnly
+			? matchModel(pattern, availableModels, context, { exactOnly: true })
+			: matchModel(pattern, availableModels, context);
 		if (literalSuffixMatch?.id.toLowerCase().endsWith(`:${level}`)) {
 			return {
 				model: literalSuffixMatch,
@@ -1018,6 +1031,12 @@ function parseModelPatternWithContext(
 			};
 		}
 		return result;
+	}
+
+	// Bracket-only / exact-only callers must not fuzzy-match character classes
+	// such as `openai/gpt-[!5]` onto `gpt-5` — leave those for Bun.Glob.
+	if (options?.exactOnly) {
+		return { model: undefined, thinkingLevel: undefined, warning: undefined, explicitThinkingLevel: false };
 	}
 
 	// No valid thinking suffix: fall back to fuzzy/substring matching on the
@@ -1184,6 +1203,10 @@ const ROLE_PRIORITY_ALIAS: Partial<Record<ModelRole, keyof typeof MODEL_PRIO>> =
 	tiny: "smol",
 };
 
+const ROLE_CONFIGURED_FALLBACK: Partial<Record<ModelRole, ModelRole>> = {
+	tiny: "smol",
+};
+
 /** Built-in priority patterns for a role, following {@link ROLE_PRIORITY_ALIAS}. */
 function rolePriorityDefaults(role: ModelRole): string[] {
 	const key = ROLE_PRIORITY_ALIAS[role] ?? (role as keyof typeof MODEL_PRIO);
@@ -1207,8 +1230,10 @@ function resolveDefaultInheritedPatterns(
 			MAX_THINKING_SUFFIX_OPTIONS,
 		);
 		const aliasRole = getModelRoleAlias(aliasCandidate, settings);
-		if (aliasRole === role) {
-			// Self-alias (e.g. modelRoles.default = "@smol") would loop back to the
+		if (aliasRole && visited.has(aliasRole)) {
+			// Cycle (self-alias like modelRoles.default = "@smol", or tiny → smol
+			// → default = "@tiny") would loop back to a visited role: fall back
+			// to the built-in chain instead of leaking the unresolved alias.
 			resolved.push(
 				...(thinkingLevel
 					? roleDefaults.map(defaultPattern => `${defaultPattern}:${thinkingLevel}`)
@@ -1216,7 +1241,7 @@ function resolveDefaultInheritedPatterns(
 			);
 			continue;
 		}
-		if (aliasRole && !visited.has(aliasRole)) {
+		if (aliasRole) {
 			// Cross-role alias (e.g. modelRoles.default = "@slow"): resolve the
 			// concrete model patterns instead of another role alias.
 			const recursed = resolveConfiguredRolePattern(pattern, settings, new Set(visited));
@@ -1251,11 +1276,34 @@ function resolveConfiguredRolePattern(
 	const configured = settings?.getModelRole(role)?.trim();
 	const configuredDefault = settings?.getModelRole(DEFAULT_MODEL_ROLE)?.trim();
 	const roleDefaults = isModelRole(role) ? rolePriorityDefaults(role) : [];
+	const configuredFallback = isModelRole(role) ? ROLE_CONFIGURED_FALLBACK[role] : undefined;
+	const fallbackPatterns =
+		configured || !configuredFallback
+			? undefined
+			: (
+					resolveConfiguredRolePattern(formatModelRoleAlias(configuredFallback), settings, new Set(visited)) ?? []
+				).flatMap(pattern => {
+					const { base, level } = splitThinkingSuffix(
+						pattern,
+						modelRoleAliasPrefixLength(pattern) ?? LEGACY_MODEL_ROLE_ALIAS_PREFIX.length,
+						MAX_THINKING_SUFFIX_OPTIONS,
+					);
+					const patternRole = getModelRoleAlias(base, settings);
+					if (!patternRole || !visited.has(patternRole)) return [pattern];
+					// Cyclic fallback alias (e.g. smol = "@tiny:high" while resolving
+					// @tiny): expand to the built-in chain, preserving the requested
+					// thinking level instead of dropping the suffix.
+					return level ? roleDefaults.map(defaultPattern => `${defaultPattern}:${level}`) : [];
+				});
 	const resolved = configured
-		? normalizeModelPatternList(configured)
-		: isModelRole(role)
-			? resolveDefaultInheritedPatterns(role, configuredDefault, roleDefaults, settings, visited)
-			: roleDefaults;
+		? normalizeModelPatternList(configured).flatMap(
+				pattern => resolveConfiguredRolePattern(pattern, settings, new Set(visited)) ?? [pattern],
+			)
+		: fallbackPatterns
+			? fallbackPatterns
+			: isModelRole(role)
+				? resolveDefaultInheritedPatterns(role, configuredDefault, roleDefaults, settings, visited)
+				: roleDefaults;
 	if (resolved.length === 0) {
 		resolved.push(...roleDefaults);
 	}
@@ -1745,8 +1793,27 @@ export async function resolveModelScope(
 	};
 
 	for (const pattern of patterns) {
-		// Check if pattern contains glob characters
+		// Check if pattern contains glob characters. Bracketed Grok Bot variant
+		// selectors (`default[]`, `gemini-3-flash[]`) also contain `[`, so try an
+		// exact model/alias match first when the pattern is not otherwise a glob
+		// (`*`/`?`). Calling the single-model matcher on `provider/*:max` would
+		// fuzzy-match one row and skip the multi-model glob expansion.
 		if (pattern.includes("*") || pattern.includes("?") || pattern.includes("[")) {
+			if (!pattern.includes("*") && !pattern.includes("?")) {
+				// Exact-only: bracketed literal ids (`default[]`) win, but character
+				// classes such as `openai/gpt-[!5]` must not fuzzy-match `gpt-5`.
+				const exact = parseModelPatternWithContext(pattern, availableModels, context, { exactOnly: true });
+				if (exact.model) {
+					if (exact.warning) logger.warn(exact.warning);
+					if (exact.thinkingLevel === AUTO_THINKING) {
+						addScopedModel(exact.model, undefined, false);
+					} else {
+						addScopedModel(exact.model, exact.thinkingLevel, exact.explicitThinkingLevel);
+					}
+					continue;
+				}
+			}
+
 			// Extract optional thinking level suffix (e.g., "provider/*:high") only
 			// after literal `:max` globs had a chance to match real model IDs.
 			const {
@@ -1875,6 +1942,17 @@ export function filterAvailableModelsByEnabledPatterns(
 
 	for (const pattern of patterns) {
 		if (pattern.includes("*") || pattern.includes("?") || pattern.includes("[")) {
+			// Mirror resolveModelScope: bracket-only selectors (`default[]`) resolve
+			// exactly before Bun.Glob treats `[]` as an empty character class.
+			// Stay exact-only so `openai/gpt-[!5]` expands via Bun.Glob instead of
+			// fuzzy-matching `gpt-5`.
+			if (!pattern.includes("*") && !pattern.includes("?")) {
+				const { model } = parseModelPatternWithContext(pattern, available, context, { exactOnly: true });
+				if (model) {
+					addAllowed(model);
+					continue;
+				}
+			}
 			for (const model of resolveGlobScopePattern(pattern, available).models) {
 				addAllowed(model);
 			}

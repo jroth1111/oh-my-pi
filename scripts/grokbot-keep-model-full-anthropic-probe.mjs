@@ -40,6 +40,7 @@ import {
 	joinGrokbotBackendUrl,
 	mintGrokbotAccessToken,
 } from "./grokbot-probe-config.mjs";
+import { probeOmpTools, probeOmpToolsExtended } from "./grokbot-probes/probe-omp-tools.ts";
 
 // ─── AvailableModels ───
 
@@ -140,68 +141,12 @@ async function sendStream(token, cfg, body) {
 // ─── Tool sets ───
 
 // Standard 6 omp tools (maps to 5 product tools — edit+write dedupe to Write)
-const ompTools = [
-	{
-		name: "bash",
-		description: "Run a shell command.",
-		parameters: { type: "object", properties: { command: { type: "string" } }, required: ["command"] },
-	},
-	{
-		name: "read",
-		description: "Read a file.",
-		parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
-	},
-	{
-		name: "write",
-		description: "Write a file.",
-		parameters: {
-			type: "object",
-			properties: { path: { type: "string" }, content: { type: "string" } },
-			required: ["path", "content"],
-		},
-	},
-	{
-		name: "edit",
-		description: "Patch a file.",
-		parameters: {
-			type: "object",
-			properties: { path: { type: "string" }, old: { type: "string" }, new: { type: "string" } },
-			required: ["path", "old", "new"],
-		},
-	},
-	{
-		name: "grep",
-		description: "Search files.",
-		parameters: { type: "object", properties: { pattern: { type: "string" } }, required: ["pattern"] },
-	},
-	{
-		name: "glob",
-		description: "Find files.",
-		parameters: { type: "object", properties: { glob: { type: "string" } }, required: ["glob"] },
-	},
-];
+const ompTools = probeOmpTools();
 
 // Extended set: adds unmapped tools (todoWrite, webSearch, webFetch) that pass
 // through with their original names + jsonSchema. These are in the field-9
 // allowlist so sand should accept them as unadvertised tools.
-const ompToolsExtended = [
-	...ompTools,
-	{
-		name: "todoWrite",
-		description: "Write a todo list.",
-		parameters: { type: "object", properties: { todos: { type: "array" } }, required: ["todos"] },
-	},
-	{
-		name: "webSearch",
-		description: "Search the web.",
-		parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
-	},
-	{
-		name: "webFetch",
-		description: "Fetch a URL.",
-		parameters: { type: "object", properties: { url: { type: "string" } }, required: ["url"] },
-	},
-];
+const ompToolsExtended = probeOmpToolsExtended();
 
 // ─── Tests ───
 
@@ -231,9 +176,10 @@ function parseValidatedShellArgs(call, token) {
 		return { ok: false, reason: "shell-redirect-or-tee" };
 	}
 	const echoesToken =
-		new RegExp(
-			String.raw`(?:^|[\s;|&])(?:echo|printf)\b(?:\s+(?:-[nEe]+))*\s+(?:(['"])${token}\1|${token})(?:\s|$|[;&|])`,
-		).test(command) || new RegExp(String.raw`(?:^|[\s;|&])(?:echo|printf)\b[^\n#]*\b${token}\b`).test(command);
+		new RegExp(String.raw`(?:^|[\s;|&])(?:echo|printf)\b(?:\s+(?:-[nEe]+))*\s+(?:(['"])${token}\1|${token})(?:\s|$|[;&|])`).test(
+			command,
+		) ||
+		new RegExp(String.raw`(?:^|[\s;|&])(?:echo|printf)\b[^\n#]*\b${token}\b`).test(command);
 	if (!echoesToken) return { ok: false, reason: "shell-command-missing-token" };
 	return { ok: true, args: { command }, result: `${token}\n` };
 }
@@ -371,11 +317,11 @@ async function testModel(token, cfg, modelId, tools, label) {
 }
 
 async function main() {
-	const cfg = loadGrokbotConfig();
+	const cfg = await loadGrokbotConfig();
 	console.log(
 		`config: machineId=${cfg.machineId.slice(0, 8)}… namespace=${cfg.namespace} client=${cfg.clientVersion}`,
 	);
-	const token = await mintGrokbotAccessToken(cfg, fetch, "inference");
+	const token = await mintGrokbotAccessToken(cfg);
 	console.log(`token minted ✓`);
 
 	// Fetch all available models

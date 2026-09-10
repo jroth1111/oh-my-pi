@@ -19,7 +19,7 @@ import { $env } from "@oh-my-pi/pi-utils";
 import { buildModel } from "../src/build";
 import { isRetiredProvider } from "../src/compat/behavior";
 import { collapseVariants } from "../src/compat/collapse";
-import { resolveModelPolicy } from "../src/compat/resolve";
+import { resolveModelPolicy, isCredentialScopedCatalogProvider } from "../src/compat/resolve";
 import { ANTIGRAVITY_PRIMARY_ENDPOINT, fetchAntigravityDiscoveryModels } from "../src/discovery/antigravity";
 import { buildGitLabDuoWorkflowFallbackModel } from "../src/discovery/gitlab-duo-workflow";
 import {
@@ -50,6 +50,7 @@ import {
 	clampFireworksKimiMaxTokens,
 	clampKimiK27CodeMaxTokens,
 	fetchWellKnownModels,
+	FIREPASS_STATIC_MODELS,
 	GMI_CLOUD_STATIC_MODELS,
 	isFireworksKimiK2ModelId,
 	isKimiK27CodeModelId,
@@ -96,16 +97,16 @@ const packageRoot = path.join(import.meta.dir, "..");
 const DISCOVERY_ONLY_PROVIDERS = new Set(["ollama", "vllm", "lm-studio", "litellm"]);
 /**
  * Credential-scoped catalogs (Devin's Cascade roster is gated per account/team
- * via `allowed_model_uids`). Fetching them during generation would bake one
- * private account's entitlements into the shared bundle, and those rows then
- * survive forever as previous-snapshot zombies: a later regen without that
- * credential can never mark the provider authoritative to prune them. These
- * providers are never fetched at generation time and their previous-snapshot
- * rows are dropped — the curated static seed is the only bundled surface, and
- * runtime discovery is authoritative per credential (mirrors the GitLab Duo
- * fallback-only policy below).
+ * via `allowed_model_uids`; Grok Bot AvailableModels is renewer-account entitlements).
+ * Fetching them during generation would bake one private account's entitlements
+ * into the shared bundle, and those rows then survive forever as previous-snapshot
+ * zombies: a later regen without that credential can never mark the provider
+ * authoritative to prune them. These providers are never fetched at generation
+ * time and their previous-snapshot rows are dropped — the curated static seed is
+ * the only bundled surface, and runtime discovery is authoritative per credential
+ * (mirrors the GitLab Duo fallback-only policy below). Exclusion is derived from
+ * KDL `credential-scoped-catalog` via {@link isCredentialScopedCatalogProvider}.
  */
-const CREDENTIAL_SCOPED_PROVIDERS = new Set(["devin"]);
 
 /**
  * Restores unfetched rows from a previous generated catalog while pruning
@@ -125,11 +126,10 @@ export function mergePreviousSnapshotModels(
 			if (
 				!fetchedKeys.has(`${model.provider}/${model.id}`) &&
 				!DISCOVERY_ONLY_PROVIDERS.has(model.provider) &&
-				!CREDENTIAL_SCOPED_PROVIDERS.has(model.provider) &&
-				// Yolo-Auto / Grok Bot documented static seeds are the complete
-				// offline fallback; never resurrect retired ids from the previous snapshot.
+				resolveModelPolicy(model).catalog.credentialScopedCatalog !== true &&
+				// Yolo-Auto documented static seeds are the complete offline fallback;
+				// never resurrect retired ids from the previous snapshot.
 				model.provider !== "yolo-auto" &&
-				model.provider !== "grokbot" &&
 				!isRetiredProvider(model.provider) &&
 				!excludedProviders.has(model.provider)
 			) {
@@ -549,7 +549,7 @@ async function generateModels() {
 		(descriptor): descriptor is CatalogProviderDescriptor =>
 			isCatalogDescriptor(descriptor) &&
 			!DISCOVERY_ONLY_PROVIDERS.has(descriptor.providerId) &&
-			!CREDENTIAL_SCOPED_PROVIDERS.has(descriptor.providerId),
+			!isCredentialScopedCatalogProvider(descriptor.providerId),
 	);
 	const catalogProviderModelBatches = await Promise.all(
 		catalogProviderDescriptors.map(async descriptor => ({
@@ -684,7 +684,12 @@ async function generateModels() {
 	if (!authoritativeCatalogProviders.has("gmi-cloud")) {
 		allModels.push(...GMI_CLOUD_STATIC_MODELS);
 	}
-	// Seed the GitLab Duo Agent fallback model so a fresh install (no credentialed
+	// Seed Fire Pass router models so the provider is usable when generation has
+	// no live key. Dedicated `fpk_...` keys only authorize router endpoints, not
+	// `/v1/models`, so dynamic discovery is never performed.
+	if (!authoritativeCatalogProviders.has("firepass")) {
+		allModels.push(...FIREPASS_STATIC_MODELS);
+	}
 	// dynamic discovery/cache yet) still surfaces the provider's default model in the
 	// built-in catalog. The descriptor deliberately has NO `catalogDiscovery`, so it is
 	// excluded from the generator's discovery loop (`isCatalogDescriptor` filter above):
@@ -699,7 +704,7 @@ async function generateModels() {
 		allModels.push(buildGitLabDuoWorkflowFallbackModel());
 	}
 	// Seed Devin's SWE-1.6 lanes. Cascade's catalog is credential-scoped, so it
-	// is never fetched during generation (CREDENTIAL_SCOPED_PROVIDERS) and the
+	// is never fetched during generation (`credential-scoped-catalog` KDL) and the
 	// seed is the entire bundled surface: the descriptor's `swe-1-6`
 	// default must resolve synchronously at boot, before credential-scoped
 	// runtime discovery replaces the seed with the account's live catalog.
@@ -751,6 +756,7 @@ async function generateModels() {
 		...authoritativeCatalogProviders,
 		...authoritativeSpecialDiscoveryProviders,
 		...modelsDevSnapshotExcludedProviders,
+		"firepass",
 	]);
 
 	// Previous-snapshot entries may carry an older ThinkingConfig vocabulary;
@@ -761,7 +767,6 @@ async function generateModels() {
 		prevModelsJson as unknown as Record<string, Record<string, Model<Api>>>,
 		previousSnapshotExcludedProviders,
 	);
-
 	allModels = applyGlobalModelsDevFallback(allModels, modelsDevModels);
 	// Previous-snapshot fallbacks can retain a retired client fingerprint. Force
 	// every bundled Copilot model onto the same identity used by live discovery.

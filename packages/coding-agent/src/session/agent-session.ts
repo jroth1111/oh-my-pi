@@ -81,7 +81,6 @@ import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { preferredDialect } from "@oh-my-pi/pi-catalog/identity";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { type EditStore, PowerAssertion, type PowerAssertionOptions } from "@oh-my-pi/pi-natives";
-import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import {
 	$env,
 	escapeXmlText,
@@ -367,13 +366,9 @@ import { buildSessionMetadata } from "./session-metadata";
 import { SessionProviderBoundary, type SessionProviderBoundaryHost } from "./session-provider-boundary";
 import { SessionStatsTracker, type SessionStatsTrackerHost } from "./session-stats";
 import { SessionTools, type SessionToolsHost } from "./session-tools";
-import { UnverifiedMergeLatch } from "./settle-gates";
 import type { ShakeMode, ShakeResult } from "./shake-types";
 import { skillPromptTitleInput } from "./skill-title-input";
-import { LoopGuards, type StreamGuardsHost, StreamingEditGuard } from "./stream-guards";
-import { TodoTracker, type TodoTrackerHost } from "./todo-tracker";
 import { ToolChoiceQueue } from "./tool-choice-queue";
-import { TtsrCoordinator, type TtsrCoordinatorHost } from "./ttsr-coordinator";
 import { planTurnPersistence, sameMessageContent, sessionMessagePersistenceKey } from "./turn-persistence";
 import { TurnRecovery, type TurnRecoveryHost } from "./turn-recovery";
 import { YieldQueue } from "./yield-queue";
@@ -383,6 +378,10 @@ export * from "./agent-session-types";
 export type { AdvisorStats, AdvisorStatusOverviewEntry, PerAdvisorStat } from "./session-advisors";
 
 const SESSION_STOP_CONTINUATION_CAP = 8;
+
+import { LoopGuards, type StreamGuardsHost, StreamingEditGuard } from "./stream-guards";
+import { TodoTracker, type TodoTrackerHost } from "./todo-tracker";
+import { TtsrCoordinator, type TtsrCoordinatorHost } from "./ttsr-coordinator";
 
 const PLAN_MODE_REMINDER_MAX = 3;
 const POST_PROMPT_DRAIN_TIMEOUT_MS = 5_000;
@@ -637,7 +636,6 @@ export class AgentSession {
 	#planModeReminderAwaitingProgress = false;
 	readonly #todo: TodoTracker;
 	#workPoolYieldItems: readonly WorkPoolYieldItem[] = [];
-	readonly #unverifiedMergeLatch = new UnverifiedMergeLatch();
 	/** Item set matching the last successfully rebuilt provider prompt. The base
 	 *  prompt starts consistent with the empty set; every later value is a
 	 *  snapshot taken after a prompt rebuild resolves. Rollback restores this —
@@ -651,7 +649,7 @@ export class AgentSession {
 	 *  generation path. Refresh via {@link AgentSession.setTitleSystemPrompt} when
 	 *  the session cwd changes. */
 	#titleSystemPrompt: string | undefined;
-	#titleGenerationStart: (() => void) | undefined;
+	#titleGenerationStart: (() => (() => void) | void) | undefined;
 	#titleGenerationInFlightFor: string | undefined;
 	#titleProviderSessionId: string | undefined;
 	#titleProviderParentSessionId: string | undefined;
@@ -1306,8 +1304,6 @@ export class AgentSession {
 			settings: this.settings,
 			model: () => this.model,
 			agentKind: () => this.#agentKind,
-			cwd: () => this.sessionManager.getCwd(),
-			repoRoot: () => vcs.git(this.sessionManager.getCwd())?.info().repoRoot,
 			emitSessionEvent: event => this.#emitSessionEvent(event),
 			scheduleAgentContinue: options => this.#scheduleAgentContinue(options),
 			promptGeneration: () => this.#promptGeneration,
@@ -1318,10 +1314,6 @@ export class AgentSession {
 			planModeEnabled: () => this.#planModeState?.enabled === true,
 			prewalkWillHandoff: () => this.#prewalk.willHandoff,
 			consumeLastServedToolChoiceLabel: () => this.#toolChoiceQueue.consumeLastServedLabel(),
-			hasUnverifiedMerge: () => this.#unverifiedMergeLatch.latched,
-			unverifiedMergeGeneration: () => this.#unverifiedMergeLatch.generation,
-			clearUnverifiedMergeIfGeneration: (generationAtStart: number) =>
-				this.#unverifiedMergeLatch.clearIfGeneration(generationAtStart),
 		};
 		this.#todo = new TodoTracker(todoHost);
 		this.#ownedAsyncJobManager = config.ownedAsyncJobManager;
@@ -1603,6 +1595,7 @@ export class AgentSession {
 			createThinkTool: config.createThinkTool,
 			builtInToolNames: config.builtInToolNames,
 			mcpManagerToolNames: config.mcpManagerToolNames,
+			autoActivateMcpManagerTools: config.autoActivateMcpManagerTools,
 			presentationPinnedToolNames: config.presentationPinnedToolNames,
 			ensureWriteRegistered: config.ensureWriteRegistered,
 			isDeviceOnlyWrite: config.isDeviceOnlyWrite,
@@ -1880,8 +1873,6 @@ export class AgentSession {
 				this.#planReferenceSent = false;
 			},
 			syncTodoPhasesFromBranch: () => this.#todo.syncFromBranch(),
-			incompleteTodosCompactionContext: () => this.#todo.buildIncompleteTodosCompactionContext(),
-			appendIncompleteTodosToCompactionSummary: summary => this.#todo.appendIncompleteTodosToSummary(summary),
 			resetAdvisorRuntimes: (reason?: string) => this.#advisors.resetAllRuntimes(reason),
 			rebaseAfterCompaction: () => this.#stats.rebaseAfterCompaction(),
 			recordAnchoredHistoryRewrite: tokensRemoved => this.#stats.recordAnchoredHistoryRewrite(tokensRemoved),
@@ -1998,18 +1989,6 @@ export class AgentSession {
 
 	getAgentId(): string | undefined {
 		return this.#agentId;
-	}
-
-	markUnverifiedMerge(): void {
-		this.#unverifiedMergeLatch.mark();
-	}
-
-	observeAsyncJobTerminal(
-		jobId: string,
-		jobType: string | undefined,
-		status: "running" | "completed" | "failed" | "cancelled" | undefined,
-	): void {
-		this.#todo.onAsyncJobTerminal(jobId, jobType, status);
 	}
 
 	/** Dequeue the next HARD forced tool choice for the upcoming LLM call, dropping
@@ -2312,10 +2291,6 @@ export class AgentSession {
 	 */
 	async #deliverAsyncJobResult(manager: AsyncJobManager, jobId: string, text: string, job?: AsyncJob): Promise<void> {
 		if (this.#isDisposed) return;
-		// Observe terminal status before delivery gates: hub `consumeJobResults`
-		// suppresses auto-delivery, but a successful bash/eval verify must still
-		// clear the unverified-merge latch.
-		this.#todo.onAsyncJobTerminal(jobId, job?.type, job?.status);
 		if (manager.isDeliverySuppressed(jobId)) return;
 		// Snapshot the generation before the async format step: a `/new` during it
 		// bumps the epoch, so this delivery belongs to the replaced session and
@@ -2961,8 +2936,7 @@ export class AgentSession {
 		// and only successful mutating tools tick — read-only exploration is
 		// not progress an agent could mark done.
 		if (event.type === "message_end" && event.message.role === "toolResult") {
-			const details = isRecord(event.message.details) ? event.message.details : undefined;
-			this.#todo.onToolResult(event.message.toolName, event.message.isError, details, event.message.toolCallId);
+			this.#todo.onToolResult(event.message.toolName, event.message.isError);
 		}
 		// Track the settled assistant turn synchronously as well: agent_end
 		// maintenance reads `#lastAssistantMessage`, and when a turn's events all
@@ -3087,7 +3061,6 @@ export class AgentSession {
 
 		if (event.type === "tool_execution_start") {
 			this.#recordToolExecutionStart(event);
-			this.#todo.onToolExecutionStart(event.toolName, event.toolCallId, event.args);
 		}
 
 		if (event.type !== "agent_end") {
@@ -4310,7 +4283,6 @@ export class AgentSession {
 				todos: event.todos,
 				attempt: event.attempt,
 				maxAttempts: event.maxAttempts,
-				...(event.unverifiedMerge ? { unverifiedMerge: true } : {}),
 			});
 		} else if (event.type === "goal_updated") {
 			await this.#extensionRunner.emit({
@@ -5716,11 +5688,6 @@ export class AgentSession {
 		// still-cached background-task snapshot from the old conversation must not
 		// survive to be replayed by a focus rebuild in the reset session (#10447).
 		this.#activeToolExecutionUpdates.clear();
-		// Isolated merges arm this latch against the current workspace/session; a
-		// switch or new session must not inherit an unverified merge from another
-		// cwd/transcript.
-		this.#unverifiedMergeLatch.clear();
-		this.#todo.resetVerifyState();
 	}
 
 	/**
@@ -6009,15 +5976,12 @@ export class AgentSession {
 		let total = 0;
 		let closed = 0;
 		let open = 0;
-		let dropped = 0;
 		const promptPhases = phases.map(phase => ({
 			name: this.#sanitizeGoalTodoText(phase.name),
 			tasks: phase.tasks.map(task => {
 				total++;
-				if (task.status === "completed") {
+				if (task.status === "completed" || task.status === "abandoned") {
 					closed++;
-				} else if (task.status === "abandoned") {
-					dropped++;
 				} else {
 					open++;
 				}
@@ -6025,12 +5989,9 @@ export class AgentSession {
 			}),
 		}));
 
-		// Matches the `todo` tool summary's Overall line so the every-turn goal
-		// context and the settle-time reminder agree that dropped ≠ done.
 		return prompt.render(goalTodoContextPrompt, {
 			canCallTodoTool,
 			closed: String(closed),
-			dropped: dropped > 0 ? String(dropped) : "",
 			open: String(open),
 			phases: promptPhases,
 			total: String(total),
@@ -7630,7 +7591,7 @@ export class AgentSession {
 	 * user message persists titles with the same environment, signal, and local
 	 * extension-command policy.
 	 */
-	maybeStartTitleGeneration(firstMessage: string, onStart?: () => void): void {
+	maybeStartTitleGeneration(firstMessage: string, onStart?: () => (() => void) | void): void {
 		const extensionCommandSpace = firstMessage.indexOf(" ");
 		const isLocalExtensionCommand =
 			firstMessage.startsWith("/") &&
@@ -7648,8 +7609,9 @@ export class AgentSession {
 			return;
 		}
 		this.#titleGenerationInFlightFor = sessionId;
+		let cleanupProgress: (() => void) | void;
 		try {
-			(onStart ?? this.#titleGenerationStart)?.();
+			cleanupProgress = (onStart ?? this.#titleGenerationStart)?.();
 		} catch (error) {
 			if (this.#titleGenerationInFlightFor === sessionId) {
 				this.#titleGenerationInFlightFor = undefined;
@@ -7677,6 +7639,7 @@ export class AgentSession {
 				if (this.#titleGenerationInFlightFor === sessionId) {
 					this.#titleGenerationInFlightFor = undefined;
 				}
+				cleanupProgress?.();
 			});
 	}
 
@@ -7692,17 +7655,26 @@ export class AgentSession {
 
 	/**
 	 * Generate an automatic session title tied to this session's lifecycle.
-	 * Input and replan callers share the signal so disposal cancels provider and
-	 * local-worker requests instead of leaving background inference alive.
+	 * Input and replan callers share the signal so interruption and disposal cancel
+	 * provider and local-worker requests instead of leaving background inference alive.
 	 * Online calls use a stable side-request identity so they cannot advance the
 	 * foreground provider session while its request is waiting.
 	 * `customSystemPrompt` swaps the title prompt for special-purpose titling
 	 * (e.g. plan-save filename topics) without touching the session override.
 	 */
-	generateTitle(firstMessage: string, customSystemPrompt?: string): Promise<string | null> {
+	async generateTitle(
+		firstMessage: string,
+		customSystemPrompt?: string,
+		signal?: AbortSignal,
+	): Promise<string | null> {
 		const parentSessionId = this.sessionId;
+		const sessionGeneration = this.#sessionGeneration;
 		const sessionId = this.#resolveTitleProviderSessionId(parentSessionId);
-		return generateSessionTitle(
+		const titleSignal = signal
+			? AbortSignal.any([signal, this.#titleGenerationAbortController.signal])
+			: this.#titleGenerationAbortController.signal;
+		if (titleSignal.aborted) return null;
+		const title = await generateSessionTitle(
 			firstMessage,
 			this.#modelRegistry,
 			this.settings,
@@ -7710,9 +7682,16 @@ export class AgentSession {
 			this.model,
 			provider => buildSessionMetadata(sessionId, provider, this.#modelRegistry.authStorage),
 			customSystemPrompt ?? this.#titleSystemPrompt,
-			this.#titleGenerationAbortController.signal,
+			titleSignal,
 			parentSessionId,
 		);
+		if (await this.#sessionGenerationChanged(sessionGeneration)) return null;
+		return !titleSignal.aborted && this.sessionId === parentSessionId ? title : null;
+	}
+
+	/** Capture before generation to detect interruption or disposal of a title request. */
+	get titleGenerationSignal(): AbortSignal {
+		return this.#titleGenerationAbortController.signal;
 	}
 
 	async #refreshTitleAfterReplan(context: string, sessionId: string): Promise<void> {
@@ -7741,9 +7720,15 @@ export class AgentSession {
 	}
 
 	/** Install the interactive title-download UI hook. Used when `/skill:` starts
-	 *  titling from {@link promptCustomMessage} without the input-controller callback. */
-	setTitleGenerationStart(handler: (() => void) | undefined): void {
+	 *  titling from {@link promptCustomMessage} without the input-controller callback.
+	 *  The hook may return cleanup to run when generation settles. */
+	setTitleGenerationStart(handler: (() => (() => void) | void) | undefined): void {
 		this.#titleGenerationStart = handler;
+	}
+
+	/** Notify the host before a user-requested title generation; return its cleanup. */
+	notifyTitleGenerationStart(): (() => void) | void {
+		return this.#titleGenerationStart?.();
 	}
 
 	/** Install the host hook that receives a typed user prompt dropped before
@@ -7780,6 +7765,8 @@ export class AgentSession {
 		// auto-starting a fresh turn during cleanup.
 		this.#abortInProgress = true;
 		try {
+			this.#titleGenerationAbortController.abort();
+			if (!this.#isDisposed) this.#titleGenerationAbortController = new AbortController();
 			this.#abortAutolearnCapture();
 			for (const controller of this.#usagePreflightAbortControllers) controller.abort();
 			this.abortRetry();

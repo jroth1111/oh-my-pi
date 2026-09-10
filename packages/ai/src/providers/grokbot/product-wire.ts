@@ -6,10 +6,11 @@
  */
 import type { Context } from "../../types";
 import { toolWireSchema } from "../../utils/schema/wire";
-import { sanitizeSchemaForCursor } from "../../utils/schema/normalize";
 import sendToUserContentDescription from "./send-to-user-content-description.md" with { type: "text" };
 import sendToUserDescription from "./send-to-user-description.md" with { type: "text" };
 import sendToUserTypeDescription from "./send-to-user-type-description.md" with { type: "text" };
+import readTargetFileAliasDescription from "./read-target-file-alias-description.md" with { type: "text" };
+import writeContentsAliasDescription from "./write-contents-alias-description.md" with { type: "text" };
 
 export type ProductWireProfile = "automation" | "parent-chat";
 
@@ -161,42 +162,95 @@ function toolParametersToJson(tool: Tool): Record<string, unknown> {
 
 type Tool = NonNullable<Context["tools"]>[number];
 
+const SCHEMA_COMBINATORS = ["anyOf", "oneOf", "allOf"] as const;
+
+function stringRequiredList(value: unknown): string[] {
+	return Array.isArray(value) ? value.filter((key): key is string => typeof key === "string") : [];
+}
+
 /**
- * When advertising a property alias (e.g. `contents` for `content`), keep the
- * rest of `required` and express the alias pair as `anyOf` so strict schema
- * consumers accept either key. If the schema already carries an `anyOf` (e.g.
- * alternative required argument groups), AND that union with the alias pair via
- * `allOf` instead of replacing it.
+ * When advertising a property alias (e.g. `contents` for `content`), rewrite
+ * every `required` list that pins the canonical key — root or branch-local
+ * under `anyOf` / `oneOf` / `allOf` — so strict schema consumers accept either
+ * key. Root `anyOf` groups are preserved via `allOf` instead of replaced, and
+ * preexisting `allOf` entries are retained.
  */
 function withRequiredPropertyAlias(
 	schema: Record<string, unknown>,
 	canonical: string,
 	alias: string,
 ): Record<string, unknown> {
-	const required = Array.isArray(schema.required)
-		? (schema.required as unknown[]).filter((key): key is string => typeof key === "string")
-		: [];
-	if (!required.includes(canonical)) return schema;
 	const aliasConstraint = {
 		anyOf: [{ required: [canonical] }, { required: [alias] }],
 	};
-	const { anyOf: existingAnyOf, ...rest } = schema;
-	const remainingRequired = required.filter(key => key !== canonical);
-	if (Array.isArray(existingAnyOf) && existingAnyOf.length > 0) {
+	let changed = false;
+
+	const rewriteCombinators = (
+		node: Record<string, unknown>,
+	): Partial<Record<(typeof SCHEMA_COMBINATORS)[number], unknown[]>> => {
+		const combinatorEntries: Partial<Record<(typeof SCHEMA_COMBINATORS)[number], unknown[]>> = {};
+		for (const key of SCHEMA_COMBINATORS) {
+			const arr = node[key];
+			if (!Array.isArray(arr) || arr.length === 0) continue;
+			const rewritten = arr.map(item => {
+				if (!item || typeof item !== "object" || Array.isArray(item)) return item;
+				return rewriteNode(item as Record<string, unknown>);
+			});
+			if (rewritten.some((item, i) => item !== arr[i])) {
+				combinatorEntries[key] = rewritten;
+			}
+		}
+		return combinatorEntries;
+	};
+
+	const rewriteNode = (node: Record<string, unknown>): Record<string, unknown> => {
+		const required = stringRequiredList(node.required);
+		const combinatorEntries = rewriteCombinators(node);
+
+		if (!required.includes(canonical)) {
+			if (Object.keys(combinatorEntries).length === 0) return node;
+			changed = true;
+			return { ...node, ...combinatorEntries };
+		}
+
+		changed = true;
+		const remainingRequired = required.filter(key => key !== canonical);
+		const existingAnyOf = combinatorEntries.anyOf ?? (Array.isArray(node.anyOf) ? node.anyOf : undefined);
+		const existingAllOf = combinatorEntries.allOf ?? (Array.isArray(node.allOf) ? node.allOf : undefined);
+		const existingOneOf = combinatorEntries.oneOf ?? (Array.isArray(node.oneOf) ? node.oneOf : undefined);
+		const { required: _required, anyOf: _anyOf, allOf: _allOf, oneOf: _oneOf, ...rest } = node;
+		if (Array.isArray(existingAnyOf) && existingAnyOf.length > 0) {
+			const priorAllOf = Array.isArray(existingAllOf) ? existingAllOf : [];
+			return {
+				...rest,
+				...(Array.isArray(existingOneOf) && existingOneOf.length > 0 ? { oneOf: existingOneOf } : {}),
+				required: remainingRequired,
+				allOf: [...priorAllOf, { anyOf: existingAnyOf }, aliasConstraint],
+			};
+		}
 		return {
 			...rest,
+			...(Array.isArray(existingAllOf) && existingAllOf.length > 0 ? { allOf: existingAllOf } : {}),
+			...(Array.isArray(existingOneOf) && existingOneOf.length > 0 ? { oneOf: existingOneOf } : {}),
 			required: remainingRequired,
-			allOf: [{ anyOf: existingAnyOf }, aliasConstraint],
+			...aliasConstraint,
 		};
-	}
-	return {
-		...rest,
-		required: remainingRequired,
-		...aliasConstraint,
 	};
+
+	const next = rewriteNode(schema);
+	return changed ? next : schema;
 }
 
-function mapOmpToolToProduct(tool: Tool, projectSchema = false): ProductWireTool | undefined {
+/** Clone canonical property constraints onto an alias key; override description. */
+function propertyAliasFromCanonical(canonical: unknown, aliasDescription: string): Record<string, unknown> {
+	const base =
+		canonical && typeof canonical === "object" && !Array.isArray(canonical)
+			? { ...(canonical as Record<string, unknown>) }
+			: { type: "string" };
+	return { ...base, description: aliasDescription.trim() };
+}
+
+function mapOmpToolToProduct(tool: Tool): ProductWireTool | undefined {
 	if (!tool || typeof tool !== "object") return undefined;
 	const name = typeof tool.name === "string" ? tool.name : "";
 	if (!name) return undefined;
@@ -218,10 +272,7 @@ function mapOmpToolToProduct(tool: Tool, projectSchema = false): ProductWireTool
 					...schema,
 					properties: {
 						...props,
-						contents: {
-							type: "string",
-							description: "File contents (alias of content)",
-						},
+						contents: propertyAliasFromCanonical(props.content, writeContentsAliasDescription),
 					},
 				},
 				"content",
@@ -237,10 +288,7 @@ function mapOmpToolToProduct(tool: Tool, projectSchema = false): ProductWireTool
 					...parametersSchema,
 					properties: {
 						...props,
-						target_file: {
-							type: "string",
-							description: "File path (alias of path)",
-						},
+						target_file: propertyAliasFromCanonical(props.path, readTargetFileAliasDescription),
 					},
 				},
 				"path",
@@ -251,7 +299,7 @@ function mapOmpToolToProduct(tool: Tool, projectSchema = false): ProductWireTool
 	const entry: ProductWireTool = {
 		name: wireName,
 		description: typeof tool.description === "string" ? tool.description : "",
-		parameters: wrapToolParameters(projectSchema ? sanitizeSchemaForCursor(parametersSchema) : parametersSchema),
+		parameters: wrapToolParameters(parametersSchema),
 	};
 	if (tool.customFormat && typeof tool.customFormat === "object") {
 		entry.customToolFormat = {
@@ -291,11 +339,7 @@ export function sendToUserProductTool(): ProductWireTool {
  * Parent profile injects SendToUser when absent.
  * Shared sand names (edit+write → Write) keep the preferred omp owner's schema.
  */
-export function toProductField2Tools(
-	tools: Context["tools"],
-	profile: ProductWireProfile,
-	projectSchema = false,
-): ProductWireTool[] {
+export function toProductField2Tools(tools: Context["tools"], profile: ProductWireProfile): ProductWireTool[] {
 	const out: ProductWireTool[] = [];
 	const seen = new Map<string, string>();
 	if (!Array.isArray(tools)) {
@@ -304,7 +348,7 @@ export function toProductField2Tools(
 	}
 	for (const tool of tools) {
 		const ompName = typeof tool?.name === "string" ? tool.name : "";
-		const mapped = mapOmpToolToProduct(tool, projectSchema);
+		const mapped = mapOmpToolToProduct(tool);
 		if (!mapped || !ompName) continue;
 		const previousOmp = seen.get(mapped.name);
 		if (!shouldClaimSandWireName(mapped.name, ompName, previousOmp)) continue;
@@ -376,7 +420,14 @@ export function rewriteInferenceMessagesForProductWire(
 		for (const tool of tools) {
 			const ompName = typeof tool?.name === "string" ? tool.name : "";
 			if (!ompName) continue;
-			const sandName = toSandField2Name(ompName);
+			// Same advertised name as mapOmpToolToProduct / toProductField2Tools —
+			// customWireName: "Write" on `save` claims Write even when built-in
+			// `write` is absent (edit must not inherit the slot on replay).
+			const customWire =
+				typeof tool.customWireName === "string" && tool.customWireName.trim()
+					? tool.customWireName.trim()
+					: undefined;
+			const sandName = customWire ?? toSandField2Name(ompName);
 			if (sandName === ompName) continue;
 			const previous = sandOwner.get(sandName);
 			if (!shouldClaimSandWireName(sandName, ompName, previous)) continue;
@@ -385,11 +436,15 @@ export function rewriteInferenceMessagesForProductWire(
 	}
 
 	const rewriteToolName = (name: string): string => {
+		// Omp owner of an advertised sand slot → sand name (save→Write).
+		for (const [sandName, owner] of sandOwner) {
+			if (owner === name) return sandName;
+		}
 		const sandName = toSandField2Name(name);
 		if (sandName === name) return name;
 		const owner = sandOwner.get(sandName);
 		// When tools are known and another omp owns this sand slot, keep the
-		// historical identity (e.g. edit stays edit while write owns Write).
+		// historical identity (e.g. edit stays edit while write/save owns Write).
 		if (owner !== undefined && owner !== name) return name;
 		return sandName;
 	};

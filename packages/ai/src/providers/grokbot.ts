@@ -1,8 +1,7 @@
 import { classifyModel } from "@oh-my-pi/pi-catalog/compat/taxonomy";
-import type { ModelIdentity } from "@oh-my-pi/pi-catalog/compat/types";
 import type { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
-import { logger, stableStringifyJson } from "@oh-my-pi/pi-utils";
+import { logger } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
 import type {
 	Api,
@@ -17,6 +16,7 @@ import type {
 	ThinkingContent,
 	Tool,
 	ToolCall,
+	ToolChoice,
 } from "../types";
 import { clearStreamingPartialJson, setStreamingPartialJson } from "../utils/block-symbols";
 import { AssistantMessageEventStream } from "../utils/event-stream";
@@ -44,12 +44,9 @@ import {
 } from "./grokbot/anthropic-sand-wire";
 import {
 	advertisedNamesForJsonTextToolCall,
-	assistantTextForJsonPromotion,
 	shouldHoldPromotableToolText,
 	shouldPromoteJsonTextToolCall,
-	parseGeminiInbandToolCall,
-	parseJsonTextToolCall,
-	type JsonTextToolCall,
+	promoteJsonTextToolCallsFromContent,
 } from "./grokbot/json-text-tool-call";
 import { nativeToolParametersForIdentity } from "./grokbot/tool-policy";
 import {
@@ -86,6 +83,13 @@ const DEFAULT_IMAGE_MIME = "image/png";
 export interface GrokbotOptions extends StreamOptions {
 	/** Optional sand conversation id; preferred over sessionId, else a fresh UUID. */
 	conversationId?: string;
+	/**
+	 * Tool choice for this request. `"none"` advertises an empty tool list even
+	 * when `context.tools` is retained (handoff prompt-cache reuse). `"auto"` /
+	 * omit leave tools advertised. Sand InferenceStreamRequest has no wire
+	 * tool_choice field — `"required"` / `"any"` / named / computer choices throw.
+	 */
+	toolChoice?: ToolChoice;
 	/** Sand effort parameter; when set from mapOptionsForApi, overrides the default `high`. */
 	effort?: Effort | string;
 	/**
@@ -201,7 +205,7 @@ function toolParametersToJson(tool: Tool): Record<string, unknown> {
 	}
 }
 
-function toInferenceTools(tools: Context["tools"], identity?: Pick<ModelIdentity, "class">) {
+function toInferenceTools(tools: Context["tools"], sandNativeToolSchema?: "google" | "strict") {
 	if (!Array.isArray(tools)) return [];
 	const out: Array<{
 		name: string;
@@ -209,14 +213,18 @@ function toInferenceTools(tools: Context["tools"], identity?: Pick<ModelIdentity
 		parameters: Record<string, unknown>;
 		customToolFormat?: { type: string; definition: string; syntax: string };
 	}> = [];
+	const owners = buildGrammarToolIndex(tools);
+	const advertised = new Set<string>();
 	for (const tool of tools) {
 		if (!tool || typeof tool !== "object") continue;
 		const name = typeof tool.name === "string" ? tool.name : "";
 		if (!name) continue;
 		const wireName =
 			typeof tool.customWireName === "string" && tool.customWireName.trim() ? tool.customWireName.trim() : name;
-		const parameters = identity
-			? nativeToolParametersForIdentity(toolParametersToJson(tool), identity)
+		if (owners.get(wireName)?.name !== name || advertised.has(wireName)) continue;
+		advertised.add(wireName);
+		const parameters = sandNativeToolSchema
+			? nativeToolParametersForIdentity(toolParametersToJson(tool), sandNativeToolSchema)
 			: toolParametersToJson(tool);
 		const entry: (typeof out)[number] = {
 			name: wireName,
@@ -274,6 +282,50 @@ function parseCompletedToolArgs(raw: unknown, isGrammar: boolean): Record<string
 	return parseToolArgs(raw, true);
 }
 
+/** Sand InferenceStreamRequest has no tool_choice field — only auto/none. */
+function assertGrokbotToolChoiceSupported(choice: ToolChoice | undefined): void {
+	if (choice === undefined || choice === "auto" || choice === "none") return;
+	const label =
+		typeof choice === "string"
+			? choice
+			: typeof choice === "object" && choice !== null && "name" in choice && typeof choice.name === "string"
+				? `named:${choice.name}`
+				: typeof choice === "object" &&
+					  choice !== null &&
+					  "function" in choice &&
+					  choice.function &&
+					  typeof choice.function === "object" &&
+					  "name" in choice.function &&
+					  typeof choice.function.name === "string"
+					? `named:${choice.function.name}`
+					: typeof choice === "object" && choice !== null && "type" in choice
+						? String(choice.type)
+						: "unknown";
+	throw new AIError.ConfigurationError(
+		`Grok Bot does not support toolChoice "${label}" (InferenceStreamRequest has no tool_choice); use "auto" or "none"`,
+	);
+}
+
+/**
+ * Prefer a custom wire alias only when this internal tool owns that advertised
+ * slot. Collision losers (e.g. `extension_shell` with `customWireName: "Shell"`
+ * while `bash` owns Shell) must keep their internal name so product-wire replay
+ * does not attribute their args to the winner's schema.
+ */
+function resolveOwnedCustomWireName(
+	internalName: string,
+	persistedAlias: string | undefined,
+	meta: ProductWireToolIndexMeta | undefined,
+	grammarTools?: Map<string, ProductWireToolIndexMeta>,
+): string {
+	const alias = persistedAlias || meta?.customWireName;
+	if (!alias) return internalName;
+	if (!grammarTools) return alias;
+	const owner = grammarTools.get(alias)?.name;
+	if (owner === undefined || owner === internalName) return alias;
+	return internalName;
+}
+
 function toolCallFromPart(part: unknown, grammarTools?: Map<string, ProductWireToolIndexMeta>) {
 	if (!part || typeof part !== "object") return undefined;
 	const p = part as Record<string, unknown>;
@@ -288,10 +340,16 @@ function toolCallFromPart(part: unknown, grammarTools?: Map<string, ProductWireT
 	const meta =
 		(name ? grammarTools?.get(name) : undefined) ?? (customWireName ? grammarTools?.get(customWireName) : undefined);
 	// Grammar/customFormat tools (apply_patch, hashline, sloppy) replay as wire
-	// name + raw input (protobuf field 4), not Struct args. hashline/sloppy omit
-	// customWireName on the tool definition — use context.tools or a stored marker.
-	const isGrammar = Boolean(customWireName) || Boolean(meta?.isGrammar);
-	const wireName = customWireName || meta?.customWireName || name;
+	// name + raw input (protobuf field 4), not Struct args. Prefer the live tool
+	// index (`meta.isGrammar`); only fall back to a persisted `customWireName`
+	// when tools are absent — never treat a wire alias alone as grammar while
+	// the advertised tool declares structured field-3 parameters.
+	const isGrammar = meta !== undefined ? Boolean(meta.isGrammar) : Boolean(customWireName);
+	const internalName = name || meta?.name || "";
+	const wireName =
+		resolveOwnedCustomWireName(internalName, customWireName || undefined, meta, grammarTools) ||
+		customWireName ||
+		name;
 	const tc: { toolCallId: string; toolName: string; args?: Record<string, unknown>; rawToolCallArgs?: string } = {
 		toolCallId: id,
 		toolName: wireName,
@@ -392,8 +450,23 @@ function toolResultPayload(msg: Record<string, unknown>): unknown {
 	return "";
 }
 
+/** Options for inference history conversion. */
+export type ToInferenceMessagesOptions = {
+	/**
+	 * When true, apply product Shell/Read/Write collision ownership so history
+	 * aliases match product-wire winners (bash owns Shell, etc.). Native wire
+	 * must leave this off — otherwise an extension's advertised `Shell`
+	 * customWireName loses to bash and replays under an undeclared internal name.
+	 */
+	productWireOwnership?: boolean;
+};
+
 /** @internal Exported for Grok Bot message-conversion contract tests. */
-export function toInferenceMessages(context: Context, model: Model<"grokbot-sand">) {
+export function toInferenceMessages(
+	context: Context,
+	model: Model<"grokbot-sand">,
+	options?: ToInferenceMessagesOptions,
+) {
 	const out: Array<Record<string, unknown>> = [];
 	const systemPrompts = normalizeSystemPrompts(context.systemPrompt);
 	if (systemPrompts.length) {
@@ -415,6 +488,11 @@ export function toInferenceMessages(context: Context, model: Model<"grokbot-sand
 	};
 
 	const toolWireIndex = buildGrammarToolIndex(context.tools);
+	// Product wire only: align Shell/Read/Write ownership with product
+	// advertisement. Native history must keep extension customWireName aliases.
+	if (options?.productWireOwnership) {
+		augmentToolIndexForProductWire(toolWireIndex, context.tools);
+	}
 	// Prefer the wire name from the preceding assistant call with the same
 	// toolCallId — edit.mode / tool set can change after a grammar call is in
 	// history, so looking up the current context.tools would mismatch names.
@@ -431,7 +509,9 @@ export function toInferenceMessages(context: Context, model: Model<"grokbot-sand
 			const callId = String(record.toolCallId || record.tool_call_id || "");
 			const internalName = String(record.toolName || record.tool_name || "");
 			const meta = internalName ? toolWireIndex.get(internalName) : undefined;
-			const wireName = (callId ? wireNameByCallId.get(callId) : undefined) || meta?.customWireName || internalName;
+			const wireName =
+				(callId ? wireNameByCallId.get(callId) : undefined) ||
+				resolveOwnedCustomWireName(internalName, undefined, meta, toolWireIndex);
 			const part: Record<string, unknown> = {
 				toolCallId: callId,
 				toolName: wireName,
@@ -477,14 +557,7 @@ export function toInferenceMessages(context: Context, model: Model<"grokbot-sand
 			continue;
 		}
 
-		// Sand has no developer role. Keep leading instructions in the system
-		// prefix, but deliver later notes as chronological user turns: a trailing
-		// system row is hoisted by the backend and leaves an invalid assistant
-		// prefill for thinking models (e.g. a late advisor after the final answer).
-		const role =
-			roleName === "developer" && out.some(message => message.role !== ROLE.system)
-				? ROLE.user
-				: ROLE[roleName as keyof typeof ROLE] || ROLE.user;
+		const role = ROLE[roleName as keyof typeof ROLE] || ROLE.user;
 		const parts = userPartsFromContent(msg.content);
 		if (!parts.length) continue;
 		const hasImage = parts.some(p => p.type === "image");
@@ -604,8 +677,76 @@ function applyUsage(output: AssistantMessage, usage: Record<string, unknown>) {
 	output.usage.cacheWrite = safeCacheWrite;
 }
 
+function emptyAssistantUsage(): AssistantMessage["usage"] {
+	return {
+		input: 0,
+		output: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 0,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	};
+}
+
+/** Sum token buckets from an abandoned attempt into a running total (costs stay 0 until calculateCost). */
+function addAbandonedUsage(
+	into: AssistantMessage["usage"] | undefined,
+	from: AssistantMessage["usage"],
+): AssistantMessage["usage"] {
+	const base = into ?? emptyAssistantUsage();
+	return {
+		input: base.input + from.input,
+		output: base.output + from.output,
+		cacheRead: base.cacheRead + from.cacheRead,
+		cacheWrite: base.cacheWrite + from.cacheWrite,
+		totalTokens: base.totalTokens + from.totalTokens,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	};
+}
+
+function usageHasTokens(usage: AssistantMessage["usage"]): boolean {
+	return usage.input > 0 || usage.output > 0 || usage.cacheRead > 0 || usage.cacheWrite > 0 || usage.totalTokens > 0;
+}
+
+/**
+ * Merge a streamed tool-args frame into the accumulated buffer.
+ * Cumulative snapshots replace the buffer; non-prefix frames append (delta wire),
+ * matching probe reconstruction in `scripts/grokbot-probes/parse-connect-stream.mjs`.
+ */
+function isCompleteJsonObjectText(text: string): boolean {
+	const trimmed = text.trim();
+	if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) return false;
+	try {
+		const parsed = JSON.parse(trimmed) as unknown;
+		return Boolean(parsed && typeof parsed === "object" && !Array.isArray(parsed));
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Merge a streamed tool-args frame into the accumulated buffer.
+ * Cumulative snapshots replace the buffer; non-prefix frames append (delta wire).
+ * Complete JSON object revisions that are not literal prefixes
+ * (`{"cmd":"ls"}` → `{"cmd":"ls","n":1}`) must replace, not concatenate —
+ * otherwise finishTool parses malformed args and SendToUser revisions break.
+ */
+function mergeStreamedArgsText(previous: string, incoming: string): { argsText: string; delta: string } {
+	if (!incoming || incoming === previous) return { argsText: previous, delta: "" };
+	if (!previous || incoming.startsWith(previous)) {
+		return { argsText: incoming, delta: incoming.slice(previous.length) };
+	}
+	if (isCompleteJsonObjectText(previous) && isCompleteJsonObjectText(incoming)) {
+		return { argsText: incoming, delta: incoming };
+	}
+	return { argsText: previous + incoming, delta: incoming };
+}
+
 function canFinalizeIncompleteToolArgs(argsText: string, isGrammar: boolean): boolean {
-	if (isGrammar) return argsText.trim().length > 0;
+	// Grammar/customFormat args are free-form text — any non-empty fragment looks
+	// "complete" to a JSON check. Without an explicit isComplete frame, a truncated
+	// patch (e.g. after an output-token limit) must not become an executable toolCall.
+	if (isGrammar) return false;
 	const trimmed = argsText.trim();
 	if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) return false;
 	try {
@@ -625,6 +766,23 @@ type GrokbotToolState = {
 	isGrammar: boolean;
 };
 
+/** Omp tool that currently owns the product-wire Write slot (collision-aware). */
+function writeOwnerFromContextTools(tools: Context["tools"]): string | undefined {
+	if (!Array.isArray(tools)) return undefined;
+	let owner: string | undefined;
+	for (const tool of tools) {
+		const ompName = typeof tool?.name === "string" ? tool.name.trim() : "";
+		if (!ompName) continue;
+		const custom =
+			typeof tool.customWireName === "string" && tool.customWireName.trim() ? tool.customWireName.trim() : "";
+		const sandName = custom || toSandField2Name(ompName);
+		if (sandName !== "Write") continue;
+		if (!shouldClaimSandWireName("Write", ompName, owner)) continue;
+		owner = ompName;
+	}
+	return owner;
+}
+
 /** True when the immediately preceding message is a Write toolResult (current tool turn). */
 function contextEndsWithWriteToolResult(context: Context): boolean {
 	const messages = context.messages ?? [];
@@ -633,30 +791,50 @@ function contextEndsWithWriteToolResult(context: Context): boolean {
 		if (!msg || typeof msg !== "object") continue;
 		if (msg.role !== "toolResult") return false;
 		const name = typeof msg.toolName === "string" ? msg.toolName : "";
-		// Product wire advertises edit as Write; decoded history keeps omp `edit`.
+		// When both edit and write are active, write owns Write and historical
+		// edit results keep the internal name — only the Write owner counts.
+		const writeOwner = writeOwnerFromContextTools(context.tools);
+		if (writeOwner !== undefined) return name === writeOwner;
+		// No Write-capable tools advertised: fall back to sand/id match.
 		return toSandField2Name(name) === "Write" || /^(write|Write)$/i.test(name);
 	}
 	return false;
 }
 
 /** Gemini/Cursor Write often emits `contents` instead of omp `content`. */
-function normalizeProductWriteArgs(name: string, args: Record<string, unknown>): Record<string, unknown> {
-	if (toSandField2Name(name) !== "Write" && !/^(write|Write|edit)$/i.test(name)) return args;
+function normalizeProductWriteArgs(
+	name: string,
+	args: Record<string, unknown>,
+	grammarTools?: Map<string, ProductWireToolIndexMeta>,
+): Record<string, unknown> {
+	const meta = grammarTools?.get(name);
+	const wire = meta?.productWireName || meta?.customWireName || toSandField2Name(name);
+	if (wire !== "Write" && !/^(write|Write|edit)$/i.test(name)) return args;
 	if (typeof args.content === "string") return args;
 	if (typeof args.contents === "string") return { ...args, content: args.contents };
 	return args;
 }
 
 /** Cursor Read sometimes emits `target_file` instead of omp `path`. */
-function normalizeProductReadArgs(name: string, args: Record<string, unknown>): Record<string, unknown> {
-	if (toSandField2Name(name) !== "Read" && !/^(read|Read)$/i.test(name)) return args;
+function normalizeProductReadArgs(
+	name: string,
+	args: Record<string, unknown>,
+	grammarTools?: Map<string, ProductWireToolIndexMeta>,
+): Record<string, unknown> {
+	const meta = grammarTools?.get(name);
+	const wire = meta?.productWireName || meta?.customWireName || toSandField2Name(name);
+	if (wire !== "Read" && !/^(read|Read)$/i.test(name)) return args;
 	if (typeof args.path === "string") return args;
 	if (typeof args.target_file === "string") return { ...args, path: args.target_file };
 	return args;
 }
 
-function normalizeProductToolArgs(name: string, args: Record<string, unknown>): Record<string, unknown> {
-	return normalizeProductReadArgs(name, normalizeProductWriteArgs(name, args));
+function normalizeProductToolArgs(
+	name: string,
+	args: Record<string, unknown>,
+	grammarTools?: Map<string, ProductWireToolIndexMeta>,
+): Record<string, unknown> {
+	return normalizeProductReadArgs(name, normalizeProductWriteArgs(name, args, grammarTools), grammarTools);
 }
 
 function uniqueToolStates(toolStates: Map<string, GrokbotToolState>): GrokbotToolState[] {
@@ -757,6 +935,8 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 			timestamp: Date.now(),
 		};
 		let firstTokenTime: number | undefined;
+		/** Token usage from abandoned empty/incomplete tool attempts (added into the final attempt / error path). */
+		let abandonedAttemptUsage: AssistantMessage["usage"] | undefined;
 
 		try {
 			const cfg = await loadGrokbotConfig();
@@ -787,12 +967,20 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 					? model.requestModelId.trim()
 					: model.id;
 			const identity = classifyModel("grokbot", policyModelId, { lenient: true });
-			const tools = toInferenceTools(context.tools, identity);
+			// Handoff / side-channel turns keep `context.tools` for prompt-cache
+			// reuse while forcing `toolChoice: "none"` — do not advertise tools.
+			// Sharpshooter `required` / named choices have no sand wire field.
+			assertGrokbotToolChoiceSupported(options?.toolChoice);
+			const tools =
+				options?.toolChoice === "none" || model.supportsTools === false
+					? []
+					: toInferenceTools(context.tools, model.sandNativeToolSchema);
 			const grammarTools = buildGrammarToolIndex(context.tools);
 			const conversationId = options?.conversationId || options?.sessionId || crypto.randomUUID();
 			let emptyToolRetryUsed = false;
 			let incompleteToolRetryUsed = false;
-			let geminiProductRetryUsed = false;
+			/** Catalog `sand-empty-tools-retry-wire` engaged for this empty-tool replay. */
+			let emptyToolsRetryWire: typeof model.sandEmptyToolsRetryWire | undefined;
 			let started = false;
 			let anthropicWire: AnthropicSandToolWireResult = {
 				requestedModel: { modelId: model.id },
@@ -811,6 +999,11 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 			/** True once `start` was published live (text-only path is unbuffered). */
 			let consumerSawStart = false;
 			const pendingToolEventBuffers = new Map<number, AssistantMessageEvent[]>();
+			type SendToUserCallState = { argsText: string; lastContent: string; keys: Set<string> };
+			const sendToUserTextIndexes = new Set<number>();
+			const openSendToUserByKey = new Map<string, SendToUserCallState>();
+			/** Live (unbuffered) complete-object tool args held until toolcall_end. */
+			const pendingCanonicalToolDeltas = new Map<number, string>();
 			const pushConsumerEvent = (event: AssistantMessageEvent) => {
 				stream.push(event);
 				if (event.type === "start") consumerSawStart = true;
@@ -867,6 +1060,9 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 			const discardAttemptEvents = () => {
 				attemptEventBuffer = [];
 				pendingToolEventBuffers.clear();
+				sendToUserTextIndexes.clear();
+				openSendToUserByKey.clear();
+				pendingCanonicalToolDeltas.clear();
 				attemptStreamingLive = false;
 				firstTokenTime = undefined;
 				// Buffered `start` was never published — re-arm so the retry emits it.
@@ -955,6 +1151,64 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 						attemptEventBuffer.push(event);
 						return;
 					}
+					// Product-wire may emit ordinary prose (already live) then a later
+					// standalone JSON / tool_code block. Buffer that later block so
+					// end-of-stream promotion can remove it — live consumers cannot
+					// retract a published dump.
+					const mayPromote = shouldPromoteJsonTextToolCall({
+						sandPromoteJsonTextTools: model.sandPromoteJsonTextTools,
+						wireMode: anthropicWire.wireMode,
+					});
+					if (
+						mayPromote &&
+						typeof contentIndex === "number" &&
+						(event.type === "text_start" ||
+							event.type === "text_delta" ||
+							event.type === "text_end" ||
+							event.type === "thinking_start" ||
+							event.type === "thinking_delta" ||
+							event.type === "thinking_end")
+					) {
+						const block = output.content[contentIndex];
+						const text =
+							block?.type === "text" && typeof block.text === "string"
+								? block.text
+								: block?.type === "thinking" && typeof block.thinking === "string"
+									? block.thinking
+									: "";
+						if (shouldHoldPromotableToolText(text)) {
+							attemptEventBuffer.push(event);
+							return;
+						}
+						// Block resolved to ordinary prose — publish any held events for
+						// this index (e.g. text_start while still undecided) then continue live.
+						if (attemptEventBuffer.some(e => "contentIndex" in e && e.contentIndex === contentIndex)) {
+							const held: AssistantMessageEvent[] = [];
+							const rest: AssistantMessageEvent[] = [];
+							for (const buffered of attemptEventBuffer) {
+								if ("contentIndex" in buffered && buffered.contentIndex === contentIndex) {
+									held.push(buffered);
+								} else {
+									rest.push(buffered);
+								}
+							}
+							attemptEventBuffer = rest;
+							for (const buffered of held) pushConsumerEvent(buffered);
+						}
+					}
+					// Hold provisional SendToUser text while any call is still open so
+					// cumulative draft→answer revisions can rewrite unpublished deltas.
+					const contentIndexLive = "contentIndex" in event ? event.contentIndex : undefined;
+					if (
+						typeof contentIndexLive === "number" &&
+						sendToUserTextIndexes.has(contentIndexLive) &&
+						openSendToUserByKey.size > 0 &&
+						(event.type === "text_start" || event.type === "text_delta" || event.type === "text_end")
+					) {
+						attemptStreamingLive = false;
+						attemptEventBuffer.push(event);
+						return;
+					}
 					pushConsumerEvent(event);
 					return;
 				}
@@ -963,6 +1217,11 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 					(event.type === "text_delta" || event.type === "text_end") &&
 					!hasEarlierIncompleteTool(event.contentIndex)
 				) {
+					// Hold provisional SendToUser text until every open SendToUser call
+					// completes — early flush cannot retract a published draft.
+					if (sendToUserTextIndexes.has(event.contentIndex) && openSendToUserByKey.size > 0) {
+						return;
+					}
 					// Hold JSON / tool_code fallback text until end-of-stream
 					// promotion — early flush cannot retract published deltas.
 					const mayPromote = shouldPromoteJsonTextToolCall({
@@ -994,8 +1253,16 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 				routedResponseModel = "";
 			};
 
+			/** Stash usage from an abandoned tool attempt, then zero for the replay stream. */
+			const resetUsageForToolRetry = () => {
+				if (usageHasTokens(output.usage)) {
+					abandonedAttemptUsage = addAbandonedUsage(abandonedAttemptUsage, output.usage);
+				}
+				output.usage = emptyAssistantUsage();
+			};
+
 			attempt: while (true) {
-				const replayToolTurn = emptyToolRetryUsed || incompleteToolRetryUsed || geminiProductRetryUsed;
+				const replayToolTurn = emptyToolRetryUsed || incompleteToolRetryUsed || emptyToolsRetryWire !== undefined;
 				const modelConfig = buildModelConfig(model, {
 					...options,
 					maxTokens: replayToolTurn ? Math.max(Number(options?.maxTokens) || 0, 4096) : options?.maxTokens,
@@ -1034,7 +1301,7 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 					conversationId,
 				};
 				if (modelConfig) body.modelConfig = modelConfig;
-				const retrySandWire = geminiProductRetryUsed ? "keep-model" : model.sandToolsWire;
+				const retrySandWire = emptyToolsRetryWire ?? model.sandToolsWire;
 				const resolvedWire = resolveAnthropicSandToolsWire(
 					typeof process !== "undefined" ? process.env.GROKBOT_ANTHROPIC_TOOLS_WIRE : undefined,
 					options?.anthropicToolsWire,
@@ -1048,7 +1315,6 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 						ompTools: context.tools,
 						sandToolsWire: retrySandWire,
 						sandWireModelId: model.sandWireModelId,
-						requiresCursorToolSchemaProjection: model.requiresCursorToolSchemaProjection,
 					},
 					resolvedWire,
 				);
@@ -1066,10 +1332,10 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 						anthropicWire.wireMode === "keep-model"
 					) {
 						augmentToolIndexForProductWire(grammarTools, context.tools);
-						// History stores omp names (bash/read/write); product tools are
-						// Shell/Read/Write — rewrite replayed call/result names to match.
+						// Re-convert with product collision ownership so extension Shell
+						// losers keep internal names; then rewrite omp owners to Shell/Read/Write.
 						body.messages = rewriteInferenceMessagesForProductWire(
-							(body.messages as Record<string, unknown>[]) ?? [],
+							toInferenceMessages(context, model, { productWireOwnership: true }),
 							context.tools,
 						);
 						logger.info("grokbot: product sand tool wire", {
@@ -1151,9 +1417,10 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 				let openKind: "" | "text" | "thinking" = "";
 				let openIndex = -1;
 				/** Content indexes whose text came from synthetic SendToUser — never promote. */
-				const sendToUserTextIndexes = new Set<number>();
-				/** Open SendToUser correlation keys (`id:…` / `idx:…`) for name-less continuation frames. */
-				const openSendToUserKeys = new Map<string, { argsText: string; lastContent: string; keys: Set<string> }>();
+				// sendToUserTextIndexes / openSendToUserByKey live in the outer attempt
+				// scope so emitAttemptEvent can hold provisional drafts.
+				sendToUserTextIndexes.clear();
+				openSendToUserByKey.clear();
 				const toolStates = new Map<
 					string,
 					{ key: string; index: number; block: ToolCall; argsText: string; ended: boolean; isGrammar: boolean }
@@ -1169,7 +1436,24 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 				};
 
 				const isOpenSendToUserPart = (part: Record<string, unknown>): boolean =>
-					sendToUserKeysForPart(part).some(key => openSendToUserKeys.has(key));
+					sendToUserKeysForPart(part).some(key => openSendToUserByKey.has(key));
+
+				const resolveSendToUserState = (part: Record<string, unknown>): SendToUserCallState => {
+					const keys = sendToUserKeysForPart(part);
+					let state: SendToUserCallState | undefined;
+					for (const key of keys) {
+						state = openSendToUserByKey.get(key);
+						if (state) break;
+					}
+					if (!state) {
+						state = { argsText: "", lastContent: "", keys: new Set() };
+					}
+					for (const key of keys) {
+						state.keys.add(key);
+						openSendToUserByKey.set(key, state);
+					}
+					return state;
+				};
 
 				const closeOpen = () => {
 					if (openKind === "text" && openIndex >= 0) {
@@ -1228,9 +1512,20 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 					state.block.arguments = normalizeProductToolArgs(
 						state.block.name,
 						parseCompletedToolArgs(state.argsText, state.isGrammar),
+						grammarTools,
 					);
 					clearStreamingPartialJson(state.block);
 					state.ended = true;
+					const heldDelta = pendingCanonicalToolDeltas.get(state.index);
+					if (heldDelta !== undefined) {
+						pendingCanonicalToolDeltas.delete(state.index);
+						emitAttemptEvent({
+							type: "toolcall_delta",
+							contentIndex: state.index,
+							delta: heldDelta,
+							partial: output,
+						});
+					}
 					emitAttemptEvent({
 						type: "toolcall_end",
 						contentIndex: state.index,
@@ -1240,34 +1535,76 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 				};
 
 				const handleSendToUser = (part: Record<string, unknown>) => {
-					const keys = sendToUserKeysForPart(part);
-					const state = keys.map(key => openSendToUserKeys.get(key)).find(value => value !== undefined) ?? {
-						argsText: "",
-						lastContent: "",
-						keys: new Set<string>(),
-					};
-					for (const key of keys) {
-						state.keys.add(key);
-						openSendToUserKeys.set(key, state);
-					}
+					const state = resolveSendToUserState(part);
 					const argsText =
 						part.args == null ? "" : typeof part.args === "string" ? part.args : JSON.stringify(part.args);
-					if (argsText) state.argsText = argsText;
+					if (argsText) state.argsText = mergeStreamedArgsText(state.argsText, argsText).argsText;
 					const parsed = parseSendToUserContent(state.argsText);
+					const isComplete = Boolean(part.isComplete ?? part.is_complete);
 					if (parsed !== undefined && parsed !== state.lastContent) {
-						const delta = parsed.startsWith(state.lastContent) ? parsed.slice(state.lastContent.length) : parsed;
-						state.lastContent = parsed;
-						if (delta) {
-							const idx = ensureText();
-							sendToUserTextIndexes.add(idx);
-							(output.content[idx] as TextContent).text += delta;
-							emitAttemptEvent({ type: "text_delta", contentIndex: idx, delta, partial: output });
+						// Mark the text index before ensureText so text_start is held with
+						// provisional SendToUser deltas (draft→answer must stay unpublished).
+						const idxHint = openKind === "text" ? openIndex : output.content.length;
+						sendToUserTextIndexes.add(idxHint);
+						const idx = ensureText();
+						sendToUserTextIndexes.add(idx);
+						const block = output.content[idx] as TextContent;
+						if (parsed.startsWith(state.lastContent)) {
+							const delta = parsed.slice(state.lastContent.length);
+							state.lastContent = parsed;
+							if (delta) {
+								block.text += delta;
+								emitAttemptEvent({ type: "text_delta", contentIndex: idx, delta, partial: output });
+							}
+						} else {
+							// Cumulative revision (e.g. "draft" → "answer"): replace the prior
+							// snapshot instead of appending (which would yield "draftanswer").
+							const previous = state.lastContent;
+							state.lastContent = parsed;
+							if (previous && block.text.endsWith(previous)) {
+								block.text = block.text.slice(0, block.text.length - previous.length) + parsed;
+							} else {
+								block.text = parsed;
+							}
+							// Rewrite unpublished text_delta events for this index to one
+							// replacement delta so flush matches the final message.
+							let replacedBufferedDelta = false;
+							const rewritten: AssistantMessageEvent[] = [];
+							for (const event of attemptEventBuffer) {
+								if (event.type === "text_delta" && event.contentIndex === idx) {
+									if (!replacedBufferedDelta) {
+										rewritten.push({
+											type: "text_delta",
+											contentIndex: idx,
+											delta: parsed,
+											partial: output,
+										});
+										replacedBufferedDelta = true;
+									}
+									continue;
+								}
+								rewritten.push(event);
+							}
+							attemptEventBuffer = rewritten;
+							if (!replacedBufferedDelta) {
+								emitAttemptEvent({
+									type: "text_delta",
+									contentIndex: idx,
+									delta: parsed,
+									partial: output,
+								});
+							}
 						}
 					}
-					if (part.isComplete ?? part.is_complete) {
+					if (isComplete) {
 						closeOpen();
-						// Other interleaved calls retain their correlation and content state.
-						for (const key of state.keys) openSendToUserKeys.delete(key);
+						// Drop only this call's correlation keys — concurrent SendToUser
+						// streams keep their own reconstruction state.
+						for (const key of state.keys) openSendToUserByKey.delete(key);
+						// Do not flush here: promotable thinking/text may still need to
+						// compact indexes before SendToUser text_* events publish. Hold
+						// remains active while openSendToUserByKey is non-empty; once
+						// cleared, end-of-stream (or ordinary) flush publishes remapped.
 					}
 				};
 
@@ -1286,13 +1623,14 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 					if (!state) {
 						closeOpen();
 						const meta = (name ? grammarTools.get(name) : undefined) ?? undefined;
-						// Mark every grammar/customFormat call (hashline/sloppy have no
-						// customWireName) so live preview + history replay stay on raw args.
-						// Do not persist productWireName (Shell/Read/Write) — that alias is
-						// lookup-only and must not flip OpenAI Responses into custom_tool_call.
+						// Persist customWireName only for grammar/customFormat calls
+						// (hashline/sloppy have no definition alias — store the omp name
+						// as the orphaned-history grammar marker). Non-grammar wire
+						// aliases stay off ToolCall.customWireName so replay does not
+						// enter the raw field-4 path.
 						const grammarWire = meta?.isGrammar
 							? meta.customWireName || meta.name || name || undefined
-							: meta?.customWireName;
+							: undefined;
 						const block: ToolCall = {
 							type: "toolCall",
 							id: id || `call_${output.content.length}`,
@@ -1326,28 +1664,89 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 							if (meta?.isGrammar) {
 								state.isGrammar = true;
 								state.block.customWireName = meta.customWireName || meta.name || name;
-							} else if (meta?.customWireName) {
-								state.block.customWireName = meta.customWireName;
 							}
 						}
 					}
 					if (id && state.block.id.startsWith("call_")) state.block.id = id;
 
-					if (argsText && argsText !== state.argsText) {
-						let delta = argsText;
-						if (argsText.startsWith(state.argsText)) delta = argsText.slice(state.argsText.length);
-						state.argsText = argsText;
-						// Keep ToolCall.arguments + streamed buffer current so live
-						// message_update snapshots show bash/edit previews mid-stream.
-						setStreamingPartialJson(state.block, argsText);
-						state.block.arguments = state.isGrammar ? { input: argsText } : parseToolArgs(argsText, false);
-						if (delta) {
-							emitAttemptEvent({
-								type: "toolcall_delta",
-								contentIndex: state.index,
-								delta,
-								partial: output,
-							});
+					if (argsText) {
+						const previousArgs = state.argsText;
+						const merged = mergeStreamedArgsText(previousArgs, argsText);
+						if (merged.argsText !== state.argsText) {
+							state.argsText = merged.argsText;
+							// Keep ToolCall.arguments + streamed buffer current so live
+							// message_update snapshots show bash/edit previews mid-stream.
+							setStreamingPartialJson(state.block, merged.argsText);
+							state.block.arguments = state.isGrammar
+								? { input: merged.argsText }
+								: parseToolArgs(merged.argsText, false);
+							if (merged.delta) {
+								// Cumulative complete-object revisions emit a full snapshot as
+								// `delta` (not an appendable suffix). Rewrite unpublished
+								// toolcall_deltas to one canonical snapshot so proxy concat
+								// (`previous + delta`) still parses.
+								const cumulativeReplace =
+									Boolean(previousArgs) &&
+									isCompleteJsonObjectText(previousArgs) &&
+									isCompleteJsonObjectText(merged.argsText) &&
+									!merged.argsText.startsWith(previousArgs);
+								if (cumulativeReplace) {
+									const buffered = pendingToolEventBuffers.get(state.index);
+									if (buffered) {
+										const rewritten: AssistantMessageEvent[] = [];
+										let replacedDelta = false;
+										for (const event of buffered) {
+											if (event.type === "toolcall_delta") {
+												if (!replacedDelta) {
+													rewritten.push({
+														type: "toolcall_delta",
+														contentIndex: state.index,
+														delta: merged.argsText,
+														partial: output,
+													});
+													replacedDelta = true;
+												}
+												continue;
+											}
+											rewritten.push(event);
+										}
+										if (!replacedDelta) {
+											rewritten.push({
+												type: "toolcall_delta",
+												contentIndex: state.index,
+												delta: merged.argsText,
+												partial: output,
+											});
+										}
+										pendingToolEventBuffers.set(state.index, rewritten);
+									} else {
+										// Live / unbuffered path: prior complete snapshots may
+										// already have been published — hold the canonical
+										// args and emit one concat-safe delta in finishTool.
+										pendingCanonicalToolDeltas.set(state.index, merged.argsText);
+									}
+								} else if (
+									isCompleteJsonObjectText(argsText) &&
+									isCompleteJsonObjectText(merged.argsText) &&
+									!shouldBufferAttemptEvents() &&
+									// Prefix-completing snapshots (`{"path":` then `{"path":"/tmp/x"}`)
+									// already expose an appendable merged.delta — emit that suffix
+									// instead of holding the full object for finishTool.
+									!(previousArgs && merged.argsText.startsWith(previousArgs))
+								) {
+									// Unbuffered complete-object *snapshots* that are not prefix
+									// extensions of the accumulator: hold until finishTool so a
+									// later cumulative revision can replace without double-emitting.
+									pendingCanonicalToolDeltas.set(state.index, merged.argsText);
+								} else {
+									emitAttemptEvent({
+										type: "toolcall_delta",
+										contentIndex: state.index,
+										delta: merged.delta,
+										partial: output,
+									});
+								}
+							}
 						}
 					}
 					if (isComplete) finishTool(state);
@@ -1385,6 +1784,12 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 					pending = pending.subarray(offset);
 
 					for (const frame of frames) {
+						if (sawEndStream) {
+							throw new AIError.ProviderResponseError(
+								"Grok Bot stream continued after the connect end-stream trailer",
+								{ provider: model.provider, kind: "incomplete-stream" },
+							);
+						}
 						if (frame.flags & CONNECT_END_STREAM_FLAG) {
 							sawEndStream = true;
 							const jsonText = Buffer.from(frame.bytes).toString("utf8").trim();
@@ -1492,14 +1897,18 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 							// Only intercept the synthetic parent-chat helper. When an
 							// extension owns the SendToUser wire name, dispatch it.
 							// Name-less continuation frames (id/index only) stay on this
-							// path via openSendToUserKeys — same correlation as upsertTool.
+							// path via openSendToUserByKey — same correlation as upsertTool.
 							const ompOwnsSendToUser =
 								Array.isArray(context.tools) &&
 								context.tools.some(tool => {
 									if (!tool || typeof tool !== "object") return false;
 									const name = typeof tool.name === "string" ? tool.name.trim() : "";
 									const custom = typeof tool.customWireName === "string" ? tool.customWireName.trim() : "";
-									return name === SEND_TO_USER_WIRE_NAME || custom === SEND_TO_USER_WIRE_NAME;
+									// Ownership follows the advertised wire name (custom alias
+									// wins). An internal `SendToUser` that maps to `Other` does
+									// not occupy the synthetic slot the parent-chat mapper injects.
+									const advertised = custom || name;
+									return advertised === SEND_TO_USER_WIRE_NAME;
 								});
 							const isSyntheticSendToUser =
 								!ompOwnsSendToUser &&
@@ -1538,17 +1947,28 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 							}
 						}
 					}
+					if (sawEndStream && pending.length > 0) {
+						throw new AIError.ProviderResponseError(
+							"Grok Bot stream retained bytes after the connect end-stream trailer",
+							{ provider: model.provider, kind: "incomplete-stream" },
+						);
+					}
 				}
 
 				closeOpen();
 				// Finalize incomplete ToolCallParts that already have a complete JSON
-				// object (stream ended before isComplete). Drop leftover fragments
-				// when the turn already has a completed tool or visible text so a
-				// parent-chat Read/Write follow-up does not fail the whole id.
+				// object (stream ended before isComplete). Skip this salvage after an
+				// output-token limit — a syntactically complete snapshot may still be
+				// provisional (cumulative revisions prove complete-looking JSON can
+				// grow). Drop leftover fragments when the turn already has a completed
+				// tool, visible text, or a length stop so a truncated Shell/Write is
+				// not executed and parent-chat Read/Write follow-ups do not fail the id.
 				const states = uniqueToolStates(toolStates);
-				for (const state of states) {
-					if (!state.ended && canFinalizeIncompleteToolArgs(state.argsText, state.isGrammar)) {
-						finishTool(state);
+				if (output.stopReason !== "length") {
+					for (const state of states) {
+						if (!state.ended && canFinalizeIncompleteToolArgs(state.argsText, state.isGrammar)) {
+							finishTool(state);
+						}
 					}
 				}
 				const leftovers = states.filter(s => !s.ended);
@@ -1557,7 +1977,7 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 					const hasText = output.content.some(
 						b => b.type === "text" && typeof b.text === "string" && b.text.trim().length > 0,
 					);
-					if (hasComplete || hasText) {
+					if (hasComplete || hasText || output.stopReason === "length") {
 						const drop = new Set(leftovers.map(s => s.index));
 						// Compacting content shifts later blocks left — remap retained
 						// event/tool indices so flush does not point at the wrong slot.
@@ -1629,14 +2049,7 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 						discardAttemptEvents();
 						clearAbandonedAttemptMetadata();
 						output.content = [];
-						output.usage = {
-							input: 0,
-							output: 0,
-							cacheRead: 0,
-							cacheWrite: 0,
-							totalTokens: 0,
-							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-						};
+						resetUsageForToolRetry();
 						output.stopReason = "stop";
 						logger.info("grokbot: retrying incomplete tool turn", { modelId: model.id });
 						continue attempt;
@@ -1654,7 +2067,11 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 				// or emit ```tool_code / default_api.bash(...) instead.
 				// Catalog `sand-promote-json-text-tools` (or product wire profiles)
 				// opts into promotion — native models keep example JSON as text.
+				// Handoff `toolChoice: "none"` keeps context.tools for prompt-cache
+				// while body.tools is [] — advertisedNamesForJsonTextToolCall would
+				// fall back to context and promote fenced Shell/Write; skip entirely.
 				if (
+					options?.toolChoice !== "none" &&
 					shouldPromoteJsonTextToolCall({
 						sandPromoteJsonTextTools: model.sandPromoteJsonTextTools,
 						wireMode: anthropicWire.wireMode,
@@ -1662,42 +2079,18 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 					!output.content.some(b => b.type === "toolCall")
 				) {
 					const advertised = advertisedNamesForJsonTextToolCall(body.tools, context.tools);
-					const promotedCalls: JsonTextToolCall[] = [];
-					const blockCalls: { call: JsonTextToolCall; thinking: boolean; fingerprint: string }[] = [];
-					const textFingerprints = new Set<string>();
-					const removedIndexes = new Set<number>();
-					for (let i = 0; i < output.content.length; i++) {
-						if (sendToUserTextIndexes.has(i)) continue;
-						const text = assistantTextForJsonPromotion([output.content[i]]);
-						const promoted =
-							parseJsonTextToolCall(text, advertised) ?? parseGeminiInbandToolCall(text, advertised);
-						if (!promoted) continue;
-						const owner = grammarTools.get(promoted.name)?.name ?? promoted.name;
-						const fingerprint = `${owner}\0${stableStringifyJson(promoted.arguments)}`;
-						const thinking = output.content[i].type === "thinking";
-						blockCalls.push({ call: promoted, thinking, fingerprint });
-						if (!thinking) textFingerprints.add(fingerprint);
-						removedIndexes.add(i);
-					}
-					// A final text invocation supersedes its mirrored thinking dump.
-					for (const entry of blockCalls) {
-						if (!entry.thinking || !textFingerprints.has(entry.fingerprint)) promotedCalls.push(entry.call);
-					}
-					// Preserve support for a single invocation split across blocks.
-					if (promotedCalls.length === 0) {
-						const text = assistantTextForJsonPromotion(output.content, sendToUserTextIndexes);
-						const promoted =
-							parseJsonTextToolCall(text, advertised) ?? parseGeminiInbandToolCall(text, advertised);
-						if (promoted) {
-							promotedCalls.push(promoted);
-							for (let i = 0; i < output.content.length; i++) {
-								if (sendToUserTextIndexes.has(i)) continue;
-								const block = output.content[i];
-								if (block?.type === "text" || block?.type === "thinking") removedIndexes.add(i);
-							}
-						}
-					}
-					if (promotedCalls.length > 0) {
+					const promotion = promoteJsonTextToolCallsFromContent(
+						output.content,
+						advertised,
+						sendToUserTextIndexes,
+						context.tools,
+						name => grammarTools.get(name)?.name ?? name,
+					);
+					const promotedList = promotion.calls;
+					if (promotedList.length > 0) {
+						// Drop only blocks that produced promoted calls — ordinary prose
+						// that already streamed live must remain on the final message.
+						const removedIndexes = new Set<number>(promotion.sourceIndexes);
 						// Compacting content shifts retained SendToUser text left —
 						// remap buffered event indices so flush matches the final message.
 						const oldToNew = new Map<number, number>();
@@ -1730,19 +2123,20 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 							}
 							attemptEventBuffer = remappedEvents;
 						}
-						for (const promoted of promotedCalls) {
+						for (const promoted of promotedList) {
 							upsertTool({
 								toolCallId: `call_json_${crypto.randomUUID()}`,
 								toolName: promoted.name,
 								args: JSON.stringify(promoted.arguments),
 								isComplete: true,
 							});
-							logger.info("grokbot: promoted JSON-as-text tool call", {
-								toolName: promoted.name,
-								wireMode: anthropicWire.wireMode,
-								routedResponseModel: routedResponseModel || undefined,
-							});
 						}
+						logger.info("grokbot: promoted JSON-as-text tool call", {
+							toolName: promotedList.map(p => p.name).join(","),
+							toolCount: promotedList.length,
+							wireMode: anthropicWire.wireMode,
+							routedResponseModel: routedResponseModel || undefined,
+						});
 					}
 				}
 
@@ -1765,36 +2159,31 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 					// cap is enough for native bash/read/write to appear.
 					if (!emptyToolRetryUsed && tools.length > 0) {
 						emptyToolRetryUsed = true;
+						const retryWire = model.sandEmptyToolsRetryWire;
 						if (
-							identity.class === "gemini" &&
+							retryWire &&
 							anthropicWire.wireMode !== "keep-model" &&
 							anthropicWire.wireMode !== "parent-chat" &&
 							anthropicWire.wireMode !== "automation"
 						) {
-							geminiProductRetryUsed = true;
+							emptyToolsRetryWire = retryWire;
 						}
 						discardAttemptEvents();
 						clearAbandonedAttemptMetadata();
 						output.content = [];
-						output.usage = {
-							input: 0,
-							output: 0,
-							cacheRead: 0,
-							cacheWrite: 0,
-							totalTokens: 0,
-							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-						};
+						resetUsageForToolRetry();
 						output.stopReason = "stop";
 						logger.info("grokbot: retrying empty tool turn", {
 							modelId: model.id,
 							class: identity.class,
-							geminiProductRetry: geminiProductRetryUsed,
+							emptyToolsRetryWire,
 						});
 						continue attempt;
 					}
-					// Some Gemini turns empty-stop after Write. Only accept that
-					// documented workaround — not empty stops after bash/read/etc.
-					if (identity.class === "gemini" && contextEndsWithWriteToolResult(context)) {
+					// Some Sand Gemini turns empty-stop after Write. Only accept that
+					// documented workaround when catalog opts in — not empty stops
+					// after bash/read/etc., and not every Gemini-class route.
+					if (model.sandAcceptEmptyWriteFollowup === true && contextEndsWithWriteToolResult(context)) {
 						logger.info("grokbot: accepting empty follow-up after Write tool result", {
 							modelId: model.id,
 							class: identity.class,
@@ -1821,6 +2210,9 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 			}
 			output.duration = Math.round(performance.now() - startTime);
 			if (firstTokenTime !== undefined) output.ttft = firstTokenTime - startTime;
+			if (abandonedAttemptUsage) {
+				output.usage = addAbandonedUsage(abandonedAttemptUsage, output.usage);
+			}
 			calculateCost(model, output.usage);
 			logger.debug("grokbot: stream done", {
 				stopReason: output.stopReason,
@@ -1850,6 +2242,12 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 			output.errorMessage = result.message;
 			output.duration = Math.round(performance.now() - startTime);
 			if (firstTokenTime !== undefined) output.ttft = firstTokenTime - startTime;
+			// Retry setup resets usage; restore tokens from abandoned empty/incomplete
+			// attempts so error messages still report the full spend.
+			if (abandonedAttemptUsage) {
+				output.usage = addAbandonedUsage(abandonedAttemptUsage, output.usage);
+			}
+			calculateCost(model, output.usage);
 			const httpMatch = /HTTP (\d{3})/.exec(output.errorMessage);
 			if (httpMatch && output.errorStatus === undefined) {
 				output.errorStatus = Number(httpMatch[1]);

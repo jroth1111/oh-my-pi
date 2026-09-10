@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { expandDefaultRoleModelSelector } from "../src/main";
 import { resolveCliRuntimeApiKeyProvider } from "../src/cli/runtime-api-key";
 
 describe("resolveCliRuntimeApiKeyProvider", () => {
@@ -66,5 +67,30 @@ describe("resolveCliRuntimeApiKeyProvider", () => {
 				models: ["grokbot/sand-default"],
 			}),
 		).toBeUndefined();
+	});
+
+	test("role aliases must be expanded before provider bind", () => {
+		// `--model @default` alone does not name a provider; binding --api-key for a
+		// credential-scoped default requires expandDefaultRoleModelSelector first
+		// (same widening resolveCredentialScopedRefreshTarget already applies).
+		expect(resolveCliRuntimeApiKeyProvider({ model: "@default" })).toBeUndefined();
+		const expanded = expandDefaultRoleModelSelector("@default", "grokbot/sand-default");
+		expect(expanded).toBe("grokbot/sand-default");
+		expect(resolveCliRuntimeApiKeyProvider({ model: expanded })).toBe("grokbot");
+	});
+
+	test("expands @smol and chained @default→@smol before provider bind", () => {
+		const settings = {
+			getModelRole: (role: string) => {
+				if (role === "smol") return "grokbot/sand-smol";
+				if (role === "default") return "@smol";
+				return undefined;
+			},
+		};
+		expect(expandDefaultRoleModelSelector("@smol", settings)).toBe("grokbot/sand-smol");
+		expect(expandDefaultRoleModelSelector("@default", settings)).toBe("grokbot/sand-smol");
+		expect(resolveCliRuntimeApiKeyProvider({ model: expandDefaultRoleModelSelector("@smol", settings) })).toBe(
+			"grokbot",
+		);
 	});
 });

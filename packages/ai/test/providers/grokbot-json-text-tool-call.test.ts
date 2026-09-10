@@ -2,12 +2,15 @@ import { afterEach, describe, expect, spyOn, test, vi } from "bun:test";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { streamGrokBot } from "../../src/providers/grokbot";
 import * as grokbotAuth from "../../src/providers/grokbot/auth";
+import { streamSimple } from "../../src/stream";
 import {
 	advertisedNamesForJsonTextToolCall,
 	assistantTextForJsonPromotion,
 	looksLikePromotableToolText,
 	parseGeminiInbandToolCall,
+	parseGeminiInbandToolCalls,
 	parseJsonTextToolCall,
+	promoteJsonTextToolCallsFromContent,
 	shouldHoldPromotableToolText,
 	shouldPromoteJsonTextToolCall,
 } from "../../src/providers/grokbot/json-text-tool-call";
@@ -30,7 +33,17 @@ describe("parseJsonTextToolCall", () => {
 	});
 
 	test("accepts bare JSON and omp bash name against product advertisements", () => {
-		expect(parseJsonTextToolCall('{"name":"bash","arguments":{"command":"echo hi"}}', ["Shell", "Read"])).toEqual({
+		// Owner aliases come from advertisedNamesForJsonTextToolCall — not a raw
+		// toSandField2Name fallback that would also revive collision losers.
+		const names = advertisedNamesForJsonTextToolCall(
+			[{ name: "Shell" }, { name: "Read" }],
+			[{ name: "bash" }, { name: "read" }],
+		);
+		expect(parseJsonTextToolCall('{"name":"bash","arguments":{"command":"echo hi"}}', names)).toEqual({
+			name: "bash",
+			arguments: { command: "echo hi" },
+		});
+		expect(parseJsonTextToolCall('{"name":"Shell","arguments":{"command":"echo hi"}}', names)).toEqual({
 			name: "Shell",
 			arguments: { command: "echo hi" },
 		});
@@ -71,6 +84,20 @@ describe("parseJsonTextToolCall", () => {
 		expect(parseGeminiInbandToolCall("just thinking about files", advertised)).toBeUndefined();
 	});
 
+	test("promotes every advertised call inside one tool_code fence", () => {
+		// Parallel default_api expressions must all become tool calls — returning
+		// only the first would drop sibling Shell/Read work from the fence.
+		expect(
+			parseGeminiInbandToolCalls(
+				'```tool_code\ndefault_api.bash(command="echo a")\ndefault_api.read(path="notes/a.txt")\n```',
+				["bash", "read", "Shell", "Read"],
+			),
+		).toEqual([
+			{ name: "bash", arguments: { command: "echo a" } },
+			{ name: "read", arguments: { path: "notes/a.txt" } },
+		]);
+	});
+
 	test("rejects prose that merely mentions a call-shaped expression", () => {
 		expect(
 			parseGeminiInbandToolCall('You can run bash(command="echo hi") to list files', ["bash", "Shell"]),
@@ -99,6 +126,163 @@ describe("parseJsonTextToolCall", () => {
 		).toBe('{"name":"bash","arguments":{"command":"echo hi"}}');
 	});
 
+	test("promoteJsonTextToolCallsFromContent tries blocks before joining reasoning prose", () => {
+		const advertised = new Set(["Shell", "bash"]);
+		const promoted = promoteJsonTextToolCallsFromContent(
+			[
+				{ type: "thinking", thinking: "I should run a shell command next." },
+				{ type: "text", text: '{"name":"Shell","arguments":{"command":"echo hi"}}' },
+			],
+			advertised,
+		);
+		expect(promoted.calls).toEqual([{ name: "Shell", arguments: { command: "echo hi" } }]);
+		expect(promoted.sourceIndexes).toEqual([1]);
+		// Combined candidate would start with prose and fail — individual text wins.
+		expect(
+			parseJsonTextToolCall(
+				assistantTextForJsonPromotion([
+					{ type: "thinking", thinking: "I should run a shell command next." },
+					{ type: "text", text: '{"name":"Shell","arguments":{"command":"echo hi"}}' },
+				]),
+				advertised,
+			),
+		).toBeUndefined();
+	});
+
+	test("promoteJsonTextToolCallsFromContent still promotes thought-only JSON via fallback", () => {
+		const advertised = new Set(["bash"]);
+		expect(
+			promoteJsonTextToolCallsFromContent(
+				[{ type: "thinking", thinking: '{"name":"bash","arguments":{"command":"echo hi"}}' }],
+				advertised,
+			),
+		).toEqual({
+			calls: [{ name: "bash", arguments: { command: "echo hi" } }],
+			sourceIndexes: [0],
+		});
+	});
+
+	test("promoteJsonTextToolCallsFromContent accumulates calls across multiple blocks", () => {
+		const advertised = new Set(["Shell", "Read"]);
+		expect(
+			promoteJsonTextToolCallsFromContent(
+				[
+					{ type: "thinking", thinking: "I'll read then shell." },
+					{ type: "text", text: '{"name":"Read","arguments":{"path":"a.ts"}}' },
+					{ type: "text", text: '{"name":"Shell","arguments":{"command":"echo hi"}}' },
+				],
+				advertised,
+			),
+		).toEqual({
+			calls: [
+				{ name: "Read", arguments: { path: "a.ts" } },
+				{ name: "Shell", arguments: { command: "echo hi" } },
+			],
+			sourceIndexes: [1, 2],
+		});
+	});
+
+	test("promoteJsonTextToolCallsFromContent prefers text over matching thinking duplicates", () => {
+		const advertised = new Set(["Shell", "Write"]);
+		const shell = '{"name":"Shell","arguments":{"command":"echo once"}}';
+		const promoted = promoteJsonTextToolCallsFromContent(
+			[
+				{ type: "thinking", thinking: shell },
+				{ type: "text", text: shell },
+			],
+			advertised,
+		);
+		// One intended action mirrored in thinking + text must not become two tool calls.
+		expect(promoted.calls).toEqual([{ name: "Shell", arguments: { command: "echo once" } }]);
+		expect(promoted.sourceIndexes).toEqual([0, 1]);
+	});
+
+	test("promoteJsonTextToolCallsFromContent dedupes thinking/text when argument key order differs", () => {
+		const advertised = new Set(["Write"]);
+		const thinking = '{"name":"Write","arguments":{"path":"a","content":"x"}}';
+		const textDump = '{"name":"Write","arguments":{"content":"x","path":"a"}}';
+		const promoted = promoteJsonTextToolCallsFromContent(
+			[
+				{ type: "thinking", thinking },
+				{ type: "text", text: textDump },
+			],
+			advertised,
+		);
+		expect(promoted.calls).toEqual([{ name: "Write", arguments: { content: "x", path: "a" } }]);
+		expect(promoted.sourceIndexes).toEqual([0, 1]);
+	});
+
+	test("promoteJsonTextToolCallsFromContent dedupes Shell/bash aliases across thinking and text", () => {
+		// Product-wire text dump + Gemini in-band thinking alias must promote once.
+		const advertised = advertisedNamesForJsonTextToolCall([{ name: "Shell" }], [{ name: "bash" }]);
+		expect(advertised.has("Shell")).toBe(true);
+		expect(advertised.has("bash")).toBe(true);
+		const promoted = promoteJsonTextToolCallsFromContent(
+			[
+				{ type: "thinking", thinking: 'default_api.bash(command="echo once")' },
+				{ type: "text", text: '{"name":"Shell","arguments":{"command":"echo once"}}' },
+			],
+			advertised,
+		);
+		expect(promoted.calls).toEqual([{ name: "Shell", arguments: { command: "echo once" } }]);
+		expect(promoted.sourceIndexes).toEqual([0, 1]);
+	});
+
+	test("promoteJsonTextToolCallsFromContent dedupes custom Write owner aliases across thinking and text", () => {
+		const ompTools = [{ name: "save", customWireName: "Write" }];
+		const advertised = advertisedNamesForJsonTextToolCall([{ name: "Write" }], ompTools);
+		expect(advertised.has("Write")).toBe(true);
+		expect(advertised.has("save")).toBe(true);
+		expect(advertised.has("write")).toBe(false);
+		const promoted = promoteJsonTextToolCallsFromContent(
+			[
+				{ type: "thinking", thinking: 'default_api.save(path="a.ts", content="x")' },
+				{ type: "text", text: '{"name":"Write","arguments":{"path":"a.ts","content":"x"}}' },
+			],
+			advertised,
+			undefined,
+			ompTools,
+		);
+		expect(promoted.calls).toEqual([{ name: "Write", arguments: { path: "a.ts", content: "x" } }]);
+		expect(promoted.sourceIndexes).toEqual([0, 1]);
+	});
+
+	test("promoteJsonTextToolCallsFromContent keeps native custom-wire Shell distinct from bash", () => {
+		// Native wire advertises Shell (extension customWireName) and bash as two tools.
+		// Product-style Shell→bash collapse would suppress one of two real invocations.
+		const ompTools = [{ name: "extension_shell", customWireName: "Shell" }, { name: "bash" }];
+		const advertised = advertisedNamesForJsonTextToolCall([{ name: "Shell" }, { name: "bash" }], ompTools);
+		const promoted = promoteJsonTextToolCallsFromContent(
+			[
+				{ type: "thinking", thinking: '{"name":"Shell","arguments":{"command":"echo ext"}}' },
+				{ type: "text", text: '{"name":"bash","arguments":{"command":"echo ext"}}' },
+			],
+			advertised,
+			undefined,
+			ompTools,
+		);
+		expect(promoted.calls).toEqual([
+			{ name: "Shell", arguments: { command: "echo ext" } },
+			{ name: "bash", arguments: { command: "echo ext" } },
+		]);
+	});
+
+	test("promoteJsonTextToolCallsFromContent keeps distinct thinking calls alongside text", () => {
+		const advertised = new Set(["Shell", "Write"]);
+		const promoted = promoteJsonTextToolCallsFromContent(
+			[
+				{ type: "thinking", thinking: '{"name":"Write","arguments":{"path":"a.ts","contents":"x"}}' },
+				{ type: "text", text: '{"name":"Shell","arguments":{"command":"echo hi"}}' },
+			],
+			advertised,
+		);
+		expect(promoted.calls).toEqual([
+			{ name: "Write", arguments: { path: "a.ts", contents: "x" } },
+			{ name: "Shell", arguments: { command: "echo hi" } },
+		]);
+		expect(promoted.sourceIndexes).toEqual([0, 1]);
+	});
+
 	test("advertisedNamesForJsonTextToolCall aliases only from advertised wire tools", () => {
 		const names = advertisedNamesForJsonTextToolCall(
 			[{ name: "Shell" }, { name: "Write" }],
@@ -112,6 +296,63 @@ describe("parseJsonTextToolCall", () => {
 		expect(names.has("edit")).toBe(false);
 		expect(names.has("read")).toBe(false);
 		expect(names.has("Read")).toBe(false);
+	});
+
+	test("advertisedNamesForJsonTextToolCall aliases the surviving custom Shell owner, not bash", () => {
+		const names = advertisedNamesForJsonTextToolCall(
+			[{ name: "Shell" }],
+			[{ name: "customThing", customWireName: "Shell" }],
+		);
+		expect(names.has("Shell")).toBe(true);
+		expect(names.has("customThing")).toBe(true);
+		expect(names.has("bash")).toBe(false);
+	});
+
+	test("advertisedNamesForJsonTextToolCall does not invent Shell for native bash wire", () => {
+		// Catalog-opted native rows advertise bash/read/write. Inventing Shell would
+		// let JSON promotion accept a name upsertTool cannot resolve on the native index.
+		const names = advertisedNamesForJsonTextToolCall(
+			[{ name: "bash" }, { name: "read" }, { name: "write" }],
+			[{ name: "bash" }, { name: "read" }, { name: "write" }],
+		);
+		expect(names.has("bash")).toBe(true);
+		expect(names.has("read")).toBe(true);
+		expect(names.has("write")).toBe(true);
+		expect(names.has("Shell")).toBe(false);
+		expect(names.has("Read")).toBe(false);
+		expect(names.has("Write")).toBe(false);
+		expect(parseJsonTextToolCall('{"name":"Shell","arguments":{"command":"echo hi"}}', names)).toBeUndefined();
+		expect(parseJsonTextToolCall('{"name":"bash","arguments":{"command":"echo hi"}}', names)).toEqual({
+			name: "bash",
+			arguments: { command: "echo hi" },
+		});
+	});
+
+	test("parseJsonTextToolCall rejects collision-loser edit/bash when write/custom owns the wire slot", () => {
+		const writeOwns = advertisedNamesForJsonTextToolCall(
+			[{ name: "Write" }, { name: "Shell" }],
+			[{ name: "write" }, { name: "edit" }, { name: "bash" }],
+		);
+		expect(writeOwns.has("write")).toBe(true);
+		expect(writeOwns.has("edit")).toBe(false);
+		expect(parseJsonTextToolCall('{"name":"edit","arguments":{"path":"a.ts"}}', writeOwns)).toBeUndefined();
+		expect(parseJsonTextToolCall('{"name":"Write","arguments":{"path":"a.ts","content":"x"}}', writeOwns)).toEqual({
+			name: "Write",
+			arguments: { path: "a.ts", content: "x" },
+		});
+		// Extension owns Shell (bash not among omp tools) — raw "bash" must not
+		// promote via toSandField2Name fallback onto the extension slot.
+		const customShell = advertisedNamesForJsonTextToolCall(
+			[{ name: "Shell" }],
+			[{ name: "customThing", customWireName: "Shell" }],
+		);
+		expect(customShell.has("bash")).toBe(false);
+		expect(customShell.has("customThing")).toBe(true);
+		expect(parseJsonTextToolCall('{"name":"bash","arguments":{"command":"echo hi"}}', customShell)).toBeUndefined();
+		expect(parseJsonTextToolCall('{"name":"customThing","arguments":{"command":"echo hi"}}', customShell)).toEqual({
+			name: "customThing",
+			arguments: { command: "echo hi" },
+		});
 	});
 
 	test("advertisedNamesForJsonTextToolCall falls back to omp tools when wire tools absent", () => {
@@ -209,47 +450,6 @@ describe("streamGrokBot JSON-as-text promotion", () => {
 			"bash",
 		]);
 	});
-	test("mirrored thinking and text invoke bash once while preserving surrounding prose", async () => {
-		spyOn(grokbotAuth, "loadGrokbotConfig").mockResolvedValue({
-			renewal: "renew",
-			machineId: "machine",
-			namespace: "prod",
-			clientVersion: "0.30.0",
-		});
-		spyOn(grokbotAuth, "mintGrokbotAccessToken").mockResolvedValue("fake-jwt");
-		const frames = [
-			encodeInferenceStreamResponse({ textPart: { text: "Running the requested check.", isFinal: true } }),
-			encodeInferenceStreamResponse({
-				thinkingPart: { text: '{"name":"Shell","arguments":{"command":"echo once","timeout":5}}', isFinal: true },
-			}),
-			encodeInferenceStreamResponse({
-				textPart: { text: '{"name":"bash","arguments":{"timeout":5,"command":"echo once"}}', isFinal: true },
-			}),
-		].map(frame => frameConnectProto(frame));
-		const stream = streamGrokBot(
-			model,
-			{
-				messages: [{ role: "user", content: "run check", timestamp: 0 }],
-				tools: [bashTool],
-			},
-			{
-				apiKey: "renew",
-				fetch: async () => connectBody(...frames, frameConnectProto(Buffer.alloc(0), CONNECT_END_STREAM_FLAG)),
-			},
-		);
-		const events = [];
-		for await (const event of stream) events.push(event);
-		const result = await stream.result();
-		expect(result.stopReason).toBe("toolUse");
-		expect(result.content.filter(block => block.type === "toolCall")).toEqual([
-			expect.objectContaining({ name: "bash", arguments: { command: "echo once", timeout: 5 } }),
-		]);
-		expect(result.content.filter(block => block.type === "text")).toEqual([
-			{ type: "text", text: "Running the requested check." },
-		]);
-		expect(events.filter(event => event.type === "toolcall_end")).toHaveLength(1);
-	});
-
 	test("automation wire fenced Shell JSON becomes a bash toolCall (matrix no-tool-call regression)", async () => {
 		spyOn(grokbotAuth, "loadGrokbotConfig").mockResolvedValue({
 			renewal: "renew",
@@ -408,6 +608,11 @@ describe("streamGrokBot JSON-as-text promotion", () => {
 					responseInfo: { id: "abandoned-resp", model: "abandoned-model" },
 				}),
 			),
+			frameConnectProto(
+				encodeInferenceStreamResponse({
+					usage: { promptTokens: 11, completionTokens: 7, totalTokens: 18 },
+				}),
+			),
 			frameConnectProto(Buffer.alloc(0), CONNECT_END_STREAM_FLAG),
 		]);
 		const toolCall = Buffer.concat([
@@ -419,6 +624,11 @@ describe("streamGrokBot JSON-as-text promotion", () => {
 						args: '{"command":"echo retried"}',
 						isComplete: true,
 					},
+				}),
+			),
+			frameConnectProto(
+				encodeInferenceStreamResponse({
+					usage: { promptTokens: 20, completionTokens: 5, totalTokens: 25 },
 				}),
 			),
 			frameConnectProto(Buffer.alloc(0), CONNECT_END_STREAM_FLAG),
@@ -462,6 +672,442 @@ describe("streamGrokBot JSON-as-text promotion", () => {
 		// Abandoned first-attempt responseInfo must not stick on the accepted retry.
 		expect(result.responseId).toBeUndefined();
 		expect(result.upstreamModel).toBeUndefined();
+		// Abandoned attempt usage is preserved and added to the successful attempt.
+		expect(result.usage.input).toBe(31);
+		expect(result.usage.output).toBe(12);
+		expect(result.usage.totalTokens).toBe(43);
+	});
+
+	test("merges abandoned attempt usage into the error when the empty-tool retry fails", async () => {
+		spyOn(grokbotAuth, "loadGrokbotConfig").mockResolvedValue({
+			renewal: "renew",
+			machineId: "machine",
+			namespace: "prod",
+			clientVersion: "0.30.0",
+		});
+		spyOn(grokbotAuth, "mintGrokbotAccessToken").mockResolvedValue("fake-jwt");
+
+		const thinkingOnly = Buffer.concat([
+			frameConnectProto(
+				encodeInferenceStreamResponse({
+					thinkingPart: { text: "planning", isFinal: true },
+				}),
+			),
+			frameConnectProto(
+				encodeInferenceStreamResponse({
+					usage: { promptTokens: 11, completionTokens: 7, totalTokens: 18 },
+				}),
+			),
+			frameConnectProto(Buffer.alloc(0), CONNECT_END_STREAM_FLAG),
+		]);
+		const err = Buffer.concat([
+			frameConnectProto(
+				encodeInferenceStreamResponse({
+					error: { errorType: 7 },
+				}),
+			),
+			frameConnectProto(Buffer.alloc(0), CONNECT_END_STREAM_FLAG),
+		]);
+		let calls = 0;
+		const fetchImpl = (async () => {
+			calls += 1;
+			return connectBody(...(calls === 1 ? [thinkingOnly] : [err]));
+		}) as FetchImpl;
+		const gemini = buildModel({
+			id: "gemini-3-flash",
+			name: "gemini-3-flash",
+			api: "grokbot-sand",
+			provider: "grokbot",
+			baseUrl: "https://api2.cursor.sh",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 100_000,
+			maxTokens: 512,
+			sandEmptyToolsRetryWire: "keep-model",
+		});
+		const context: Context = {
+			messages: [{ role: "user", content: "Use bash", timestamp: 1 }],
+			tools: [bashTool],
+		};
+
+		const result = await streamGrokBot(gemini as Model<"grokbot-sand">, context, {
+			apiKey: "renew",
+			fetch: fetchImpl,
+			maxTokens: 512,
+		}).result();
+		expect(calls).toBe(2);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toMatch(/errorType=7/);
+		// Abandoned first-attempt usage must survive onto the error message after retry reset.
+		expect(result.usage.input).toBe(11);
+		expect(result.usage.output).toBe(7);
+		expect(result.usage.totalTokens).toBe(18);
+	});
+
+	test("buffers a later promotable JSON block after ordinary prose already went live", async () => {
+		spyOn(grokbotAuth, "loadGrokbotConfig").mockResolvedValue({
+			renewal: "renew",
+			machineId: "machine",
+			namespace: "prod",
+			clientVersion: "0.30.0",
+		});
+		spyOn(grokbotAuth, "mintGrokbotAccessToken").mockResolvedValue("fake-jwt");
+
+		const prose = frameConnectProto(
+			encodeInferenceStreamResponse({ textPart: { text: "Looking into it.", isFinal: true } }),
+		);
+		const fenced = '```json\n{"name":"Shell","arguments":{"command":"echo tools-pong-after-prose"}}\n```';
+		const dump = frameConnectProto(encodeInferenceStreamResponse({ textPart: { text: fenced, isFinal: true } }));
+		const trailer = frameConnectProto(Buffer.alloc(0), CONNECT_END_STREAM_FLAG);
+		const fetchImpl = (async () => connectBody(prose, dump, trailer)) as FetchImpl;
+		const context: Context = {
+			messages: [{ role: "user", content: "Use the Shell tool", timestamp: 1 }],
+			tools: [bashTool],
+		};
+
+		const stream = streamGrokBot(model, context, { apiKey: "renew", fetch: fetchImpl });
+		const textDeltas: string[] = [];
+		for await (const event of stream) {
+			if (event.type === "text_delta") textDeltas.push(event.delta);
+		}
+		const result = await stream.result();
+		expect(result.stopReason).toBe("toolUse");
+		expect(result.content).toEqual([
+			expect.objectContaining({ type: "text", text: "Looking into it." }),
+			expect.objectContaining({
+				type: "toolCall",
+				name: "bash",
+				arguments: { command: "echo tools-pong-after-prose" },
+			}),
+		]);
+		// Prose streams live and stays on the final message; only the JSON dump is dropped.
+		expect(textDeltas.join("")).toBe("Looking into it.");
+		expect(textDeltas.join("")).not.toContain("tools-pong-after-prose");
+	});
+
+	test("toolChoice none omits tools even when context.tools is retained", async () => {
+		// Handoff keeps live tools for prompt-cache reuse while forcing toolChoice none.
+		spyOn(grokbotAuth, "loadGrokbotConfig").mockResolvedValue({
+			renewal: "renew",
+			machineId: "machine",
+			namespace: "prod",
+			clientVersion: "0.30.0",
+		});
+		spyOn(grokbotAuth, "mintGrokbotAccessToken").mockResolvedValue("fake-jwt");
+		const text = Buffer.concat([
+			frameConnectProto(encodeInferenceStreamResponse({ textPart: { text: "handoff", isFinal: true } })),
+			frameConnectProto(Buffer.alloc(0), CONNECT_END_STREAM_FLAG),
+		]);
+		let advertised: unknown;
+		const fetchImpl = (async () => connectBody(...[text])) as FetchImpl;
+		const model = buildModel({
+			id: "grok-4.6",
+			name: "grok-4.6",
+			api: "grokbot-sand",
+			provider: "grokbot",
+			baseUrl: "https://api2.cursor.sh",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 100_000,
+			maxTokens: 512,
+		});
+		const result = await streamGrokBot(
+			model as Model<"grokbot-sand">,
+			{
+				messages: [{ role: "user", content: "Summarize", timestamp: 1 }],
+				tools: [bashTool],
+			},
+			{
+				apiKey: "renew",
+				fetch: fetchImpl,
+				toolChoice: "none",
+				onPayload: body => {
+					advertised = (body as { tools?: unknown }).tools;
+					return body;
+				},
+			},
+		).result();
+		expect(result.stopReason).toBe("stop");
+		expect(advertised).toEqual([]);
+		expect(result.content.some(b => b.type === "toolCall")).toBe(false);
+	});
+
+	test("toolChoice none does not promote fenced Shell despite retained context.tools", async () => {
+		// body.tools is [] under toolChoice none, but advertisedNamesForJsonTextToolCall
+		// falls back to context.tools — promotion must still be skipped so handoff
+		// cannot dispatch Shell/Write.
+		spyOn(grokbotAuth, "loadGrokbotConfig").mockResolvedValue({
+			renewal: "renew",
+			machineId: "machine",
+			namespace: "prod",
+			clientVersion: "0.30.0",
+		});
+		spyOn(grokbotAuth, "mintGrokbotAccessToken").mockResolvedValue("fake-jwt");
+		const fenced = '```json\n{"name":"Shell","arguments":{"command":"echo tools-pong-none"}}\n```';
+		const text = frameConnectProto(encodeInferenceStreamResponse({ textPart: { text: fenced, isFinal: true } }));
+		const trailer = frameConnectProto(Buffer.alloc(0), CONNECT_END_STREAM_FLAG);
+		const fetchImpl = (async () => connectBody(text, trailer)) as FetchImpl;
+		const promoteModel = buildModel({
+			id: "sand-automation",
+			name: "sand-automation",
+			api: "grokbot-sand",
+			provider: "grokbot",
+			baseUrl: "https://api2.cursor.sh",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 100_000,
+			maxTokens: 8_000,
+			sandToolsWire: "automation",
+			sandParameterIds: [],
+			sandPromoteJsonTextTools: true,
+		});
+		const result = await streamGrokBot(
+			promoteModel as Model<"grokbot-sand">,
+			{
+				messages: [{ role: "user", content: "Summarize", timestamp: 1 }],
+				tools: [bashTool],
+			},
+			{ apiKey: "renew", fetch: fetchImpl, toolChoice: "none" },
+		).result();
+		expect(result.stopReason).toBe("stop");
+		expect(result.content.some(b => b.type === "toolCall")).toBe(false);
+		expect(result.content).toEqual([expect.objectContaining({ type: "text", text: fenced })]);
+	});
+
+	test("streamSimple forwards toolChoice none into Grok Bot provider options", async () => {
+		// Handoff / generateHandoffFromContext go through streamSimple → mapOptionsForApi;
+		// dropping toolChoice there left the provider advertising live tools.
+		spyOn(grokbotAuth, "loadGrokbotConfig").mockResolvedValue({
+			renewal: "renew",
+			machineId: "machine",
+			namespace: "prod",
+			clientVersion: "0.30.0",
+		});
+		spyOn(grokbotAuth, "mintGrokbotAccessToken").mockResolvedValue("fake-jwt");
+		const text = Buffer.concat([
+			frameConnectProto(encodeInferenceStreamResponse({ textPart: { text: "handoff", isFinal: true } })),
+			frameConnectProto(Buffer.alloc(0), CONNECT_END_STREAM_FLAG),
+		]);
+		let advertised: unknown;
+		const fetchImpl = (async () => connectBody(...[text])) as FetchImpl;
+		const model = buildModel({
+			id: "grok-4.6",
+			name: "grok-4.6",
+			api: "grokbot-sand",
+			provider: "grokbot",
+			baseUrl: "https://api2.cursor.sh",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 100_000,
+			maxTokens: 512,
+		});
+		const result = await streamSimple(
+			model as Model<"grokbot-sand">,
+			{
+				messages: [{ role: "user", content: "Summarize", timestamp: 1 }],
+				tools: [bashTool],
+			},
+			{
+				apiKey: "renew",
+				fetch: fetchImpl,
+				toolChoice: "none",
+				onPayload: body => {
+					advertised = (body as { tools?: unknown }).tools;
+					return body;
+				},
+			},
+		).result();
+		expect(result.stopReason).toBe("stop");
+		expect(advertised).toEqual([]);
+		expect(result.content.some(b => b.type === "toolCall")).toBe(false);
+	});
+
+	test("rejects unsupported required toolChoice (no sand wire field)", async () => {
+		spyOn(grokbotAuth, "loadGrokbotConfig").mockResolvedValue({
+			renewal: "renew",
+			machineId: "machine",
+			namespace: "prod",
+			clientVersion: "0.30.0",
+		});
+		spyOn(grokbotAuth, "mintGrokbotAccessToken").mockResolvedValue("fake-jwt");
+		const model = buildModel({
+			id: "grok-4.6",
+			name: "grok-4.6",
+			api: "grokbot-sand",
+			provider: "grokbot",
+			baseUrl: "https://api2.cursor.sh",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 100_000,
+			maxTokens: 512,
+		});
+		const result = await streamGrokBot(
+			model as Model<"grokbot-sand">,
+			{
+				messages: [{ role: "user", content: "Extract", timestamp: 1 }],
+				tools: [bashTool],
+			},
+			{ apiKey: "renew", toolChoice: "required" },
+		).result();
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage ?? "").toMatch(/toolChoice "required"/);
+		expect(result.errorMessage ?? "").toMatch(/auto|none/);
+	});
+
+	test("empty-tool retry uses catalog sandEmptyToolsRetryWire keep-model product tools", async () => {
+		spyOn(grokbotAuth, "loadGrokbotConfig").mockResolvedValue({
+			renewal: "renew",
+			machineId: "machine",
+			namespace: "prod",
+			clientVersion: "0.30.0",
+		});
+		spyOn(grokbotAuth, "mintGrokbotAccessToken").mockResolvedValue("fake-jwt");
+
+		const thinkingOnly = Buffer.concat([
+			frameConnectProto(
+				encodeInferenceStreamResponse({
+					thinkingPart: { text: "planning", isFinal: true },
+				}),
+			),
+			frameConnectProto(Buffer.alloc(0), CONNECT_END_STREAM_FLAG),
+		]);
+		const toolCall = Buffer.concat([
+			frameConnectProto(
+				encodeInferenceStreamResponse({
+					toolCallPart: {
+						toolCallId: "c-retry",
+						toolName: "Shell",
+						args: '{"command":"echo retried"}',
+						isComplete: true,
+					},
+				}),
+			),
+			frameConnectProto(Buffer.alloc(0), CONNECT_END_STREAM_FLAG),
+		]);
+		const toolNameSnapshots: string[][] = [];
+		let calls = 0;
+		const fetchImpl = (async () => {
+			calls += 1;
+			return connectBody(...(calls === 1 ? [thinkingOnly] : [toolCall]));
+		}) as FetchImpl;
+		const gemini = buildModel({
+			id: "gemini-3-flash",
+			name: "gemini-3-flash",
+			api: "grokbot-sand",
+			provider: "grokbot",
+			baseUrl: "https://api2.cursor.sh",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 100_000,
+			maxTokens: 512,
+			// Catalog fact (also applied via KDL for gemini-*); set explicitly so the
+			// contract does not depend on class === "gemini" in the streamer.
+			sandEmptyToolsRetryWire: "keep-model",
+		});
+		expect(gemini.sandEmptyToolsRetryWire).toBe("keep-model");
+		const result = await streamGrokBot(
+			gemini as Model<"grokbot-sand">,
+			{
+				messages: [{ role: "user", content: "Use bash", timestamp: 1 }],
+				tools: [bashTool],
+			},
+			{
+				apiKey: "renew",
+				fetch: fetchImpl,
+				maxTokens: 512,
+				onPayload: body => {
+					const tools = (body as { tools?: Array<{ name?: string }> }).tools ?? [];
+					toolNameSnapshots.push(tools.map(t => String(t.name ?? "")));
+					return body;
+				},
+			},
+		).result();
+		expect(calls).toBe(2);
+		expect(toolNameSnapshots).toHaveLength(2);
+		expect(toolNameSnapshots[0]).toContain("bash");
+		expect(toolNameSnapshots[0]).not.toContain("Shell");
+		expect(toolNameSnapshots[1]).toContain("Shell");
+		expect(result.stopReason).toBe("toolUse");
+	});
+
+	test("empty-tool retry without sandEmptyToolsRetryWire keeps the original tool wire", async () => {
+		spyOn(grokbotAuth, "loadGrokbotConfig").mockResolvedValue({
+			renewal: "renew",
+			machineId: "machine",
+			namespace: "prod",
+			clientVersion: "0.30.0",
+		});
+		spyOn(grokbotAuth, "mintGrokbotAccessToken").mockResolvedValue("fake-jwt");
+
+		const thinkingOnly = Buffer.concat([
+			frameConnectProto(
+				encodeInferenceStreamResponse({
+					thinkingPart: { text: "planning", isFinal: true },
+				}),
+			),
+			frameConnectProto(Buffer.alloc(0), CONNECT_END_STREAM_FLAG),
+		]);
+		const toolCall = Buffer.concat([
+			frameConnectProto(
+				encodeInferenceStreamResponse({
+					toolCallPart: {
+						toolCallId: "c-retry",
+						toolName: "bash",
+						args: '{"command":"echo retried"}',
+						isComplete: true,
+					},
+				}),
+			),
+			frameConnectProto(Buffer.alloc(0), CONNECT_END_STREAM_FLAG),
+		]);
+		const toolNameSnapshots: string[][] = [];
+		let calls = 0;
+		const fetchImpl = (async () => {
+			calls += 1;
+			return connectBody(...(calls === 1 ? [thinkingOnly] : [toolCall]));
+		}) as FetchImpl;
+		// Non-Gemini row with no catalog retry wire — must not invent keep-model.
+		const model = buildModel({
+			id: "grok-4.6",
+			name: "grok-4.6",
+			api: "grokbot-sand",
+			provider: "grokbot",
+			baseUrl: "https://api2.cursor.sh",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 100_000,
+			maxTokens: 512,
+		});
+		expect(model.sandEmptyToolsRetryWire).toBeUndefined();
+		await streamGrokBot(
+			model as Model<"grokbot-sand">,
+			{
+				messages: [{ role: "user", content: "Use bash", timestamp: 1 }],
+				tools: [bashTool],
+			},
+			{
+				apiKey: "renew",
+				fetch: fetchImpl,
+				maxTokens: 512,
+				onPayload: body => {
+					const tools = (body as { tools?: Array<{ name?: string }> }).tools ?? [];
+					toolNameSnapshots.push(tools.map(t => String(t.name ?? "")));
+					return body;
+				},
+			},
+		).result();
+		expect(calls).toBe(2);
+		expect(toolNameSnapshots).toHaveLength(2);
+		expect(toolNameSnapshots[0]).toEqual(toolNameSnapshots[1]);
+		expect(toolNameSnapshots[0]).toContain("bash");
+		expect(toolNameSnapshots[0]).not.toContain("Shell");
 	});
 
 	test("empty-tool retry clears effort defaults when forcing thinking off", async () => {
@@ -572,6 +1218,7 @@ describe("streamGrokBot JSON-as-text promotion", () => {
 			maxTokens: 512,
 			sandToolsWire: "keep-model",
 		});
+		expect(gemini.sandAcceptEmptyWriteFollowup).toBe(true);
 		const writeTool = {
 			name: "write",
 			description: "Write a file.",
@@ -718,6 +1365,198 @@ describe("streamGrokBot JSON-as-text promotion", () => {
 		expect(result.stopReason).toBe("stop");
 		expect(result.errorMessage).toBeUndefined();
 		expect(result.content.some(b => b.type === "toolCall")).toBe(false);
+	});
+
+	test("accepts empty follow-up after customWireName Write extension owner", async () => {
+		// Extension `{ name: "save", customWireName: "Write" }` must win Write ownership
+		// so empty Gemini follow-ups after that tool result are accepted.
+		spyOn(grokbotAuth, "loadGrokbotConfig").mockResolvedValue({
+			renewal: "renew",
+			machineId: "machine",
+			namespace: "prod",
+			clientVersion: "0.30.0",
+		});
+		spyOn(grokbotAuth, "mintGrokbotAccessToken").mockResolvedValue("fake-jwt");
+
+		const thinkingOnly = Buffer.concat([
+			frameConnectProto(
+				encodeInferenceStreamResponse({
+					thinkingPart: { text: "done writing", isFinal: true },
+				}),
+			),
+			frameConnectProto(Buffer.alloc(0), CONNECT_END_STREAM_FLAG),
+		]);
+		const fetchImpl = (async () => connectBody(thinkingOnly)) as FetchImpl;
+		const gemini = buildModel({
+			id: "gemini-3-flash",
+			name: "gemini-3-flash",
+			api: "grokbot-sand",
+			provider: "grokbot",
+			baseUrl: "https://api2.cursor.sh",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 100_000,
+			maxTokens: 512,
+			sandToolsWire: "keep-model",
+		});
+		expect(gemini.sandAcceptEmptyWriteFollowup).toBe(true);
+		const saveTool = {
+			name: "save",
+			description: "extension write",
+			customWireName: "Write",
+			parameters: {
+				type: "object",
+				properties: { path: { type: "string" }, content: { type: "string" } },
+				required: ["path", "content"],
+			},
+		} as Tool;
+		const context: Context = {
+			messages: [
+				{ role: "user", content: "Write ping to /tmp/x", timestamp: 1 },
+				{
+					role: "assistant",
+					content: [
+						{
+							type: "toolCall",
+							id: "w1",
+							name: "save",
+							arguments: { path: "/tmp/x", content: "ping" },
+						},
+					],
+					api: "grokbot-sand",
+					provider: "grokbot",
+					model: "gemini-3-flash",
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "toolUse",
+					timestamp: 1,
+				},
+				{
+					role: "toolResult",
+					toolCallId: "w1",
+					toolName: "save",
+					content: [{ type: "text", text: "ping" }],
+					isError: false,
+					timestamp: 2,
+				},
+			],
+			tools: [saveTool],
+		};
+
+		const result = await streamGrokBot(gemini as Model<"grokbot-sand">, context, {
+			apiKey: "renew",
+			fetch: fetchImpl,
+			maxTokens: 512,
+		}).result();
+		expect(result.stopReason).toBe("stop");
+		expect(result.errorMessage).toBeUndefined();
+		expect(result.content.some(b => b.type === "toolCall")).toBe(false);
+	});
+
+	test("rejects empty follow-up after edit when write owns the product-wire Write slot", async () => {
+		// Collision policy: write owns Write; historical edit results keep omp `edit`
+		// and must not trigger the empty Write follow-up workaround.
+		spyOn(grokbotAuth, "loadGrokbotConfig").mockResolvedValue({
+			renewal: "renew",
+			machineId: "machine",
+			namespace: "prod",
+			clientVersion: "0.30.0",
+		});
+		spyOn(grokbotAuth, "mintGrokbotAccessToken").mockResolvedValue("fake-jwt");
+
+		const thinkingOnly = Buffer.concat([
+			frameConnectProto(
+				encodeInferenceStreamResponse({
+					thinkingPart: { text: "done editing", isFinal: true },
+				}),
+			),
+			frameConnectProto(Buffer.alloc(0), CONNECT_END_STREAM_FLAG),
+		]);
+		const fetchImpl = (async () => connectBody(thinkingOnly)) as FetchImpl;
+		const gemini = buildModel({
+			id: "gemini-3-flash",
+			name: "gemini-3-flash",
+			api: "grokbot-sand",
+			provider: "grokbot",
+			baseUrl: "https://api2.cursor.sh",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 100_000,
+			maxTokens: 512,
+			sandToolsWire: "keep-model",
+		});
+		const editTool = {
+			name: "edit",
+			description: "Edit a file.",
+			parameters: {
+				type: "object",
+				properties: { path: { type: "string" }, oldText: { type: "string" }, newText: { type: "string" } },
+				required: ["path", "oldText", "newText"],
+			},
+		} as Tool;
+		const writeTool = {
+			name: "write",
+			description: "Write a file.",
+			parameters: {
+				type: "object",
+				properties: { path: { type: "string" }, content: { type: "string" } },
+				required: ["path", "content"],
+			},
+		} as Tool;
+		const context: Context = {
+			messages: [
+				{ role: "user", content: "Edit /tmp/x", timestamp: 1 },
+				{
+					role: "assistant",
+					content: [
+						{
+							type: "toolCall",
+							id: "e1",
+							name: "edit",
+							arguments: { path: "/tmp/x", oldText: "a", newText: "b" },
+						},
+					],
+					api: "grokbot-sand",
+					provider: "grokbot",
+					model: "gemini-3-flash",
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "toolUse",
+					timestamp: 1,
+				},
+				{
+					role: "toolResult",
+					toolCallId: "e1",
+					toolName: "edit",
+					content: [{ type: "text", text: "ok" }],
+					isError: false,
+					timestamp: 2,
+				},
+			],
+			tools: [editTool, writeTool],
+		};
+
+		const result = await streamGrokBot(gemini as Model<"grokbot-sand">, context, {
+			apiKey: "renew",
+			fetch: fetchImpl,
+			maxTokens: 512,
+		}).result();
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage ?? "").toMatch(/no text or tool call/i);
 	});
 
 	test("rejects empty follow-up after a non-Write tool result", async () => {
@@ -1020,6 +1859,46 @@ describe("streamGrokBot JSON-as-text promotion", () => {
 		expect(result.errorMessage).toBeUndefined();
 	});
 
+	test("does not finalize provisional JSON tool calls after an output-token limit", async () => {
+		// Cumulative revisions prove a complete-looking JSON snapshot can still be
+		// provisional — salvaging isComplete:false after length flips stop to toolUse
+		// and can execute a truncated Shell/Write.
+		spyOn(grokbotAuth, "loadGrokbotConfig").mockResolvedValue({
+			renewal: "renew",
+			machineId: "machine",
+			namespace: "prod",
+			clientVersion: "0.30.0",
+		});
+		spyOn(grokbotAuth, "mintGrokbotAccessToken").mockResolvedValue("fake-jwt");
+
+		const provisional = frameConnectProto(
+			encodeInferenceStreamResponse({
+				toolCallPart: {
+					toolCallId: "c1",
+					toolName: "bash",
+					args: '{"command":"echo truncated"}',
+					isComplete: false,
+				},
+			}),
+		);
+		const limit = frameConnectProto(
+			encodeInferenceStreamResponse({
+				error: { isOutputTokenLimitError: true },
+			}),
+		);
+		const trailer = frameConnectProto(Buffer.alloc(0), CONNECT_END_STREAM_FLAG);
+		const fetchImpl = (async () => connectBody(provisional, limit, trailer)) as FetchImpl;
+		const context: Context = {
+			messages: [{ role: "user", content: "hi", timestamp: 1 }],
+			tools: [bashTool],
+		};
+
+		const result = await streamGrokBot(model, context, { apiKey: "renew", fetch: fetchImpl }).result();
+		expect(result.stopReason).toBe("length");
+		expect(result.content.some(b => b.type === "toolCall")).toBe(false);
+		expect(result.errorMessage).toBeUndefined();
+	});
+
 	test("throws when a stream error frame has only errorType", async () => {
 		spyOn(grokbotAuth, "loadGrokbotConfig").mockResolvedValue({
 			renewal: "renew",
@@ -1097,6 +1976,75 @@ describe("streamGrokBot JSON-as-text promotion", () => {
 		}).result();
 		expect(result.stopReason).toBe("stop");
 		expect(result.content).toEqual([expect.objectContaining({ type: "text", text: "hello-visible" })]);
+	});
+
+	test("replaces revised SendToUser content snapshots instead of appending", async () => {
+		// Cumulative args may revise content ("draft" → "answer") rather than extend
+		// it — appending the non-prefix snapshot produced "draftanswer".
+		spyOn(grokbotAuth, "loadGrokbotConfig").mockResolvedValue({
+			renewal: "renew",
+			machineId: "machine",
+			namespace: "prod",
+			clientVersion: "0.30.0",
+		});
+		spyOn(grokbotAuth, "mintGrokbotAccessToken").mockResolvedValue("fake-jwt");
+
+		const parent = buildModel({
+			id: "sand-default",
+			name: "sand-default",
+			api: "grokbot-sand",
+			provider: "grokbot",
+			baseUrl: "https://api2.cursor.sh",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 100_000,
+			maxTokens: 8_000,
+			sandToolsWire: "parent-chat",
+			sandParameterIds: [],
+		});
+		const draft = frameConnectProto(
+			encodeInferenceStreamResponse({
+				toolCallPart: {
+					toolCallId: "stu1",
+					toolName: "SendToUser",
+					args: '{"type":"text","content":"draft"}',
+					isComplete: false,
+				},
+			}),
+		);
+		const answer = frameConnectProto(
+			encodeInferenceStreamResponse({
+				toolCallPart: {
+					toolCallId: "stu1",
+					toolName: "SendToUser",
+					args: '{"type":"text","content":"answer"}',
+					isComplete: true,
+				},
+			}),
+		);
+		const trailer = frameConnectProto(Buffer.alloc(0), CONNECT_END_STREAM_FLAG);
+		const fetchImpl = (async () => connectBody(draft, answer, trailer)) as FetchImpl;
+		const context: Context = {
+			messages: [{ role: "user", content: "hi", timestamp: 1 }],
+			tools: [bashTool],
+		};
+
+		const stream = streamGrokBot(parent as Model<"grokbot-sand">, context, {
+			apiKey: "renew",
+			fetch: fetchImpl,
+		});
+		let textDeltas = "";
+		for await (const event of stream) {
+			if (event.type === "text_delta") textDeltas += event.delta;
+		}
+		const result = await stream.result();
+		expect(result.stopReason).toBe("stop");
+		expect(result.content).toEqual([expect.objectContaining({ type: "text", text: "answer" })]);
+		expect(result.content).not.toEqual([expect.objectContaining({ type: "text", text: "draftanswer" })]);
+		// Delta consumers must not see a published draft followed by an additive answer.
+		expect(textDeltas).toBe("answer");
+		expect(textDeltas).not.toContain("draft");
 	});
 
 	test("sequential SendToUser calls each emit full text independently", async () => {
@@ -1585,6 +2533,72 @@ describe("streamGrokBot JSON-as-text promotion", () => {
 				type: "toolCall",
 				name: "SendToUser",
 				arguments: { type: "text", content: "should-dispatch" },
+			}),
+		]);
+	});
+
+	test("internal SendToUser aliased away still treats wire SendToUser as synthetic text", async () => {
+		// Extension named SendToUser but advertised as Other does not own the
+		// injected parent-chat SendToUser slot — wire SendToUser must stay text.
+		spyOn(grokbotAuth, "loadGrokbotConfig").mockResolvedValue({
+			renewal: "renew",
+			machineId: "machine",
+			namespace: "prod",
+			clientVersion: "0.30.0",
+		});
+		spyOn(grokbotAuth, "mintGrokbotAccessToken").mockResolvedValue("fake-jwt");
+
+		const parent = buildModel({
+			id: "sand-default",
+			name: "sand-default",
+			api: "grokbot-sand",
+			provider: "grokbot",
+			baseUrl: "https://api2.cursor.sh",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 100_000,
+			maxTokens: 8_000,
+			sandToolsWire: "parent-chat",
+			sandParameterIds: [],
+		});
+		const aliasedAway = {
+			name: "SendToUser",
+			customWireName: "Other",
+			description: "extension other",
+			parameters: {
+				type: "object",
+				properties: {
+					payload: { type: "string" },
+				},
+			},
+		} as Tool;
+		const call = frameConnectProto(
+			encodeInferenceStreamResponse({
+				toolCallPart: {
+					toolCallId: "stu-syn",
+					toolName: "SendToUser",
+					args: '{"type":"text","content":"visible-not-extension"}',
+					isComplete: true,
+				},
+			}),
+		);
+		const trailer = frameConnectProto(Buffer.alloc(0), CONNECT_END_STREAM_FLAG);
+		const fetchImpl = (async () => connectBody(call, trailer)) as FetchImpl;
+		const context: Context = {
+			messages: [{ role: "user", content: "hi", timestamp: 1 }],
+			tools: [bashTool, aliasedAway],
+		};
+
+		const result = await streamGrokBot(parent as Model<"grokbot-sand">, context, {
+			apiKey: "renew",
+			fetch: fetchImpl,
+		}).result();
+		expect(result.stopReason).toBe("stop");
+		expect(result.content).toEqual([
+			expect.objectContaining({
+				type: "text",
+				text: "visible-not-extension",
 			}),
 		]);
 	});

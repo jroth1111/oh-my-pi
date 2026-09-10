@@ -42,8 +42,17 @@ export interface AxisDef {
 const OAI = ["openai", "openai-responses"] as const;
 const EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
 /** Reviewed Grok Bot Anthropic+tools auto wire profiles (routers). */
-const SAND_TOOLS_WIRES = ["parent-chat", "automation", "keep-model", "error", "sand-default-fallback"] as const;
+const SAND_TOOLS_WIRES = [
+	"parent-chat",
+	"automation",
+	"keep-model",
+	"error",
+	"native",
+	"sand-default-fallback",
+] as const;
 const SAND_WIRE_MODEL_ID_WHEN = ["tools"] as const;
+/** Native field-2 JSON Schema projection for Grok Bot sand InferenceService. */
+const SAND_NATIVE_TOOL_SCHEMAS = ["google", "strict"] as const;
 
 /** Effort tiers accepted by taxonomy collapse/override vocabulary (`Effort` ∪ `"off"`). */
 export const EFFORT_TIERS: readonly string[] = [...EFFORTS, "off"];
@@ -316,6 +325,17 @@ export const AXES: Readonly<Record<string, AxisDef>> = {
 		values: SAND_TOOLS_WIRES,
 	},
 	/**
+	 * On an empty first tool turn, replay once with this sand tools wire
+	 * (typically `keep-model` product Shell/Read/Write). KDL-owned per row —
+	 * do not infer from model class in TypeScript.
+	 */
+	"sand-empty-tools-retry-wire": {
+		key: "sandEmptyToolsRetryWire",
+		set: "catalog",
+		shape: "scalar",
+		values: SAND_TOOLS_WIRES,
+	},
+	/**
 	 * Reviewed Grok Bot requestedModel rewrite. Discovery/seeds keep the listed
 	 * AvailableModels id; the stream sends this bare wire id (same pattern as
 	 * Auto → sand-default). Used when a listed slug is a broken peer of a
@@ -339,6 +359,28 @@ export const AXES: Readonly<Record<string, AxisDef>> = {
 	 * instead of toolCallPart — native text responses stay text.
 	 */
 	"sand-promote-json-text-tools": { key: "sandPromoteJsonTextTools", set: "catalog", shape: "scalar" },
+	/**
+	 * Accept an empty stop after a Write tool result (no visible text). Sand
+	 * Gemini rows often empty-stop after Write; other classes must still error.
+	 */
+	"sand-accept-empty-write-followup": {
+		key: "sandAcceptEmptyWriteFollowup",
+		set: "catalog",
+		shape: "scalar",
+	},
+	/**
+	 * Native omp field-2 JSON Schema projection for Grok Bot sand.
+	 * `google` strips keywords Gemini backends reject; `strict` forces
+	 * `additionalProperties: false` for OpenAI-class sand rows. Unset keeps
+	 * the raw omp schema (grok/composer working path). Do not branch on model
+	 * class in TypeScript — declare the projection per row/class in KDL.
+	 */
+	"sand-native-tool-schema": {
+		key: "sandNativeToolSchema",
+		set: "catalog",
+		shape: "scalar",
+		values: SAND_NATIVE_TOOL_SCHEMAS,
+	},
 	/**
 	 * Reviewed reasoning capability. Applied as a correction so synthetic
 	 * discovery/seed rows can stay neutral (`reasoning: false`) while KDL

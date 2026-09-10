@@ -6,7 +6,12 @@
  * absent from the live list (`sand-default`, `sand-cua`, `sand-automation`).
  */
 import { Effort, THINKING_EFFORTS } from "../effort";
-import { GROKBOT_API, GROKBOT_BACKEND } from "../provider-models/grokbot";
+import {
+	GROKBOT_API,
+	GROKBOT_BACKEND,
+	GROKBOT_SAND_ROUTER_IDS,
+	type GrokbotSandRouterId,
+} from "../provider-models/grokbot";
 import type { FetchImpl, ModelSpec, ThinkingConfig } from "../types";
 import { discoveryFetch } from "../utils";
 import {
@@ -31,7 +36,7 @@ import {
 const COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } as const;
 
 /** Sand router slugs — not in AvailableModels; always unioned into the catalog. */
-export const GROKBOT_SAND_ROUTER_IDS = ["sand-default", "sand-cua", "sand-automation"] as const;
+export { GROKBOT_SAND_ROUTER_IDS };
 
 export interface GrokbotModelDiscoveryOptions {
 	/** Renewal credential (registry passes `GROKBOT_RENEWAL_CREDENTIAL`). */
@@ -72,15 +77,24 @@ export async function fetchGrokbotAvailableModels(
 		const overrideVer = options.clientVersion?.trim();
 		// Prefer the same resolved identity used for model-cache scoping so a
 		// catalog fetched under one namespace/version is never stored under another.
-		const cfg = {
-			...loaded,
-			namespace: overrideNs || loaded.namespace,
-			clientVersion: resolveGrokbotClientVersion(
-				overrideNs || loaded.namespace,
-				GROKBOT_STAMPED_CLIENT_VERSION,
-				overrideVer || loaded.explicitClientVersion,
-			),
-		};
+		// Namespace-only overrides must recompute clientVersion (lab → 0.30.0-lab)
+		// from the already-loaded config — do not call the sync identity helper
+		// (second secrets/grokbot.env read) after loadGrokbotConfig().
+		const cfg =
+			overrideNs || overrideVer
+				? (() => {
+						const namespace = overrideNs || loaded.namespace;
+						const clientVersion = resolveGrokbotClientVersion(
+							namespace,
+							GROKBOT_STAMPED_CLIENT_VERSION,
+							// Explicit request version wins; else keep a file/env
+							// explicitClientVersion from the async load; else recompute
+							// from the stamped base for the (possibly new) namespace.
+							overrideVer || loaded.explicitClientVersion,
+						);
+						return { ...loaded, namespace, clientVersion };
+					})()
+				: loaded;
 		const machineId = cfg.machineId;
 		if (!cfg.renewal || !machineId) {
 			return null;
@@ -165,7 +179,7 @@ export function normalizeGrokbotAvailableModels(
 	return [...byId.values()].sort((a, b) => a.id.localeCompare(b.id));
 }
 
-function buildSandRouterSpec(id: (typeof GROKBOT_SAND_ROUTER_IDS)[number], baseUrl: string): ModelSpec<"grokbot-sand"> {
+function buildSandRouterSpec(id: GrokbotSandRouterId, baseUrl: string): ModelSpec<"grokbot-sand"> {
 	return {
 		id,
 		name: `${id} (routed)`,
@@ -297,13 +311,13 @@ function toGrokbotModelSpec(row: GrokbotAvailableModel, baseUrl: string, id: str
 	const reasoning = row.supportsThinking === true || efforts.length > 0 || unrecognizedEffortOnly;
 	// Empty ladder marks authored non-reasoning (and unrecognized-only effort
 	// vocabularies) so preserve-authored-thinking can block KDL reasoning
-	// upgrades on live rows. Synthetic sand routers omit thinking and still
-	// receive reviewed KDL `reasoning` fills.
-	const isSandRouter = (GROKBOT_SAND_ROUTER_IDS as readonly string[]).includes(id);
+	// upgrades on live rows. Synthetic sand routers are built separately via
+	// `buildSandRouterSpec` (no empty ladder) so reviewed KDL `reasoning`
+	// fills still apply — do not special-case router ids here.
 	const thinking =
 		efforts.length > 0
 			? ({ mode: "effort", efforts } satisfies ThinkingConfig)
-			: unrecognizedEffortOnly || (!reasoning && !isSandRouter)
+			: unrecognizedEffortOnly || !reasoning
 				? ({ mode: "effort", efforts: [] } satisfies ThinkingConfig)
 				: undefined;
 	const variantLegacySlugs = (row.variants ?? [])

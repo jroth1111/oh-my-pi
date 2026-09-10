@@ -60,9 +60,10 @@ export function resolveAnthropicSandToolsWire(
 	if (raw !== "auto") return "error";
 
 	const toolCount = context?.toolCount ?? 0;
-	const modelId = context?.modelId?.trim() ?? "";
 	if (toolCount === 0) return "error";
-	if (isAnthropicSandModelId(modelId)) return "keep-model";
+	// Catalog `sand-tools-wire` wins — including Anthropic-class keep-model from
+	// providers/grokbot.kdl and any reviewed native/error override. Do not force
+	// keep-model from taxonomy class in TypeScript.
 	const catalogWire = context?.sandToolsWire;
 	if (
 		catalogWire === "parent-chat" ||
@@ -95,8 +96,6 @@ export type AnthropicSandToolWireInput = {
 	 * the wire keeps the router id.
 	 */
 	sandWireModelId?: string;
-	/** Catalog-owned projection for provider-rejected schema composition keywords. */
-	requiresCursorToolSchemaProjection?: boolean;
 };
 
 export type AnthropicSandToolWireResult = AnthropicSandToolWireInput & {
@@ -113,6 +112,24 @@ function productProfileForWire(wire: AnthropicSandToolsWire): ProductWireProfile
 	return undefined;
 }
 
+/**
+ * Catalog-owned non-Anthropic keep-model (e.g. gemini empty-tool retry) drops
+ * retry-disabled thinking/effort/fast parameters, but must keep routing flags
+ * and other advertised parameters (e.g. `context`) that
+ * `resolveGrokbotRequestedModel()` already selected.
+ */
+const KEEP_MODEL_RETRY_STRIPPED_PARAMS = new Set(["effort", "reasoning", "thinking", "fast"]);
+
+function keepModelRequestedModel(requested: GrokbotRequestedModel, anthropic: boolean): GrokbotRequestedModel {
+	if (anthropic) return requested;
+	const next: GrokbotRequestedModel = { modelId: requested.modelId };
+	if (requested.maxMode) next.maxMode = true;
+	if (requested.isVariantStringRepresentation) next.isVariantStringRepresentation = true;
+	const kept = requested.parameters?.filter(p => !KEEP_MODEL_RETRY_STRIPPED_PARAMS.has(p.id));
+	if (kept && kept.length > 0) next.parameters = kept;
+	return next;
+}
+
 function applyProductWire(
 	input: AnthropicSandToolWireInput,
 	profile: ProductWireProfile,
@@ -125,11 +142,7 @@ function applyProductWire(
 	},
 ): AnthropicSandToolWireResult {
 	const ompTools = (input.ompTools ?? input.tools) as Parameters<typeof toProductField2Tools>[0];
-	const productTools: ProductWireTool[] = toProductField2Tools(
-		ompTools,
-		profile,
-		input.requiresCursorToolSchemaProjection,
-	);
+	const productTools: ProductWireTool[] = toProductField2Tools(ompTools, profile);
 	return {
 		...input,
 		requestedModel: options.requestedModel,
@@ -160,7 +173,7 @@ export function applyAnthropicSandToolWire(
 		// non-Anthropic row onto product tools without rewriting requestedModel.
 		if (!anthropic && !catalogOwns) return input;
 		return applyProductWire(input, "automation", "keep-model", {
-			requestedModel: anthropic ? input.requestedModel : { modelId: input.requestedModel.modelId },
+			requestedModel: keepModelRequestedModel(input.requestedModel, anthropic),
 			originalModelId: modelId,
 		});
 	}

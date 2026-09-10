@@ -3,12 +3,6 @@
 // from neutral seeds instead of TypeScript per-id branches.
 
 provider "grokbot" {
-	// Anthropic rejects composed tool schemas added by product Read/Write aliases.
-	// Live Opus 5 medium: identical three-tool request fails 400 before projection,
-	// then emits a valid Shell call with the shared Cursor schema projection.
-	class "anthropic" {
-		requires-cursor-tool-schema-projection #true
-	}
 	// AvailableModels / seed-owned ladders must survive generate-models rebake,
 	// and buildModel must not invent fallback efforts when no thinking-efforts
 	// rule matched (routers, fast-only, unrecognized upstream-only values).
@@ -16,6 +10,21 @@ provider "grokbot" {
 	// Live discovery owns limits/modality; gen:models must not backfill from
 	// canonical-family or stencil.so same-id references.
 	credential-scoped-catalog #true
+	// Anthropic-class sand rows with tools use product keep-model (Shell/Read/Write
+	// on the original Anthropic requestedModel). Reviewed in KDL so a row can
+	// override to native/error/parent-chat without a TypeScript class branch.
+	class "anthropic" {
+		sand-tools-wire "keep-model"
+	}
+	// Native field-2 schema projection: Gemini backends reject leftover JSON
+	// Schema keywords; OpenAI mini/strict backends require additionalProperties
+	// false. Declared per class so a reviewed row can override without TS.
+	class "gemini" {
+		sand-native-tool-schema "google"
+	}
+	class "openai" {
+		sand-native-tool-schema "strict"
+	}
 	// Synthetic routers + offline seeds: reviewed budgeting floor when live
 	// AvailableModels omits contextTokenLimit (proto3 zero/absent).
 	// Synthetic sand-default router: reviewed reasoning capability (discovery/seeds stay neutral).
@@ -48,6 +57,14 @@ provider "grokbot" {
 	// substituting Gemini 3.8 Flash can fail the account's model permission check.
 	models "gemini-3-flash" "gemini-3-flash[]" {
 		sand-promote-json-text-tools #true
+	}
+	// Empty first tool turns on Gemini-class sand rows often spend the budget
+	// on thinking. One replay with product keep-model tools (Shell/Read/Write)
+	// recovers native toolCallPart — declared per row, not via class checks in TS.
+	// Empty Write follow-ups are a documented Sand Gemini quirk (same rows).
+	models "gemini-*" {
+		sand-empty-tools-retry-wire "keep-model"
+		sand-accept-empty-write-followup #true
 	}
 	models "sand-default" "sand-cua" "sand-automation" "default" "default[]" "auto" "auto[]" {
 		context-window-floor 200000

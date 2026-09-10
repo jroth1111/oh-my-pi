@@ -119,6 +119,7 @@
 		"providers/coreweave.kdl",
 		"providers/cursor.kdl",
 		"providers/deepseek.kdl",
+		"providers/devin.kdl",
 		"providers/firepass.kdl",
 		"providers/fireworks.kdl",
 		"providers/github-copilot.kdl",
@@ -8013,25 +8014,46 @@
 				}
 			},
 			{
-				"source": "providers/firepass.kdl:11",
+				"source": "providers/devin.kdl:5",
+				"providers": [
+					"devin"
+				],
+				"catalog": {
+					"credentialScopedCatalog": true
+				}
+			},
+			{
+				"source": "providers/firepass.kdl:10",
+				"class": "glm",
 				"providers": [
 					"firepass"
 				],
-				"models": [
-					{
-						"kind": "exact",
-						"value": "kimi-k2.6-turbo"
-					}
-				],
+				"priority": 1,
 				"thinking": {
+					"mode": "effort",
 					"efforts": [
+						"minimal",
 						"low",
 						"medium",
 						"high",
-						"xhigh",
 						"max"
-					],
-					"mode": "effort"
+					]
+				}
+			},
+			{
+				"source": "providers/firepass.kdl:15",
+				"class": "kimi",
+				"providers": [
+					"firepass"
+				],
+				"priority": 1,
+				"thinking": {
+					"mode": "effort",
+					"efforts": [
+						"low",
+						"high",
+						"max"
+					]
 				}
 			},
 			{
@@ -8843,17 +8865,37 @@
 				}
 			},
 			{
-				"source": "providers/grokbot.kdl:9",
+				"source": "providers/grokbot.kdl:16",
 				"class": "anthropic",
 				"providers": [
 					"grokbot"
 				],
 				"catalog": {
-					"requiresCursorToolSchemaProjection": true
+					"sandToolsWire": "keep-model"
 				}
 			},
 			{
 				"source": "providers/grokbot.kdl:22",
+				"class": "gemini",
+				"providers": [
+					"grokbot"
+				],
+				"catalog": {
+					"sandNativeToolSchema": "google"
+				}
+			},
+			{
+				"source": "providers/grokbot.kdl:25",
+				"class": "openai",
+				"providers": [
+					"grokbot"
+				],
+				"catalog": {
+					"sandNativeToolSchema": "strict"
+				}
+			},
+			{
+				"source": "providers/grokbot.kdl:31",
 				"providers": [
 					"grokbot"
 				],
@@ -8870,7 +8912,7 @@
 				}
 			},
 			{
-				"source": "providers/grokbot.kdl:27",
+				"source": "providers/grokbot.kdl:36",
 				"providers": [
 					"grokbot"
 				],
@@ -8886,7 +8928,7 @@
 				}
 			},
 			{
-				"source": "providers/grokbot.kdl:31",
+				"source": "providers/grokbot.kdl:40",
 				"providers": [
 					"grokbot"
 				],
@@ -8902,7 +8944,7 @@
 				}
 			},
 			{
-				"source": "providers/grokbot.kdl:41",
+				"source": "providers/grokbot.kdl:50",
 				"providers": [
 					"grokbot"
 				],
@@ -8932,7 +8974,7 @@
 				}
 			},
 			{
-				"source": "providers/grokbot.kdl:49",
+				"source": "providers/grokbot.kdl:58",
 				"providers": [
 					"grokbot"
 				],
@@ -8951,7 +8993,23 @@
 				}
 			},
 			{
-				"source": "providers/grokbot.kdl:52",
+				"source": "providers/grokbot.kdl:65",
+				"providers": [
+					"grokbot"
+				],
+				"models": [
+					{
+						"kind": "glob",
+						"value": "gemini-*"
+					}
+				],
+				"catalog": {
+					"sandEmptyToolsRetryWire": "keep-model",
+					"sandAcceptEmptyWriteFollowup": true
+				}
+			},
+			{
+				"source": "providers/grokbot.kdl:69",
 				"providers": [
 					"grokbot"
 				],
@@ -8990,7 +9048,7 @@
 				}
 			},
 			{
-				"source": "providers/grokbot.kdl:60",
+				"source": "providers/grokbot.kdl:77",
 				"providers": [
 					"grokbot"
 				],
@@ -9019,7 +9077,7 @@
 				}
 			},
 			{
-				"source": "providers/grokbot.kdl:68",
+				"source": "providers/grokbot.kdl:85",
 				"providers": [
 					"grokbot"
 				],
@@ -16759,7 +16817,7 @@
 			{
 				"id": "firepass",
 				"apiKeyFormat": "bearer",
-				"name": "Fire Pass (Fireworks Kimi K2.6 Turbo subscription)",
+				"name": "Fire Pass (Fireworks subscription)",
 				"login": {
 					"kind": "api-key",
 					"authUrl": "https://app.fireworks.ai/settings/users/api-keys",
@@ -16770,7 +16828,7 @@
 						"kind": "chat-completions",
 						"label": "Fire Pass",
 						"baseUrl": "https://api.fireworks.ai/inference/v1",
-						"model": "accounts/fireworks/routers/kimi-k2p6-turbo"
+						"model": "accounts/fireworks/routers/glm-5p2-fast"
 					}
 				}
 			},

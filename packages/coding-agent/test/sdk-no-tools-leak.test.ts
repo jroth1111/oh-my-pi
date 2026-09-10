@@ -96,6 +96,9 @@ describe("--no-tools leak prevention", () => {
 	});
 
 	it("excludes ambient custom tools with an empty whitelist without restrictToolNames", async () => {
+		// Contract: `toolNames: []` must stay an empty active set even when custom
+		// tools are registered. Assembly must use `toolNames !== undefined` (not a
+		// truthy check that could be misread as collapsing `[]` into the full registry).
 		const { session } = await createAgentSession({
 			cwd: registryDir,
 			agentDir: registryDir,
@@ -154,5 +157,45 @@ describe("--no-tools leak prevention", () => {
 		sessions.push(session);
 		expect(session.getXdevToolEntries()).toEqual([]);
 		expect(session.getActiveToolNames()).toEqual([]);
+	});
+
+	it("keeps deferred MCP manager tools inactive under an empty whitelist", async () => {
+		// `--no-tools` skips alwaysInclude at startup; deferred MCP discovery must
+		// not reintroduce manager tools via refreshMCPTools auto-activation.
+		const { session } = await createAgentSession({
+			cwd: registryDir,
+			agentDir: registryDir,
+			modelRegistry,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "tools.xdev": true, "plan.enabled": false }),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			disableExtensionDiscovery: true,
+			enableMCP: false,
+			enableLsp: false,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			rules: [],
+			toolNames: [],
+		});
+		sessions.push(session);
+		expect(session.getActiveToolNames()).toEqual([]);
+
+		await session.refreshMCPTools([
+			{
+				name: "mcp__deferred_probe",
+				label: "Deferred probe",
+				description: "Manager tool discovered after session start",
+				parameters: { type: "object", properties: {} },
+				mcpServerName: "deferred",
+				mcpToolName: "probe",
+				execute: async () => ({ content: [] }),
+			} as CustomTool,
+		]);
+
+		expect(session.getToolByName("mcp__deferred_probe")).toBeDefined();
+		expect(session.getActiveToolNames()).toEqual([]);
+		expect(session.getEnabledToolNames()).not.toContain("mcp__deferred_probe");
 	});
 });

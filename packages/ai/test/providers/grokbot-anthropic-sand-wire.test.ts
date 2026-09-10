@@ -98,20 +98,44 @@ describe("anthropic sand tool wire", () => {
 			resolveAnthropicSandToolsWire(undefined, undefined, {
 				modelId: "claude-opus-5",
 				toolCount: 2,
+				sandToolsWire: "keep-model",
 			}),
 		).toBe("keep-model");
 		expect(
 			resolveAnthropicSandToolsWire(undefined, undefined, {
 				modelId: "claude-fable-5",
 				toolCount: 2,
+				sandToolsWire: "keep-model",
 			}),
 		).toBe("keep-model");
+		// Without catalog sand-tools-wire, auto does not invent Anthropic policy.
+		expect(
+			resolveAnthropicSandToolsWire(undefined, undefined, {
+				modelId: "claude-opus-5",
+				toolCount: 2,
+			}),
+		).toBe("native");
 		expect(
 			resolveAnthropicSandToolsWire(undefined, undefined, {
 				modelId: "grok-4.6",
 				toolCount: 2,
 			}),
 		).toBe("native");
+		// Catalog override wins over the Anthropic-class default (e.g. native).
+		expect(
+			resolveAnthropicSandToolsWire(undefined, undefined, {
+				modelId: "claude-opus-5",
+				toolCount: 2,
+				sandToolsWire: "native",
+			}),
+		).toBe("native");
+		expect(
+			resolveAnthropicSandToolsWire(undefined, undefined, {
+				modelId: "claude-opus-5",
+				toolCount: 2,
+				sandToolsWire: "error",
+			}),
+		).toBe("error");
 		// Router wire mode comes from catalog `sand-tools-wire`, not id compares.
 		expect(
 			resolveAnthropicSandToolsWire(undefined, undefined, {
@@ -198,6 +222,45 @@ describe("anthropic sand tool wire", () => {
 		const tools = [{ name: "read" }];
 		const input = { requestedModel, tools, modelId: "grok-4.6" };
 		expect(applyAnthropicSandToolWire(input, "keep-model")).toEqual(input);
+	});
+
+	test("catalog keep-model on non-anthropic strips retry params but keeps context and routing flags", () => {
+		const requestedModel = resolveGrokbotRequestedModel("gemini-3-flash", {
+			sandParameterIds: ["effort", "fast", "context", "thinking"],
+			sandMaxMode: true,
+			sandVariantStringRepresentation: true,
+			effort: "high",
+			context: "1m",
+			thinking: true,
+		});
+		expect(requestedModel.maxMode).toBe(true);
+		expect(requestedModel.isVariantStringRepresentation).toBe(true);
+		expect(requestedModel.parameters?.some(p => p.id === "context" && p.value === "1m")).toBe(true);
+		expect(requestedModel.parameters?.some(p => p.id === "effort")).toBe(true);
+		const tools = [
+			{
+				name: "bash",
+				description: "shell",
+				parameters: { type: "object", properties: { command: { type: "string" } } },
+			},
+		];
+		const wired = applyAnthropicSandToolWire(
+			{
+				requestedModel,
+				tools,
+				modelId: "gemini-3-flash",
+				ompTools: tools,
+				sandToolsWire: "keep-model",
+			},
+			"keep-model",
+		);
+		expect(wired.wireMode).toBe("keep-model");
+		expect(wired.requestedModel.modelId).toBe("gemini-3-flash");
+		expect(wired.requestedModel.maxMode).toBe(true);
+		expect(wired.requestedModel.isVariantStringRepresentation).toBe(true);
+		expect(wired.requestedModel.parameters).toEqual([{ id: "context", value: "1m" }]);
+		const names = (wired.tools as Array<{ name: string }>).map(t => t.name);
+		expect(names).toContain("Shell");
 	});
 
 	test("automation/parent-chat without catalog sandToolsWire is a no-op for non-anthropic ids", () => {
@@ -322,6 +385,7 @@ describe("product wire helpers", () => {
 		expect(schema?.properties).toHaveProperty("target_file");
 		expect(schema?.required ?? []).not.toContain("path");
 		expect(schema?.anyOf).toEqual([{ required: ["path"] }, { required: ["target_file"] }]);
+		expect((schema?.properties?.target_file as { description?: string })?.description).toContain("alias of path");
 	});
 
 	test("Write schema advertises contents as an alias of content", () => {
@@ -353,6 +417,105 @@ describe("product wire helpers", () => {
 		expect(schema?.properties).toHaveProperty("contents");
 		expect(schema?.required).toEqual(["path"]);
 		expect(schema?.anyOf).toEqual([{ required: ["content"] }, { required: ["contents"] }]);
+		expect((schema?.properties?.contents as { description?: string })?.description).toContain("alias of content");
+	});
+
+	test("Write alias rewrites branch-local required when canonical is only in anyOf", () => {
+		const tools = toProductField2Tools(
+			[
+				{
+					name: "write",
+					description: "write file",
+					parameters: {
+						type: "object",
+						properties: {
+							path: { type: "string" },
+							content: { type: "string" },
+						},
+						anyOf: [{ required: ["content"] }, { required: ["path"] }],
+					},
+				},
+			],
+			"automation",
+		);
+		const schema = (
+			tools[0]?.parameters as {
+				jsonSchema?: {
+					properties?: Record<string, unknown>;
+					required?: string[];
+					anyOf?: Array<{ required?: string[]; anyOf?: Array<{ required?: string[] }> }>;
+				};
+			}
+		).jsonSchema;
+		expect(schema?.properties).toHaveProperty("contents");
+		expect(schema?.required).toBeUndefined();
+		expect(schema?.anyOf).toEqual([
+			{ required: [], anyOf: [{ required: ["content"] }, { required: ["contents"] }] },
+			{ required: ["path"] },
+		]);
+	});
+
+	test("Read alias rewrites branch-local required when canonical is only in oneOf", () => {
+		const tools = toProductField2Tools(
+			[
+				{
+					name: "read",
+					description: "read file",
+					parameters: {
+						type: "object",
+						properties: {
+							path: { type: "string" },
+							offset: { type: "number" },
+						},
+						oneOf: [{ required: ["path"] }, { required: ["offset"] }],
+					},
+				},
+			],
+			"automation",
+		);
+		const schema = (
+			tools[0]?.parameters as {
+				jsonSchema?: {
+					properties?: Record<string, unknown>;
+					oneOf?: Array<{ required?: string[]; anyOf?: Array<{ required?: string[] }> }>;
+				};
+			}
+		).jsonSchema;
+		expect(schema?.properties).toHaveProperty("target_file");
+		expect(schema?.oneOf).toEqual([
+			{ required: [], anyOf: [{ required: ["path"] }, { required: ["target_file"] }] },
+			{ required: ["offset"] },
+		]);
+	});
+
+	test("Write contents alias clones canonical property constraints", () => {
+		const tools = toProductField2Tools(
+			[
+				{
+					name: "write",
+					description: "write file",
+					parameters: {
+						type: "object",
+						properties: {
+							path: { type: "string" },
+							content: { type: "string", enum: ["a", "b"], minLength: 1 },
+						},
+						required: ["path", "content"],
+					},
+				},
+			],
+			"automation",
+		);
+		const schema = (
+			tools[0]?.parameters as {
+				jsonSchema?: { properties?: Record<string, Record<string, unknown>> };
+			}
+		).jsonSchema;
+		const contents = schema?.properties?.contents;
+		expect(contents?.enum).toEqual(["a", "b"]);
+		expect(contents?.minLength).toBe(1);
+		expect(contents?.type).toBe("string");
+		expect(String(contents?.description ?? "")).toContain("alias of content");
 	});
 
 	test("Read alias preserves preexisting anyOf required groups via allOf", () => {
@@ -394,16 +557,76 @@ describe("product wire helpers", () => {
 		]);
 	});
 
+	test("Read alias retains preexisting allOf when combining with anyOf", () => {
+		const tools = toProductField2Tools(
+			[
+				{
+					name: "read",
+					description: "read file",
+					parameters: {
+						type: "object",
+						properties: {
+							path: { type: "string" },
+							offset: { type: "number" },
+							start_line: { type: "number" },
+						},
+						required: ["path"],
+						anyOf: [{ required: ["offset"] }, { required: ["start_line"] }],
+						allOf: [{ not: { required: ["forbidden"] } }],
+					},
+				},
+			],
+			"automation",
+		);
+		const schema = (
+			tools[0]?.parameters as {
+				jsonSchema?: {
+					anyOf?: unknown;
+					allOf?: unknown[];
+				};
+			}
+		).jsonSchema;
+		expect(schema?.anyOf).toBeUndefined();
+		expect(schema?.allOf).toEqual([
+			{ not: { required: ["forbidden"] } },
+			{ anyOf: [{ required: ["offset"] }, { required: ["start_line"] }] },
+			{ anyOf: [{ required: ["path"] }, { required: ["target_file"] }] },
+		]);
+	});
+
 	test("parent profile injects SendToUser", () => {
 		const tools = toProductField2Tools([], "parent-chat");
 		expect(tools[0]?.name).toBe("SendToUser");
-		expect(tools[0]?.description).toContain("user-visible message");
-		expect(tools[0]?.description).toContain("SendToUser");
 		const schema = (
-			tools[0]?.parameters as { jsonSchema?: { properties?: Record<string, { description?: string }> } }
+			tools[0]?.parameters as {
+				jsonSchema?: {
+					properties?: Record<string, { type?: string; enum?: string[] }>;
+					required?: string[];
+				};
+			}
 		).jsonSchema;
-		expect(schema?.properties?.type?.description).toContain("visible to the user");
-		expect(schema?.properties?.content?.description).toContain("user will see");
+		expect(schema?.properties).toHaveProperty("type");
+		expect(schema?.properties).toHaveProperty("content");
+		expect(schema?.properties?.type?.enum).toEqual(["text"]);
+		expect(schema?.properties?.content?.type).toBe("string");
+		expect(schema?.required).toEqual(["type", "content"]);
+	});
+
+	test("parent profile still injects SendToUser when an extension only aliases away from it", () => {
+		// Internal name SendToUser + customWireName Other occupies Other, not the
+		// synthetic SendToUser wire slot — parent-chat must still inject the helper.
+		const product = toProductField2Tools(
+			[
+				{
+					name: "SendToUser",
+					description: "extension other",
+					parameters: { type: "object", properties: {} },
+					customWireName: "Other",
+				},
+			] as never,
+			"parent-chat",
+		);
+		expect(product.map(t => t.name)).toEqual(["SendToUser", "Other"]);
 	});
 
 	test("prefers write over edit for the shared Write wire slot", () => {
@@ -644,6 +867,40 @@ describe("product wire helpers", () => {
 					{ toolCallId: "c2", toolName: "Write", result: "wrote" },
 				],
 			},
+		});
+	});
+	test("keeps historical edit when customWireName Write owns the sand slot", () => {
+		// save advertises Write via customWireName while edit remains; ownership must
+		// match toProductField2Tools so replay does not rewrite edit → Write.
+		const tools = [
+			{
+				name: "save",
+				description: "create",
+				parameters: { type: "object", properties: {} },
+				customWireName: "Write",
+			},
+			{ name: "edit", description: "patch", parameters: { type: "object", properties: {} } },
+		];
+		const product = toProductField2Tools(tools as never, "automation");
+		expect(product.filter(t => t.name === "Write").map(t => t.description)).toEqual(["create"]);
+		const rewritten = rewriteInferenceMessagesForProductWire(
+			[
+				{
+					role: 2,
+					toolCalls: [
+						{ toolCallId: "c1", toolName: "edit", args: { path: "c.ts" } },
+						{ toolCallId: "c2", toolName: "save", args: { path: "b.ts", content: "x" } },
+					],
+				},
+			],
+			tools as never,
+		);
+		expect(rewritten[0]).toEqual({
+			role: 2,
+			toolCalls: [
+				{ toolCallId: "c1", toolName: "edit", args: { path: "c.ts" } },
+				{ toolCallId: "c2", toolName: "Write", args: { path: "b.ts", content: "x" } },
+			],
 		});
 	});
 });

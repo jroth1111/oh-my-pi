@@ -49,22 +49,34 @@ function formatGrokbotStatusValue(value: string): string {
 	return truncateToWidth(cleaned, TRUNCATE_LENGTHS.TITLE);
 }
 
-/** Strip URL userinfo and credential-shaped query params before /grokbot Host display. */
+/** Strip URL userinfo and all query params before `/grokbot` Host display. */
+function scrubMalformedGrokbotDisplayHost(raw: string): string {
+	// Scheme-less / opaque endpoints used while diagnosing proxies — strip
+	// userinfo and query/fragment conservatively (never echo secrets).
+	let scrubbed = raw.replace(/^(?:([a-z][a-z0-9+.-]*:\/\/))?([^/?#]*@)/i, "$1");
+	const cut = scrubbed.search(/[?#]/);
+	if (cut >= 0) scrubbed = scrubbed.slice(0, cut);
+	return scrubbed.replace(/\/+$/, "") || GROKBOT_BACKEND;
+}
+
 function formatGrokbotDisplayHost(raw: string): string {
 	const trimmed = raw.replace(/\/+$/, "") || GROKBOT_BACKEND;
 	try {
 		const url = new URL(trimmed);
+		// `user:sekrit@proxy.local` parses as opaque scheme `user:` with empty
+		// host — do not trust pathname (still holds userinfo). Scrub raw instead.
+		if (!url.host) return formatGrokbotStatusValue(scrubMalformedGrokbotDisplayHost(trimmed));
 		url.username = "";
 		url.password = "";
-		for (const key of [...url.searchParams.keys()]) {
-			if (/^(?:api[_-]?key|access[_-]?token|auth|password|secret|token|key)$/i.test(key)) {
-				url.searchParams.delete(key);
-			}
-		}
-		const display = `${url.protocol}//${url.host}${url.pathname}${url.search}${url.hash}`.replace(/\/+$/, "");
+		// Omit the entire query string — reverse proxies may auth with arbitrary
+		// keys (`x-api-key`, signed tokens, …) that no allowlist can exhaust.
+		url.search = "";
+		// Fragments commonly carry tokens (`#access_token=…`); never show them.
+		url.hash = "";
+		const display = `${url.protocol}//${url.host}${url.pathname}`.replace(/\/+$/, "");
 		return formatGrokbotStatusValue(display || GROKBOT_BACKEND);
 	} catch {
-		return formatGrokbotStatusValue(trimmed);
+		return formatGrokbotStatusValue(scrubMalformedGrokbotDisplayHost(trimmed));
 	}
 }
 
