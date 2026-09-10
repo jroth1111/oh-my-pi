@@ -346,6 +346,7 @@
 - Auth gateway `GET /v1/routes` lists registered virtual routes.
 - Auth gateway `GET /v1/routes/:id` returns a registered virtual route.
 
+- Gateway streaming fallback waits for meaningful output and preserves metadata-only completions.
 
 ## [18.1.14] - 2026-09-07
 

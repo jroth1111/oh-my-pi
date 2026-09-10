@@ -2214,6 +2214,14 @@ function handleRouteGet(registry: RouteRegistry, id: string): Response {
 	return json(200, row);
 }
 
+function decodeRoutePathId(pathname: string): { id?: string; error?: Response } {
+	try {
+		return { id: decodeURIComponent(pathname.slice("/v1/routes/".length)) };
+	} catch (error) {
+		return { error: json(400, { error: `Invalid encoded route id: ${String(error)}` }) };
+	}
+}
+
 async function handleRoutePut(registry: RouteRegistry, id: string, req: Request): Promise<Response> {
 	let body: unknown;
 	try {
