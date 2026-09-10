@@ -448,3 +448,14 @@ it("enters a nested fallback at its primary when handling context overflow", () 
 		}),
 	).toEqual({ type: "fallback_target", targetModelId: "b" });
 });
+
+it("tries an unused primary when a remembered backup is unavailable", () => {
+	expect(
+		decideAttempt({
+			route: route({ targets: ["primary", "backup"], fallbacks: { provider_unavailable: ["backup"] } }),
+			state: state({ attemptedTargets: new Set(["backup"]), currentTarget: "backup" }),
+			classification: classification("provider_unavailable"),
+			commitState: "probing",
+		}),
+	).toEqual({ type: "fallback_target", targetModelId: "primary" });
+});

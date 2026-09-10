@@ -316,6 +316,7 @@
 - Fixed bare `balance` routes always dispatching the first child; initial pick now rotates across children.
 - Fixed Anthropic count-tokens ignoring `system`/`tools` and accepting non-array `messages`.
 - Fixed quota-share DRR picking by weight when the first finalist already holds higher deficit than the second.
+- Gemini streamed tool calls are emitted once, and nested fallbacks preserve branch-specific failure rules.
 - Fixed fair-share ties, round-robin target selection, conditional vision routes, and recovery when a preferred fallback becomes unavailable.
 
 - Quota probes require a requestId; balance routes pick the initial target via rr/weighted strategy.

@@ -474,10 +474,31 @@ function resolveFirstAvailableTarget(
 	}
 }
 
-function hashString(value: string): number {
-	let h = 0;
-	for (let i = 0; i < value.length; i++) h = (h * 31 + value.charCodeAt(i)) | 0;
-	return h;
+/**
+ * Resolve the first viable dispatch target for a compiled route. A primary
+ * that is absent from the catalog (stale route, credential-scoped model
+ * change) is marked attempted and the conductor advances to the next sibling
+ * instead of 404ing a route with usable fallbacks.
+ */
+function resolveFirstAvailableTarget(
+	compiled: CompiledRoute,
+	resolveModel: (id: string) => Model<Api> | undefined,
+	firstTarget: string,
+	attemptedTargets: Set<string>,
+): { target: string; model: Model<Api> | undefined } {
+	let current = firstTarget;
+	for (;;) {
+		const model = resolveModel(current);
+		if (model !== undefined) return { target: current, model };
+		attemptedTargets.add(current);
+		const next = decideAttempt({
+			route: compiled,
+			state: conductorExecutionState(compiled, attemptedTargets, new Set<number>(), 0, 0, current, false, "probing"),
+			commitState: "probing",
+		});
+		if (next.type !== "dispatch") return { target: current, model: undefined };
+		current = next.targetModelId;
+	}
 }
 
 function hashString(value: string): number {

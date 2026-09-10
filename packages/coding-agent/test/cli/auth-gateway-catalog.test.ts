@@ -168,3 +168,23 @@ test("catalog refresh includes newly credentialed providers and removes revoked 
 	afterDiscovery = [];
 	expect((await refreshAuthGatewayModelIndex(registry, storage)).has(`${model.provider}/${model.id}`)).toBe(false);
 });
+
+test("catalog refresh includes newly credentialed providers and removes revoked providers", async () => {
+	const model = getBundledModels("anthropic")[0]!;
+	let credentials: StoredAuthCredential[] = [];
+	let afterDiscovery: StoredAuthCredential[] = [];
+	const storage: Pick<AuthStorage, "listStoredCredentials" | "reload"> = {
+		listStoredCredentials: () => credentials,
+		reload: async () => {
+			credentials = afterDiscovery;
+		},
+	};
+	const registry: Pick<ModelRegistry, "refresh" | "getAll"> = { refresh: async () => {}, getAll: () => [model] };
+	expect((await refreshAuthGatewayModelIndex(registry, storage)).has(`${model.provider}/${model.id}`)).toBe(false);
+	afterDiscovery = [
+		{ id: 1, provider: model.provider, disabledCause: null, credential: { type: "api_key", key: "new-key" } },
+	];
+	expect((await refreshAuthGatewayModelIndex(registry, storage)).get(`${model.provider}/${model.id}`)).toEqual(model);
+	afterDiscovery = [];
+	expect((await refreshAuthGatewayModelIndex(registry, storage)).has(`${model.provider}/${model.id}`)).toBe(false);
+});

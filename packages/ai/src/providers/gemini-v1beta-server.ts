@@ -708,6 +708,7 @@ export function encodeStream(
 						case "toolcall_end": {
 							// Gemini functionCall parts are complete calls, not argument deltas.
 							const call = event.toolCall;
+							if (call === undefined) break;
 							writeSse(
 								controller,
 								{

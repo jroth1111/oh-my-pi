@@ -130,6 +130,11 @@
 
 ## [18.1.15] - 2026-09-08
 
+### Fixed
+
+- Running auth gateways now add or remove provider models when broker credentials change, without requiring a restart.
+
+
 ### Added
 
 - `omp auth-gateway serve --routes=<path>` loads virtual route definitions from a JSON/JSON5 file.
