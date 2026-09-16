@@ -1,0 +1,24 @@
+name: Python client validation tooling
+on:
+  push:
+    branches: [cloudflare-devin-proxy-20260916]
+    paths: [.github/workflows/python-validation-tooling.yml]
+permissions:
+  contents: read
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Download official client wheels
+        run: |
+          mkdir wheels
+          python -m pip download --only-binary=:all: --dest wheels openai==3.14.1 protobuf==7.36.1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python313-client-validation
+          path: wheels
+          retention-days: 1
