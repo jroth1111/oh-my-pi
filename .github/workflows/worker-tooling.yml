@@ -1,0 +1,42 @@
+name: Worker validation tooling
+on:
+  push:
+    branches: [cloudflare-devin-proxy-20260916]
+    paths: [.github/workflows/worker-tooling.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  tooling:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Download official test runtimes and public source snapshots
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/worker-tooling/wheels"
+          cd "$RUNNER_TEMP/worker-tooling"
+          npm init -y > /dev/null
+          npm install --save-exact miniflare@4 wrangler@4 esbuild typescript
+          python -m pip download --only-binary=:all: --dest wheels openai protobuf
+          git clone --depth 1 https://github.com/blue-pen5805/llm-proxy-on-cloudflare-workers.git blue-pen
+          git -C blue-pen rev-parse HEAD > blue-pen-source-sha.txt
+          mkdir -p omp-source
+          for p in packages/catalog/src/discovery/protobuf.ts packages/catalog/src/discovery/devin-proto.ts packages/catalog/src/wire/devin.ts packages/catalog/src/wire/devin-proto.ts packages/ai/src/providers/devin.ts LICENSE; do
+            mkdir -p "omp-source/$(dirname "$p")"
+            curl --fail --silent --show-error "https://raw.githubusercontent.com/jroth1111/oh-my-pi/805cd815ba13ce76998336d0038d1f21e292dda4/$p" -o "omp-source/$p"
+          done
+          node -e 'console.log(JSON.stringify({node:process.version,miniflare:require("miniflare/package.json").version,wrangler:require("wrangler/package.json").version}))' > versions.json
+          tar -czf "$RUNNER_TEMP/worker-tooling.tar.gz" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: worker-validation-tooling
+          path: ${{ runner.temp }}/worker-tooling.tar.gz
+          retention-days: 1
