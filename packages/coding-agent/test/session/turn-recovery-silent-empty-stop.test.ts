@@ -8,8 +8,8 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { TurnRecovery, type TurnRecoveryHost } from "@oh-my-pi/pi-coding-agent/session/turn-recovery";
-import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-coding-agent/thinking";
-import { concreteThinkingLevel } from "@oh-my-pi/pi-coding-agent/thinking";
+import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/render/render-utils";
+import { concreteThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 /**
@@ -81,6 +81,10 @@ function createHost(model: Model, modelRegistry: ModelRegistry): TurnRecoveryHos
 		abortInProgress: () => false,
 		streamingEditAbortTriggered: () => false,
 		promptGeneration: () => 0,
+		promptSequence: () => 0,
+		resolveActiveEditMode: () => "replace",
+		syncAfterModelChange: async () => {},
+		shakeForRequestBodyReadTimeout: async () => false,
 		sessionId: () => "test-session",
 		emitSessionEvent: async () => {},
 		scheduleAgentContinue: () => {},
@@ -89,7 +93,7 @@ function createHost(model: Model, modelRegistry: ModelRegistry): TurnRecoveryHos
 		sessionMessageAlreadyPersisted: () => false,
 		setModelWithProviderSessionReset: async () => {},
 		resetCurrentResponsesProviderSession: () => {},
-		maybeAutoRedeemCodexReset: async () => false,
+		maybeAutoRedeemReset: async () => false,
 		runAutoCompaction: async () => ({ deferredHandoff: false, continuationScheduled: false }) as never,
 		withBashBranchTransition: <T>(operation: () => T): T => operation(),
 		sessionManager: {

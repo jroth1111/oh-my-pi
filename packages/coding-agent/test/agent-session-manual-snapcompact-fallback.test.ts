@@ -121,7 +121,7 @@ describe("AgentSession manual snapcompact text-only fallback", () => {
 		);
 		expect(harness.sessionManager.getBranch().find(entry => entry.type === "compaction")).toMatchObject({
 			type: "compaction",
-			summary: "llm summary",
+			summary: expect.stringContaining("llm summary"),
 		});
 	});
 

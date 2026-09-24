@@ -6,7 +6,7 @@
  * surface and adds `/grokbot` status formatting.
  */
 import { GROKBOT_BACKEND, grokbotSecretsPath, loadGrokbotConfig } from "@oh-my-pi/pi-catalog/discovery/grokbot-auth";
-import { replaceTabs, TRUNCATE_LENGTHS, truncateToWidth } from "@oh-my-pi/pi-tui";
+import { replaceTabs, TRUNCATE_LENGTHS, truncateToWidth } from "@oh-my-pi/pi-tui/utils";
 import { sanitizeText, shortenPath } from "@oh-my-pi/pi-utils";
 
 export {

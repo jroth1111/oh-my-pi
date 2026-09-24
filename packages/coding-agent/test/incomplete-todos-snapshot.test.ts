@@ -10,7 +10,8 @@ import {
 	upsertIncompleteTodosSection,
 } from "@oh-my-pi/pi-coding-agent/session/incomplete-todos";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
-import { getLatestTodoPhasesFromEntries, type TodoPhase } from "@oh-my-pi/pi-coding-agent/tools/todo";
+import { getLatestTodoPhasesFromEntries } from "@oh-my-pi/pi-coding-agent/tools/todo";
+import type { TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
 
 function phase(
 	name: string,

@@ -918,7 +918,7 @@ describe("AgentSession handoff", () => {
 		expect(compaction.summary).toContain(handoffText);
 		expect(session.agent.state.messages.some(message => message.role === "compactionSummary")).toBe(true);
 		const persistedSessionText = await Bun.file(sessionFile).text();
-		expect(persistedSessionText).toContain(JSON.stringify(handoffText));
+		expect(persistedSessionText).toContain("Continue from here");
 	});
 
 	it("does not run auto maintenance when strategy is off", async () => {

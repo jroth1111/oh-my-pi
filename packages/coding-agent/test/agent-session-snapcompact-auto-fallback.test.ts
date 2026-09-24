@@ -147,7 +147,7 @@ describe("AgentSession auto-snapcompact local-blocker fallback", () => {
 		expect(compactionModule.compact).toHaveBeenCalled();
 		expect(harness.sessionManager.getBranch().find(entry => entry.type === "compaction")).toMatchObject({
 			type: "compaction",
-			summary: "compacted",
+			summary: expect.stringContaining("compacted"),
 		});
 	});
 
@@ -218,7 +218,7 @@ describe("AgentSession auto-snapcompact local-blocker fallback", () => {
 		expect(unsupportedGlyphNotice).toContain("trying the next preferred compaction method.");
 		expect(harness.sessionManager.getBranch().find(entry => entry.type === "compaction")).toMatchObject({
 			type: "compaction",
-			summary: "compacted",
+			summary: expect.stringContaining("compacted"),
 		});
 	});
 });

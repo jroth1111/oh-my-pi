@@ -37,6 +37,7 @@ function createFlushHarness(finalMessage?: AssistantMessage): FlushHarness {
 			getHeader: () => undefined,
 			buildSessionContext: () => ({ messages: [] }),
 			getEntries: () => [],
+			onPersistenceError: () => () => {},
 		},
 		settings: { get: () => false },
 		getLastAssistantMessage: () => finalMessage,
@@ -137,7 +138,7 @@ describe("print-mode JSON flush (#7635)", () => {
 		expect(harness.disposed()).toBe(false);
 
 		releaseAgentEnd?.();
-		await run;
+		expect(await run).toBe(0);
 
 		expect(settled).toBe(true);
 		expect(harness.disposed()).toBe(true);
@@ -194,12 +195,15 @@ describe("print-mode JSON flush (#7635)", () => {
 		await issued.promise;
 		expect(exit).not.toHaveBeenCalled();
 		releaseOutput?.();
-		await run;
+		// runPrintMode reports the terminal failure as a nonzero exit code; the
+		// caller owns process.exit after dispose has run.
+		expect(await run).toBe(1);
+		expect(harness.disposed()).toBe(true);
 		expect(JSON.parse(writes.join(""))).toMatchObject({
 			type: "agent_end",
 			messages: [{ stopReason: "error", errorStatus: 401 }],
 		});
 		expect(drain).toHaveBeenCalledWith(PRINT_MODE_ERROR_ADVISOR_DRAIN_TIMEOUT_MS);
-		expect(exit).toHaveBeenCalledWith(1);
+		expect(exit).not.toHaveBeenCalled();
 	});
 });

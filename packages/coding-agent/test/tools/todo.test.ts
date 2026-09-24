@@ -3,7 +3,7 @@ import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import { toolWireSchema } from "@oh-my-pi/pi-ai";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { initTheme, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { initTheme, theme } from "@oh-my-pi/pi-tui/theme";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import {
 	applyOpsToPhases,
@@ -13,23 +13,25 @@ import {
 	formatTodoHudRatio,
 	isCompletedTodo,
 	isHudSettledTodo,
-	isSettledTodo,
 	isTodoPhase,
 	markdownToPhases,
 	nextActionableTask,
 	phasesToMarkdown,
 	resolveTodoMarkdownPath,
+	todoHudCounts,
+	TodoTool,
+	unescapeTodoMarkdownContent,
+} from "@oh-my-pi/pi-coding-agent/tools";
+import {
+	isClosedTodo,
 	selectCollapsedTodos,
 	TODO_STRIKE_HOLD_FRAMES,
 	TODO_STRIKE_TOTAL_FRAMES,
 	type TodoItem,
 	type TodoPhase,
-	TodoTool,
-	todoHudCounts,
 	todoMatchesAnyDescription,
 	todoToolRenderer,
-	unescapeTodoMarkdownContent,
-} from "@oh-my-pi/pi-coding-agent/tools";
+} from "@oh-my-pi/pi-tui/tools/todo";
 import type { Component } from "@oh-my-pi/pi-tui";
 
 function createSession(initialPhases: TodoPhase[] = []): ToolSession {
@@ -1258,7 +1260,7 @@ describe("abandoned todos in tool summary and compact HUD contracts", () => {
 		];
 		expect(nextActionableTask(phases)).toBeUndefined();
 		expect(phases.flatMap(p => p.tasks).filter(isCompletedTodo)).toHaveLength(0);
-		expect(phases.flatMap(p => p.tasks).filter(isSettledTodo)).toHaveLength(2);
+		expect(phases.flatMap(p => p.tasks).filter(isClosedTodo)).toHaveLength(2);
 		expect(phases.flatMap(p => p.tasks).filter(isHudSettledTodo)).toHaveLength(0);
 		const tool = new TodoTool(createSession(phases));
 		const result = await tool.execute("t1", { op: "view" });

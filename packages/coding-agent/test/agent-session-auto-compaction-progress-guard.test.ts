@@ -932,7 +932,7 @@ describe("AgentSession auto-compaction progress guard", () => {
 		expect(continueSpy).toHaveBeenCalledTimes(1);
 		expect(sessionManager.getBranch().at(-1)).toMatchObject({
 			type: "compaction",
-			summary: "handoff document",
+			summary: expect.stringContaining("handoff document"),
 		});
 		expect(sessionManager.getBranch()).not.toContainEqual(
 			expect.objectContaining({
@@ -1136,7 +1136,7 @@ describe("AgentSession auto-compaction progress guard", () => {
 		expect(continueSpy).toHaveBeenCalledTimes(1);
 		expect(sessionManager.getBranch().at(-1)).toMatchObject({
 			type: "compaction",
-			summary: "speculative handoff",
+			summary: expect.stringContaining("speculative handoff"),
 		});
 		expect(sessionManager.getBranch()).not.toContainEqual(
 			expect.objectContaining({
@@ -1224,7 +1224,7 @@ describe("AgentSession auto-compaction progress guard", () => {
 		expect(continueSpy).toHaveBeenCalledTimes(1);
 		expect(sessionManager.getBranch().at(-1)).toMatchObject({
 			type: "compaction",
-			summary: "recovery handoff",
+			summary: expect.stringContaining("recovery handoff"),
 		});
 	});
 

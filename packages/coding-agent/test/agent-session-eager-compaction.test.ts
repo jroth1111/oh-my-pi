@@ -13,7 +13,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { TodoTool, type ToolSession, USER_TODO_EDIT_CUSTOM_TYPE } from "@oh-my-pi/pi-coding-agent/tools";
+import { TodoTool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 // Re-injecting eager preludes after compaction: the first-message preludes are the
@@ -371,18 +371,17 @@ describe("AgentSession eager prelude re-injection after compaction", () => {
 	});
 
 	it("does not re-inject the eager todo reminder when todos survived compaction", async () => {
-		const { session, sessionManager, waitForCall } = await createHarness({
+		const { session, waitForCall } = await createHarness({
 			"task.eager": "default",
 			"todo.enabled": true,
 			"todo.eager": "preferred",
 		});
 		await session.prompt("refactor the parser across modules");
 		activateOngoingGoal(session);
-		// A surviving todo entry; pin firstKeptEntryId so compaction preserves it in the branch.
-		const todoEntryId = sessionManager.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, {
-			phases: [{ name: "Work", tasks: [{ content: "do the thing", status: "pending" }] }],
-		});
-		stubCompaction(todoEntryId);
+		// Seed the live tracker so the compaction's Incomplete Todos section
+		// carries the surviving todo (the section is authoritative on resume).
+		session.setTodoPhases([{ name: "Work", tasks: [{ content: "do the thing", status: "pending" }] }]);
+		stubCompaction();
 
 		const continuationPromise = waitForCall(call => call.callIndex > 0);
 		emitHighUsageTurn(session);

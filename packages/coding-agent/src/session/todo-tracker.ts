@@ -10,7 +10,8 @@ import postCompactionIncompleteTodosPrompt from "../prompts/system/post-compacti
 import todoCompletionReminderPrompt from "../prompts/system/todo-completion-reminder.md" with { type: "text" };
 import { resolveLeadingCdChain } from "../tools/shell-tokenize";
 import { resolveToCwd } from "../tools/path-utils";
-import { getLatestTodoPhasesFromEntries, isTodoPhase, type TodoItem, type TodoPhase } from "../tools/todo";
+import { getLatestTodoPhasesFromEntries, isTodoPhase } from "../tools/todo";
+import { type TodoItem, type TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
 import { buildNamedToolChoice } from "../utils/tool-choice";
 import type { AgentSessionEvent } from "./agent-session-events";
 import {
