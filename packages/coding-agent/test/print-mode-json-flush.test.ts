@@ -203,7 +203,7 @@ describe("print-mode JSON flush (#7635)", () => {
 			type: "agent_end",
 			messages: [{ stopReason: "error", errorStatus: 401 }],
 		});
-		expect(drain).toHaveBeenCalledWith(PRINT_MODE_ERROR_ADVISOR_DRAIN_TIMEOUT_MS);
+		expect(drain).toHaveBeenCalledWith(PRINT_MODE_ERROR_ADVISOR_DRAIN_TIMEOUT_MS, { waitThroughRecovery: true });
 		expect(exit).not.toHaveBeenCalled();
 	});
 });
