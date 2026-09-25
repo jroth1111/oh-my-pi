@@ -105,6 +105,7 @@ export function isAuthorized(req: Request, tokens: ReadonlySet<string>): boolean
 const PASSTHROUGH_HEADER_NAMES: Record<string, true> = {
 	"anthropic-beta": true,
 	"anthropic-version": true,
+	"anthropic-user-profile-id": true,
 	"openai-organization": true,
 	"openai-project": true,
 	"openai-beta": true,
@@ -235,7 +236,7 @@ const CORS_HEADERS: Record<string, string> = {
 	"Access-Control-Allow-Origin": "*",
 	"Access-Control-Allow-Methods": "GET, PUT, DELETE, POST, OPTIONS",
 	"Access-Control-Allow-Headers":
-		"authorization, content-type, anthropic-version, anthropic-beta, openai-organization, openai-project, x-stainless-*, x-api-key, x-cursor-auto-mode, x-cursor-tool-passthrough, x-cursor-agent-exclude-tools, local-cli-mode, x-dev-experiment-overrides",
+		"authorization, content-type, anthropic-version, anthropic-beta, anthropic-user-profile-id, openai-organization, openai-project, x-stainless-*, x-api-key, x-cursor-auto-mode, x-cursor-tool-passthrough, x-cursor-agent-exclude-tools, local-cli-mode, x-dev-experiment-overrides",
 	"Access-Control-Expose-Headers":
 		"x-request-id, request-id, x-litellm-model-id, x-litellm-model-api-base, x-litellm-response-cost, x-litellm-response-duration-ms, openai-processing-ms",
 	"Access-Control-Max-Age": "86400",

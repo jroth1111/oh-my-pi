@@ -78,6 +78,24 @@
 - Devin parallel tool calls follow `compat.supportsParallelToolCalls` instead of being disabled unconditionally, so natively discovered configs that support parallelism can use it ([#8590](https://github.com/can1357/oh-my-pi/pull/8590) by [@will-bogusz](https://github.com/will-bogusz)).
 - Fixed Cloudflare AI Gateway onboarding and routing so gateway account and endpoint configuration is preserved correctly while gateway credentials are not sent as upstream OpenAI authorization headers.
 - Fixed Claude Opus 5.5 ignoring a mid-session switch to high effort when the session started without an explicit effort; the change is now sent as a cache-preserving per-message effort control ([#12909](https://github.com/can1357/oh-my-pi/pull/12909) by [@h4vc](https://github.com/h4vc)).
+- Fixed multi-account provider selection for OpenCode Go and SuperGrok (xai-oauth), so accounts with insufficient funds or exhausted included quota are skipped in favor of eligible accounts with available billing headroom.
+
+## [18.3.0] - 2026-09-24
+
+### Added
+
+- Added support for Anthropic User Profiles, including schema-validated API responses.
+- Added support for Apple Foundation Models running on-device, including tool calling and vision capabilities.
+- Added multi-account authentication and authorization for Codex cyber access programs, including automatic request replay after access-program rejections.
+- Added credential-aware authentication routing with per-account OAuth policies, deterministic account selection, protected quota reserves, persistent rate-limit tracking, automatic recovery, and sticky session-to-credential affinity.
+- Added deprecated `getApiKey` and `reload` methods for backward compatibility.
+
+## [18.2.11] - 2026-09-23
+
+### Fixed
+
+- Fixed Claude Opus 5.5 not applying a mid-session switch to high-effort reasoning when the session started without an explicit effort setting.
+- Fixed Alibaba Token Plan monthly quotas not appearing in usage reports or the status line.
 
 ## [18.2.9] - 2026-09-22
 
@@ -3241,3 +3259,4 @@
 
 Older entries are archived in [packages/ai/CHANGELOG.md@8a9097246135](https://github.com/can1357/oh-my-pi/blob/8a9097246135bd572ff96fb552121fe1194d2906/packages/ai/CHANGELOG.md).
 Older entries are archived in [packages/ai/CHANGELOG.md@1f7329fc2c7c](https://github.com/can1357/oh-my-pi/blob/1f7329fc2c7c366b38731738e0db9c170f9bb348/packages/ai/CHANGELOG.md).
+Older entries are archived in [packages/ai/CHANGELOG.md@d58593a30902](https://github.com/can1357/oh-my-pi/blob/d58593a3090258473304608d68ffd1f620e6b695/packages/ai/CHANGELOG.md).

@@ -1,5 +1,6 @@
-import { describe, expect, it, vi } from "bun:test";
+import { afterAll, describe, expect, it, vi } from "bun:test";
 import * as AIError from "@oh-my-pi/pi-ai/error";
+import * as BedrockProvider from "@oh-my-pi/pi-ai/providers/amazon-bedrock";
 import { setBedrockProviderModule, streamBedrock } from "@oh-my-pi/pi-ai/providers/register-builtins";
 import type { AssistantMessage, Context, Model } from "@oh-my-pi/pi-ai/types";
 import type { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
@@ -56,6 +57,13 @@ function createAssistantMessage(
 }
 
 const baseContext: Context = { messages: [] };
+
+// `setBedrockProviderModule` installs a process-global override with no clear
+// path — restore the built-in transport after this file or later suites get a
+// mock stream that never invokes `onPayload`.
+afterAll(() => {
+	setBedrockProviderModule(BedrockProvider);
+});
 
 describe("register-builtins lazy streams", () => {
 	it("resolves the outer stream result from source.result() when no terminal event is iterated", async () => {

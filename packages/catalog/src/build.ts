@@ -378,12 +378,18 @@ export function buildModel<TApi extends Api>(spec: ModelSpec<TApi>): Model<TApi>
 	// model policy (identity, thinking, compat, catalog assignments/corrections)
 	// against the canonical `requestModelId` when present — otherwise opaque
 	// aliases of e.g. grok-4.5 miss supports-tools=false and gemini-3-flash
-	// misses sand-wire-model-id.
+	// misses sand-wire-model-id. Opaque deployment aliases (Azure deployment
+	// names, Bedrock ARNs) carry no lineage: when the wire id is unclassifiable
+	// but the catalog `id` resolves to a concrete class, keep the catalog
+	// identity rather than letting the alias erase reviewed knowledge.
 	const requestModelId = spec.requestModelId?.trim();
-	const policy =
-		requestModelId && requestModelId !== spec.id
-			? resolveModelPolicy({ ...spec, id: requestModelId })
-			: resolveModelPolicy(spec);
+	let policy = resolveModelPolicy(spec);
+	if (requestModelId && requestModelId !== spec.id) {
+		const wirePolicy = resolveModelPolicy({ ...spec, id: requestModelId });
+		if (wirePolicy.identity.class !== "unknown" || policy.identity.class === "unknown") {
+			policy = wirePolicy;
+		}
+	}
 	const identity = policy.identity;
 	const supportsComputerUseConfig = explicitComputerUseConfig(spec);
 	const model: Model<TApi> = {

@@ -43,6 +43,13 @@ export interface BashToolDetails {
 	terminalId?: string;
 	/** Absolute working directory the command ran in. */
 	cwd?: string;
+	service?: {
+		name: string;
+		state: string;
+		ready: boolean;
+		timedOut: boolean;
+		pid?: number;
+	};
 	async?: {
 		state: "running" | "completed" | "failed";
 		jobId: string;
@@ -364,6 +371,12 @@ export function createShellRenderer<TArgs>(config: ShellRendererConfig<TArgs>) {
 					if (details?.async?.state === "running") {
 						statsParts.push(`Backgrounded: ${details.async.jobId}`);
 					}
+					if (details?.service) {
+						const service = details.service;
+						statsParts.push(`Service: ${service.name}`, `State: ${service.state}`);
+						statsParts.push(`Ready: ${service.ready ? "yes" : service.timedOut ? "timed out" : "no"}`);
+						if (service.pid !== undefined) statsParts.push(`PID: ${service.pid}`);
+					}
 					if (wallTimeMs !== undefined) {
 						statsParts.push(`Wall: ${formatWallTimeSeconds(wallTimeMs)}s`);
 					}
@@ -462,7 +475,7 @@ export function createShellRenderer<TArgs>(config: ShellRendererConfig<TArgs>) {
 
 /** Renders bash command previews and output. */
 export const bashToolRenderer = createShellRenderer<BashRenderArgs>({
-	resolveTitle: () => "Bash",
+	resolveTitle: args => (args?.name ? `Bash · ${String(args.name)}` : "Bash"),
 	resolveCommand: args => args?.command,
 	resolveCwd: args => args?.cwd,
 	resolveEnv: args => args?.env,

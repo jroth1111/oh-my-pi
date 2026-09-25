@@ -67,10 +67,7 @@ function decodeAssignRequest(body: RequestInit["body"]): AssignModelRequest {
 function decodeChatRequest(body: RequestInit["body"]): GetChatMessageRequest {
 	const framed = new Uint8Array(body as ArrayBuffer);
 	const length = new DataView(framed.buffer, framed.byteOffset, framed.byteLength).getUint32(1, false);
-	return fromBinary(
-		GetChatMessageRequestSchema,
-		framed[0] & 1 ? gunzipSync(framed.subarray(5, 5 + length)) : framed.subarray(5, 5 + length),
-	);
+	return fromBinary(GetChatMessageRequestSchema, gunzipSync(framed.subarray(5, 5 + length)));
 }
 
 /** Fake Devin edge: serves auth, a fixed model assignment, and one chat response frame. */
@@ -143,6 +140,7 @@ describe("streamDevin router assignment", () => {
 		}).result();
 
 		expect(recorded.paths).toEqual([
+			"/exa.auth_pb.AuthService/GetUserJwt",
 			"/exa.api_server_pb.ApiServerService/AssignModel",
 			"/exa.api_server_pb.ApiServerService/GetChatMessage",
 		]);
@@ -165,7 +163,7 @@ describe("streamDevin router assignment", () => {
 		expect(recorded.chat?.chatModelUid).toBe("claude-sonnet-4-5");
 		expect(recorded.chat?.modelAssignmentJwt).toBe("assign-jwt");
 		expect(recorded.chat?.cascadeId).toBe("cascade-42");
-		expect(recorded.chat?.metadata).toMatchObject({ ideType: "chisel", userJwt: "" });
+		expect(recorded.chat?.metadata).toMatchObject({ ideType: "chisel", userJwt: "user-jwt" });
 		expect(result.upstreamModel).toBe("claude-sonnet-4-5");
 		expect(result.stopReason).toBe("stop");
 	});
@@ -231,10 +229,10 @@ describe("streamDevin router assignment", () => {
 		expect(result.usage.credits).toBeUndefined();
 	});
 
-	it("omits the unsupported parallel-tool policy from the native request", async () => {
+	it("enables parallel tool calls only when compat advertises support", async () => {
 		const off = fakeDevin({});
 		await streamDevin(devinModel({}), context, { apiKey: "token", fetch: off.fetch }).result();
-		expect(off.recorded.chat?.disableParallelToolCalls).toBe(false);
+		expect(off.recorded.chat?.disableParallelToolCalls).toBe(true);
 
 		const on = fakeDevin({});
 		await streamDevin(devinModel({ supportsParallelToolCalls: true }), context, {

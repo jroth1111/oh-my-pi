@@ -358,6 +358,12 @@ export const AXES: Readonly<Record<string, AxisDef>> = {
 		shape: "scalar",
 	},
 	"supports-assistant-prefill": { key: "supportsAssistantPrefill", set: "catalog", shape: "scalar" },
+	/**
+	 * Ordered Anthropic model ids forwarded as the server-side `fallbacks`
+	 * chain when the user opts in. Each must appear in the requested model's
+	 * `allowed_fallback_models` (GET /v1/models/{id}); anything else is a 400.
+	 */
+	"server-side-fallback-models": { key: "serverSideFallbackModels", set: "catalog", shape: "array" },
 	priority: { key: "priority", set: "catalog", shape: "scalar" },
 	/**
 	 * Offline Sand wire-parameter allowlist (e.g. `effort`/`fast`). Applied only

@@ -2,9 +2,23 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed shell commands using `/dev/stdin`, `/dev/stdout`, `/dev/stderr`, `/dev/fd/N`, and `/dev/tty` so they now access the command's descriptors correctly, including preventing heredoc commands from hanging the TUI.
+- Fixed native operations such as grep, glob, AST, shell, and VCS calls so they promptly honor an `AbortSignal` that was already aborted when the operation starts.
+
+## [18.3.0] - 2026-09-24
+
+### Added
+
+- Added native bindings for Apple Foundation Models availability checks, text generation, and cancellation.
+- Added offline token counting support for TypeSafe Jev 1.13 `state` inputs via `Encoding.Jev` (excluding the request frame).
+
+## [18.2.11] - 2026-09-23
+
 ### Changed
 
-- `warmHighlighter()` now also prepares TypeScript, TSX, JavaScript, bash, Python, Rust, and Markdown highlighting in the background, so their first highlight no longer blocks the caller ([#12908](https://github.com/can1357/oh-my-pi/pull/12908) by [@H4vC](https://github.com/H4vC)).
+- Improved `warmHighlighter()` so it prepares TypeScript, TSX, JavaScript, Bash, Python, Rust, and Markdown highlighting in the background, reducing delays on the first highlight for these languages.
 
 ## [18.2.9] - 2026-09-22
 

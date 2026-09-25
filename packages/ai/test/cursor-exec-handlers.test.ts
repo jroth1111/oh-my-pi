@@ -38,6 +38,9 @@ import { logger } from "@oh-my-pi/pi-utils";
 
 afterEach(() => {
 	vi.restoreAllMocks();
+	// The provider-module override is process-global with no clear path —
+	// restore the built-in transport or later suites inherit this file's mock.
+	setCursorProviderModule({ streamCursor });
 });
 
 const cursorModel: Model<"cursor-agent"> = buildModel({

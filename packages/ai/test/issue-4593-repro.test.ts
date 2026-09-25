@@ -1,4 +1,5 @@
-import { describe, expect, it } from "bun:test";
+import { afterAll, describe, expect, it } from "bun:test";
+import * as BedrockProvider from "@oh-my-pi/pi-ai/providers/amazon-bedrock";
 import { setBedrockProviderModule, streamBedrock } from "@oh-my-pi/pi-ai/providers/register-builtins";
 import type { AssistantMessage, Context, Model } from "@oh-my-pi/pi-ai/types";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
@@ -156,4 +157,10 @@ describe("idle watchdog local-work deferral (issue #4593)", () => {
 		expect(result.stopReason).toBe("stop");
 		expect(result.errorMessage).toBeUndefined();
 	});
+});
+
+// The provider-module override is process-global with no clear path — restore
+// the built-in transport or later suites inherit this file's mock stream.
+afterAll(() => {
+	setBedrockProviderModule(BedrockProvider);
 });

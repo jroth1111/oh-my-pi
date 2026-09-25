@@ -57,6 +57,7 @@ const ALLOWED_OPTION_KEYS: ReadonlySet<keyof SimpleStreamOptions> = new Set([
 	"maxTokens",
 	"cacheRetention",
 	"cachedContent",
+	"userProfileId",
 	"headers",
 	"initiatorOverride",
 	"maxRetryDelayMs",
@@ -95,8 +96,8 @@ const ALLOWED_OPTION_KEYS: ReadonlySet<keyof SimpleStreamOptions> = new Set([
 	"cursorClientSupportsPromptContextUsageRpc",
 	"cursorRunId",
 	"cursorAgentSessionId",
-	// Anthropic server-side compaction request: the gateway builds the
-	// `compact_20260112` edit itself, so the option must survive the hop.
+	// Anthropic on-demand compaction request: the gateway constructs the
+	// top-level `compaction` parameter, so the option must survive the hop.
 	"anthropicCompaction",
 ] as const satisfies readonly (keyof SimpleStreamOptions)[]);
 
