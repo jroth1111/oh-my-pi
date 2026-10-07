@@ -323,6 +323,8 @@ describe("model presets", () => {
 		tempDirs.push(dir);
 		const noAuth = await AuthStorage.create(path.join(dir.path(), "auth.db"));
 		const registry = new ModelRegistry(noAuth, path.join(dir.path(), "models.yml"));
+		// An empty fixture DB must not inherit ambient env or Grokbot host-secret credentials.
+		vi.spyOn(registry, "hasConfiguredAuth").mockReturnValue(false);
 		try {
 			const settings = Settings.isolated();
 			settings.setModelRole("default", SONNET);

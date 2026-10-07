@@ -111,7 +111,7 @@ or `--fork`.
 | `--prompt-cache-key <key>` | Override the provider prompt-cache key for this session. |
 | `--service-tier <tier>` | OpenAI service tier: `none`, `auto`, `default`, `flex`, `scale`, `priority`, or `ultrafast` (`none` omits `service_tier`). |
 
-See [providers](./providers.md) and [models](./models.md) for model resolution.
+See [providers](./providers.md) and [models](./models.md) for model resolution. Grok Bot (`grokbot` / `grokbot-sand`) one-shot text and tools probes plus the live catalog matrix: [Grok Bot](./grokbot.md).
 
 #### Thinking and reasoning
 

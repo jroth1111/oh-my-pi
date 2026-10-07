@@ -196,6 +196,9 @@ describe("collab host registry lifecycle (#6099)", () => {
 			const reached = Promise.withResolvers<void>();
 			const release = Promise.withResolvers<void>();
 			const completed = Promise.withResolvers<boolean>();
+			// The prompt path short-circuits getApiKey when hasAuth reports a
+			// configured credential; force the getApiKey leg so it stays the gate.
+			spyOn(auth, "hasAuth").mockReturnValue(false);
 			const getApiKey = models.getApiKey.bind(models);
 			const keyLookup = spyOn(models, "getApiKey").mockImplementation(async (...args) => {
 				reached.resolve();

@@ -39,6 +39,10 @@ function extractFunctionName(choice: ToolChoice): string | undefined {
 	return undefined;
 }
 
+export function getNamedToolChoiceName(choice: ToolChoice | undefined): string | undefined {
+	return choice ? extractFunctionName(choice) : undefined;
+}
+
 /**
  * Map unified ToolChoice to OpenAI Completions API format.
  * - "any" → "required"

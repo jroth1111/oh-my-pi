@@ -5799,12 +5799,14 @@ describe("openai-codex streaming", () => {
 		});
 
 		let constructorCount = 0;
+		const socketReady = Promise.withResolvers<void>();
 		const sockets: DeferredOpenWebSocket[] = [];
 		class DeferredOpenWebSocket extends MockWebSocket {
 			constructor(url: string, options?: { headers?: WsHeaders }) {
 				super(url, options);
 				constructorCount += 1;
 				sockets.push(this);
+				socketReady.resolve();
 			}
 
 			open(): void {
@@ -5842,6 +5844,8 @@ describe("openai-codex streaming", () => {
 		}).result();
 
 		// Let both callers reach the handshake before the socket opens.
+		await socketReady.promise;
+		// Upstream invokes onPayload only after connection; waiting for it here deadlocks the handshake.
 		await Bun.sleep(5);
 		for (const socket of sockets) socket.open();
 

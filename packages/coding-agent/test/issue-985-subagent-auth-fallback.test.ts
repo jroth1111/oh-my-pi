@@ -261,10 +261,9 @@ describe("issue #11709: disabled provider subagent model resolution", () => {
 	});
 
 	test("skips an authenticated model from a disabled provider", async () => {
-		const settings = await Settings.init({
-			inMemory: true,
-			overrides: { disabledProviders: ["opencode-zen"] },
-		});
+		// `Settings.init` returns a stale singleton if an earlier test file leaked
+		// one — `isolated` always honors the overrides.
+		const settings = Settings.isolated({ disabledProviders: ["opencode-zen"] });
 		const registry = createMockRegistry({
 			models: [unauthedTaskModel, parentModel],
 			authedProviders: new Set(["opencode-zen", "deepseek"]),

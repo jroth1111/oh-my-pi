@@ -227,6 +227,7 @@ export function extensionEventFromSessionEvent(
 				todos: event.todos,
 				attempt: event.attempt,
 				maxAttempts: event.maxAttempts,
+				...(event.unverifiedMerge ? { unverifiedMerge: true } : {}),
 			};
 		case "goal_updated":
 			return { type: "goal_updated", goal: event.goal, state: event.state };

@@ -310,8 +310,14 @@ export interface AssistantErrorEvent {
 	error: AssistantMessage;
 }
 
+export interface AssistantRoutedModelEvent {
+	type: "routed_model";
+	model: string;
+	partial: AssistantMessage;
+}
+
 /** Streaming update for one assistant message, discriminated by `type`. */
-export type AssistantMessageEvent = AssistantStartEvent | AssistantTextStartEvent | AssistantTextDeltaEvent | AssistantTextEndEvent | AssistantThinkingStartEvent | AssistantThinkingDeltaEvent | AssistantThinkingEndEvent | AssistantImageEndEvent | AssistantToolCallStartEvent | AssistantToolCallDeltaEvent | AssistantToolCallEndEvent | AssistantDoneEvent | AssistantErrorEvent;
+export type AssistantMessageEvent = AssistantStartEvent | AssistantTextStartEvent | AssistantTextDeltaEvent | AssistantTextEndEvent | AssistantThinkingStartEvent | AssistantThinkingDeltaEvent | AssistantThinkingEndEvent | AssistantImageEndEvent | AssistantToolCallStartEvent | AssistantToolCallDeltaEvent | AssistantToolCallEndEvent | AssistantDoneEvent | AssistantErrorEvent | AssistantRoutedModelEvent;
 
 export type Effort = "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
@@ -397,6 +403,7 @@ export type SubagentStatus = "pending" | "running" | "completed" | "failed" | "a
 export interface TodoItem {
 	content: string;
 	status: TodoStatus;
+	droppedBy?: "user";
 	/** What a `blocked` task is waiting on. */
 	blocker?: string;
 	details?: string;
@@ -857,6 +864,7 @@ export interface TodoReminderEvent {
 	todos: TodoItem[];
 	attempt: number;
 	maxAttempts: number;
+	unverifiedMerge?: boolean;
 }
 
 export interface TodoAutoClearEvent {

@@ -283,6 +283,27 @@ describe("worktree isolation helpers", () => {
 			}
 		});
 
+		// First mutator: runs on the pristine fixture, so no reset is needed. Leaves
+		// behind a stash that the next test's reset clears.
+		it("does not pop an unrelated pre-existing stash when the working tree is clean", async () => {
+			// A tracked-file edit makes the cheapest possible "unrelated" stash; the
+			// kind of stash is irrelevant — mergeTaskBranches must not pop one it did
+			// not create. Stashing restores the working tree to clean.
+			await fs.writeFile(path.join(repo, "merged.txt"), "unrelated user change\n");
+			await runGit(repo, ["stash", "push", "-m", "preexisting-user-stash"]);
+
+			const result = await mergeTaskBranches(repo, []);
+
+			const [stashList, status] = await Promise.all([
+				runGit(repo, ["stash", "list"]),
+				runGit(repo, ["status", "--porcelain=v1"]),
+			]);
+			expect(result).toEqual({ failed: [], merged: [], processed: [] });
+			const stashEntries = stashList.split("\n").filter(Boolean);
+			expect(stashEntries).toHaveLength(1);
+			expect(stashEntries[0]).toContain("preexisting-user-stash");
+			expect(status).toBe("");
+		});
 		// These rewind the fixture so each starts from the pristine post-`initial`
 		// state: `reset --hard` restores HEAD + index + tracked files and the parallel
 		// `stash clear` drops any leftover stash. No `git clean` is needed — none of
@@ -305,7 +326,7 @@ describe("worktree isolation helpers", () => {
 					runGit(repo, ["diff", "--cached", "--", "staged.txt"]),
 					runGit(repo, ["stash", "list"]),
 				]);
-				expect(result).toEqual({ failed: [], merged: [TASK_BRANCH] });
+				expect(result).toEqual({ failed: [], merged: [TASK_BRANCH], processed: [TASK_BRANCH] });
 				expect(mergedContent).toBe("task branch change\n");
 				expect(status).toBe("M  staged.txt");
 				expect(cached).toContain("+local staged change");
@@ -350,7 +371,7 @@ describe("worktree isolation helpers", () => {
 					runGit(repo, ["status", "--porcelain=v1"]),
 					fs.readFile(path.join(repo, "merged.txt"), "utf8"),
 				]);
-				expect(result).toEqual({ failed: [], merged: [TASK_BRANCH] });
+				expect(result).toEqual({ failed: [], merged: [TASK_BRANCH], processed: [TASK_BRANCH] });
 				expect(merged).toBe("task branch change\n");
 				expect(status).toBe("M staged.txt\n?? scratch.txt");
 				await fs.rm(path.join(repo, "scratch.txt"));
@@ -387,7 +408,7 @@ describe("worktree isolation helpers", () => {
 					const mergeResult = await mergeTaskBranches(repo, [{ branchName, taskId }]);
 					const finalContent = await fs.readFile(fixturePath, "utf8");
 
-					expect(mergeResult).toEqual({ failed: [], merged: [branchName] });
+					expect(mergeResult).toEqual({ failed: [], merged: [branchName], processed: [branchName] });
 					expect(finalContent).toBe(`${isolatedLines.join("\n")}\n`);
 				} finally {
 					await cleanupTaskBranches(repo, [branchName]);
@@ -456,7 +477,11 @@ describe("worktree isolation helpers", () => {
 						runGit(repo, ["log", "--pretty=%s", `${initialSha}..HEAD`]),
 					]);
 
-					expect(result).toEqual({ failed: [], merged: [TASK_BRANCH, REDUNDANT_BRANCH] });
+					expect(result).toEqual({
+						failed: [],
+						merged: [TASK_BRANCH, REDUNDANT_BRANCH],
+						processed: [TASK_BRANCH, REDUNDANT_BRANCH],
+					});
 					// No cherry-pick sequencer state, no unmerged entries: the
 					// skip advanced cleanly.
 					expect(status).toBe("");
@@ -976,9 +1001,10 @@ describe("applyNestedPatches", () => {
 			"+v2\n";
 		const warnings = await applyNestedPatches(parentRepo, [{ relativePath: nestedRel, patch }]);
 
-		expect(warnings).toHaveLength(1);
-		expect(warnings[0]).toContain("could not be auto-restored");
-		expect(warnings[0]).toContain(nestedRel);
+		expect(warnings.warnings).toHaveLength(1);
+		expect(warnings.warnings[0]).toContain("could not be auto-restored");
+		expect(warnings.warnings[0]).toContain(nestedRel);
+		expect(warnings.applied).toBe(true);
 
 		// Commit landed and the stash entry is preserved for manual recovery.
 		const [committedFiles, stashList] = await Promise.all([
@@ -1087,7 +1113,7 @@ describe("commitToBranch preserves agent commits", () => {
 		const merge = await mergeTaskBranches(parent, [
 			{ branchName: result!.branchName!, taskId: "multi", baseSha: result!.baseSha! },
 		]);
-		expect(merge).toEqual({ failed: [], merged: ["omp/task/multi"] });
+		expect(merge).toEqual({ failed: [], merged: ["omp/task/multi"], processed: ["omp/task/multi"] });
 
 		const subjects = (await runGit(parent, ["log", "-2", "--pretty=%s"])).split("\n");
 		expect(subjects).toEqual(["test: add beta coverage", "feat: add alpha file"]);
@@ -1142,7 +1168,11 @@ describe("commitToBranch preserves agent commits", () => {
 		const merge = await mergeTaskBranches(parent, [
 			{ branchName: result!.branchName!, taskId: "dirty-baseline", baseSha: result!.baseSha! },
 		]);
-		expect(merge).toEqual({ failed: [], merged: ["omp/task/dirty-baseline"] });
+		expect(merge).toEqual({
+			failed: [],
+			merged: ["omp/task/dirty-baseline"],
+			processed: ["omp/task/dirty-baseline"],
+		});
 
 		const [headSubject, status, fixture] = await Promise.all([
 			runGit(parent, ["log", "-1", "--pretty=%s"]),
@@ -1185,7 +1215,7 @@ describe("commitToBranch preserves agent commits", () => {
 		const merge = await mergeTaskBranches(parent, [
 			{ branchName: result!.branchName!, taskId, baseSha: result!.baseSha! },
 		]);
-		expect(merge).toEqual({ failed: [], merged: [result!.branchName!] });
+		expect(merge).toEqual({ failed: [], merged: [result!.branchName!], processed: [result!.branchName!] });
 		expect(await fs.readFile(path.join(parent, "EXP_CLEAN_COMMIT.txt"), "utf8")).toBe(agentLines.join("\n"));
 	});
 

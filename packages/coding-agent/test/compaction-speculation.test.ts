@@ -12,6 +12,7 @@ import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionMaintenance, type SessionMaintenanceHost } from "@oh-my-pi/pi-coding-agent/session/session-maintenance";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import * as snapcompactModule from "@oh-my-pi/snapcompact";
+import { withOfficialAnthropicEndpoint } from "./helpers/anthropic-endpoint";
 
 import { cfgCompactionMethodOrder } from "@oh-my-pi/pi-coding-agent/session/context-settings";
 
@@ -44,6 +45,7 @@ function assistantMessage(text: string, model: Model): AssistantMessage {
 }
 
 describe("async speculative compaction", () => {
+	withOfficialAnthropicEndpoint();
 	let authStorage: AuthStorage;
 	let modelRegistry: ModelRegistry;
 	let model: Model;

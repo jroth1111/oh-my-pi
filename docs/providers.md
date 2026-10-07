@@ -1,6 +1,6 @@
 # Providers
 
-Providers are the model backends `omp` can route requests to: Anthropic, OpenAI, Google Gemini, Groq, OpenRouter, Mistral, xAI, local engines like Ollama, hosted gateways, custom `models.yml` providers, and providers registered by extensions.
+Providers are the model backends `omp` can route requests to: Anthropic, OpenAI, Google Gemini, Groq, OpenRouter, Mistral, xAI, Grok Bot (`grokbot`), local engines like Ollama, hosted gateways, custom `models.yml` providers, and providers registered by extensions.
 
 A **provider** is the account or backend namespace, such as `anthropic`, `openai`, `google`, or `ollama`. A **model** is a concrete model under that provider, selected as `provider/model-id`, such as `anthropic/claude-opus-4-6`. Disabling a provider removes every model under it from selection; if you only want to narrow individual models, use model settings instead.
 
@@ -121,6 +121,7 @@ The variables below supply credentials after runtime/config overrides and stored
 | `xai-oauth`      | `XAI_OAUTH_TOKEN`, then `XAI_API_KEY`                                                                                                            |
 | `github-copilot` | `COPILOT_GITHUB_TOKEN`                                                                                                                           |
 | `cursor`         | `CURSOR_ACCESS_TOKEN`                                                                                                                            |
+| `grokbot`        | `GROKBOT_RENEWAL_CREDENTIAL` (alias `SAND_INFERENCE_RENEWAL_CREDENTIAL`); also requires `GROKBOT_MACHINE_ID` — see [Grok Bot](./grokbot.md)       |
 | `azure`          | `AZURE_OPENAI_API_KEY`                                                                                                                           |
 | `amazon-bedrock` | `AWS_BEARER_TOKEN_BEDROCK`, AWS profiles, `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY`, or an ECS/IRSA/EC2 credential chain                        |
 
@@ -196,6 +197,8 @@ Vertex ADC availability accepts project aliases `GOOGLE_CLOUD_PROJECT`, `GCP_PRO
 For `xai-oauth`, `XAI_API_KEY` is accepted for an explicit request but does not automatically make SuperGrok models available or preferred; automatic availability requires its dedicated `XAI_OAUTH_TOKEN` or stored/configured auth.
 
 `/login cloudflare-ai-gateway` prompts for the gateway token, Cloudflare account ID, and gateway ID, then stores all three together. To use environment variables, set all three values listed above. OMP selects the Anthropic, OpenAI, or Workers AI gateway route for each model; you do not need a `models.yml` base URL override.
+
+`grokbot` is not Cursor OAuth and not xAI. `/login grokbot` only surfaces the host-install prompt for `~/.omp/agent/secrets/grokbot.env`. One-shot probes and the live catalog matrix: [Grok Bot](./grokbot.md).
 
 `charm-hyper` is Charm's OpenAI-compatible inference gateway for coding agents. Issue or manage a key at `https://hyper.charm.land/`; the model list is discovered live from the provider's public `/v1/models` endpoint, and `HYPER_API_KEY` is accepted as a fallback alias for `CHARM_HYPER_API_KEY`.
 

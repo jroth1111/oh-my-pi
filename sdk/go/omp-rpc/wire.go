@@ -1575,6 +1575,37 @@ func (v *AssistantErrorEventReason) UnmarshalJSON(data []byte) error {
 	return unknownValue("AssistantErrorEventReason", s)
 }
 
+type AssistantRoutedModelEvent struct {
+	Model   string           `json:"model"`
+	Partial AssistantMessage `json:"partial"`
+	// Extra holds undeclared keys and declared keys whose value did not decode (that field stays zero).
+	// Encoding writes them back, over a declared field with the same key.
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+func (v *AssistantRoutedModelEvent) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "AssistantRoutedModelEvent", v.decodeFrom)
+}
+
+func (v *AssistantRoutedModelEvent) decodeFrom(raw map[string]json.RawMessage) error {
+	var out AssistantRoutedModelEvent
+	d := fieldDecoder{raw: raw, owner: "AssistantRoutedModelEvent", open: true}
+	d.constant("type", "routed_model")
+	d.required("model", &out.Model)
+	d.required("partial", &out.Partial)
+	out.Extra = d.rest()
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+func (v AssistantRoutedModelEvent) MarshalJSON() ([]byte, error) {
+	type plain AssistantRoutedModelEvent
+	return encodeObject(plain(v), `"type":"routed_model"`, v.Extra)
+}
+
 // Streaming update for one assistant message, discriminated by `type`.
 type AssistantMessageEvent struct {
 	// Value holds one variant, chosen by "type" on decode.
@@ -1599,6 +1630,7 @@ func (AssistantToolCallDeltaEvent) isAssistantMessageEvent() {}
 func (AssistantToolCallEndEvent) isAssistantMessageEvent()   {}
 func (AssistantDoneEvent) isAssistantMessageEvent()          {}
 func (AssistantErrorEvent) isAssistantMessageEvent()         {}
+func (AssistantRoutedModelEvent) isAssistantMessageEvent()   {}
 
 func (v AssistantMessageEvent) MarshalJSON() ([]byte, error) {
 	return encodeVariant("AssistantMessageEvent", v.Value)
@@ -1641,6 +1673,8 @@ func (v *AssistantMessageEvent) decodeFrom(raw map[string]json.RawMessage) error
 		value, err = decodeVariant[AssistantDoneEvent](raw)
 	case "error":
 		value, err = decodeVariant[AssistantErrorEvent](raw)
+	case "routed_model":
+		value, err = decodeVariant[AssistantRoutedModelEvent](raw)
 	default:
 		return unknownValue("AssistantMessageEvent.type", tag)
 	}
@@ -2130,8 +2164,9 @@ func (v *SubagentStatus) UnmarshalJSON(data []byte) error {
 }
 
 type TodoItem struct {
-	Content string     `json:"content"`
-	Status  TodoStatus `json:"status"`
+	Content   string             `json:"content"`
+	Status    TodoStatus         `json:"status"`
+	DroppedBy *TodoItemDroppedBy `json:"droppedBy,omitempty"`
 	// What a `blocked` task is waiting on.
 	Blocker *string  `json:"blocker,omitempty"`
 	Details *string  `json:"details,omitempty"`
@@ -2147,6 +2182,7 @@ func (v *TodoItem) decodeFrom(raw map[string]json.RawMessage) error {
 	d := fieldDecoder{raw: raw, owner: "TodoItem"}
 	d.required("content", &out.Content)
 	d.required("status", &out.Status)
+	d.optional("droppedBy", &out.DroppedBy)
 	d.optional("blocker", &out.Blocker)
 	d.optional("details", &out.Details)
 	d.optional("notes", &out.Notes)
@@ -2155,6 +2191,25 @@ func (v *TodoItem) decodeFrom(raw map[string]json.RawMessage) error {
 	}
 	*v = out
 	return nil
+}
+
+type TodoItemDroppedBy string
+
+const (
+	TodoItemDroppedByUser TodoItemDroppedBy = "user"
+)
+
+func (v *TodoItemDroppedBy) UnmarshalJSON(data []byte) error {
+	s, err := decodeString(data, "TodoItemDroppedBy")
+	if err != nil {
+		return err
+	}
+	switch value := TodoItemDroppedBy(s); value {
+	case TodoItemDroppedByUser:
+		*v = value
+		return nil
+	}
+	return unknownValue("TodoItemDroppedBy", s)
 }
 
 type TodoPhase struct {
@@ -3870,9 +3925,10 @@ func (v TtsrTriggeredEvent) MarshalJSON() ([]byte, error) {
 }
 
 type TodoReminderEvent struct {
-	Todos       []TodoItem `json:"todos"`
-	Attempt     int64      `json:"attempt"`
-	MaxAttempts int64      `json:"maxAttempts"`
+	Todos           []TodoItem `json:"todos"`
+	Attempt         int64      `json:"attempt"`
+	MaxAttempts     int64      `json:"maxAttempts"`
+	UnverifiedMerge *bool      `json:"unverifiedMerge,omitempty"`
 }
 
 func (v *TodoReminderEvent) UnmarshalJSON(data []byte) error {
@@ -3886,6 +3942,7 @@ func (v *TodoReminderEvent) decodeFrom(raw map[string]json.RawMessage) error {
 	d.required("todos", &out.Todos)
 	d.required("attempt", &out.Attempt)
 	d.required("maxAttempts", &out.MaxAttempts)
+	d.optional("unverifiedMerge", &out.UnverifiedMerge)
 	if d.err != nil {
 		return d.err
 	}

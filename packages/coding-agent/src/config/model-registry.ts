@@ -24,6 +24,12 @@ import {
 	clampsContextOverride,
 	resolveMaxContextWindow,
 } from "@oh-my-pi/pi-catalog/compat/context-window";
+import {
+	resolveGrokbotCacheCredentialAsync,
+	resolveGrokbotDiscoveryIdentity,
+	resolveGrokbotDiscoveryIdentityAsync,
+	resolveGrokbotMachineId,
+} from "@oh-my-pi/pi-catalog/discovery/grokbot-auth";
 import { applyCatalogMetrics, CatalogMetricsIndex } from "@oh-my-pi/pi-catalog/identity/metrics";
 import { getModelCacheWriteStats, readModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import {
@@ -917,10 +923,17 @@ export class ModelRegistry {
 		this.#addImplicitDiscoverableProviders(configuredProviders);
 		const configuredDiscoveryProviders = new Set(this.#discoverableProviders.map(provider => provider.provider));
 		this.#pendingStandardCacheProviders = new Set(
-			STARTUP_MODEL_CACHE_PROVIDER_IDS.filter(
-				providerId =>
-					!configuredDiscoveryProviders.has(providerId) && !isCredentialScopedModelCacheProvider(providerId),
-			),
+			STARTUP_MODEL_CACHE_PROVIDER_IDS.filter(providerId => {
+				if (configuredDiscoveryProviders.has(providerId)) return false;
+				// Credential-scoped providers (grokbot, copilot, …) can warm-start from
+				// cache when a sync-resolvable credential exists so the renewer-scoped
+				// cache id matches what discovery previously wrote. Include models.yml
+				// `providers.*.apiKey` (already installed into AuthStorage above).
+				if (isCredentialScopedModelCacheProvider(providerId)) {
+					return Boolean(this.#resolveCredentialScopedStartupApiKey(providerId));
+				}
+				return true;
+			}),
 		);
 		this.#cachedDiscoverableModels = logger.time("modelRegistry:loadDiscoverableModels", () =>
 			this.#applyHardcodedModelPolicies(this.#loadCachedDiscoverableModels()),
@@ -1207,12 +1220,57 @@ export class ModelRegistry {
 		);
 	}
 
+	#resolveCredentialScopedStartupApiKey(providerId: string): string | undefined {
+		// Match AuthStorage.peekApiKey: runtime/config overrides beat env so the
+		// startup cache row matches the credential discovery will hash later.
+		const override = this.authStorage.peekApiKeyOverrides(providerId)?.trim();
+		if (providerId === "grokbot") {
+			// Overrides bypass resolveGrokbotEnvApiKey — still require the machine
+			// id pair or streamGrokBot fails with “machine id missing”.
+			if (override) return resolveGrokbotMachineId() ? override : undefined;
+			return getEnvApiKey(providerId);
+		}
+		return override || getEnvApiKey(providerId);
+	}
+
 	#resolveStartupModelCacheProviderId(providerId: string): string {
 		const baseUrl =
 			this.#runtimeProviderOverrides.get(providerId)?.baseUrl ??
 			this.#providerOverrides.get(providerId)?.baseUrl ??
 			(this.#hasFullSnapshot ? this.getProviderBaseUrl(providerId) : undefined);
-		return resolveModelCacheProviderId(providerId, { baseUrl });
+		const apiKey = isCredentialScopedModelCacheProvider(providerId)
+			? this.#resolveCredentialScopedStartupApiKey(providerId)
+			: undefined;
+		if (providerId === "grokbot") {
+			const identity = resolveGrokbotDiscoveryIdentity();
+			return resolveModelCacheProviderId(providerId, {
+				baseUrl,
+				apiKey,
+				namespace: identity.namespace,
+				clientVersion: identity.clientVersion,
+				headers: this.#peekProviderOverrideHeaders("grokbot"),
+			});
+		}
+		return resolveModelCacheProviderId(providerId, { baseUrl, apiKey });
+	}
+
+	/**
+	 * Raw configured provider headers for cache-key scoping — synchronous.
+	 * Unlike {@link getProviderHeaders}, command-bearing values fingerprint as
+	 * their config string rather than the executed result: stable across
+	 * credential rotation and safe on the sync startup path.
+	 */
+	#peekProviderOverrideHeaders(providerId: string): Record<string, string> | undefined {
+		const headers = {
+			...this.#providerOverrides.get(providerId)?.headers,
+			...this.#runtimeProviderOverrides.get(providerId)?.headers,
+		};
+		return Object.keys(headers).length > 0 ? headers : undefined;
+	}
+
+	async #resolveProviderOverrideHeaders(providerId: string): Promise<Record<string, string> | undefined> {
+		// Merge models.yml + runtime override headers (same as getProviderHeaders).
+		return this.getProviderHeaders(providerId);
 	}
 
 	#loadCachedStandardProviderModels(providerIds: readonly string[]): {
@@ -2249,7 +2307,23 @@ export class ModelRegistry {
 				const preparedConfig =
 					getProviderDefinition(descriptor.providerId)?.prepareModelDiscovery?.(discoveryConfig) ??
 					discoveryConfig;
-				const managerOptions = descriptor.createModelManagerOptions(preparedConfig);
+				// Grok Bot cache scope needs secrets-file identity + renewer; load
+				// both async once here so createModelManagerOptions never sync-reads
+				// the file. Forward configured provider headers for reverse-proxy discovery.
+				const grokbotHeaders =
+					descriptor.providerId === "grokbot" ? await this.#resolveProviderOverrideHeaders("grokbot") : undefined;
+				const managerConfig =
+					descriptor.providerId === "grokbot"
+						? {
+								...preparedConfig,
+								...(await resolveGrokbotDiscoveryIdentityAsync()),
+								cacheCredential: await resolveGrokbotCacheCredentialAsync(
+									typeof preparedConfig.apiKey === "string" ? preparedConfig.apiKey : undefined,
+								),
+								...(grokbotHeaders ? { headers: grokbotHeaders } : {}),
+							}
+						: preparedConfig;
+				const managerOptions = descriptor.createModelManagerOptions(managerConfig);
 				const modelsDev = managerOptions.modelsDev
 					? { ...managerOptions.modelsDev, additiveOnly: true }
 					: modelsDevCatalogFallback(descriptor.providerId, this.#fetch);
@@ -2908,6 +2982,15 @@ export class ModelRegistry {
 			this.#modelsForProviderLookup(provider).find(m => m.provider === provider && m.baseUrl)?.baseUrl
 		);
 	}
+
+	/**
+	 * Effective provider base URL: runtime override, then models.yml, then bundled
+	 * catalog model default (same precedence discovery uses).
+	 */
+	getEffectiveProviderBaseUrl(provider: string): string | undefined {
+		return this.#descriptorBaseUrl(provider);
+	}
+
 	/**
 	 * Materialize provider-level config headers for one outbound request.
 	 * Catalog inspection never executes command-backed values.

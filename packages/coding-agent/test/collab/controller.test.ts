@@ -1694,6 +1694,8 @@ describe("CollabController", () => {
 				await stalled.promise;
 				// Only the host's 15 s connect timeout can end the stalled attempt.
 				vi.advanceTimersByTime(15_000);
+				// Publication/teardown use real socket IPC; only the connect deadline is virtualized.
+				vi.useRealTimers();
 				expect(await state.firstStatus.promise).toMatch(/auto-start failed: timed out connecting to relay/);
 				await settled(publishSpy, 1);
 				await controller.idle();

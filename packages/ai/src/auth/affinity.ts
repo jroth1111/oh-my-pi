@@ -69,6 +69,29 @@ export class SessionAffinity implements SessionsApi {
 	}
 
 	/**
+	 * Drop every session pin that resolves to `credentialId` — called when the
+	 * row's physical identity changes (incarnation bump) so stale pins can't
+	 * resurrect the old account. Persisted stickies for the provider are
+	 * cleared as a unit (the cache exposes prefix delete only).
+	 */
+	clearCredential(provider: string, credentialId: number): void {
+		const sessionMap = this.#sessionLastCredential.get(provider);
+		if (!sessionMap) return;
+		const index = this.#pool.entries(provider).findIndex(entry => entry.id === credentialId);
+		for (const [sessionId, sticky] of sessionMap) {
+			if (sticky.credentialId === credentialId || (sticky.credentialId === undefined && sticky.index === index)) {
+				sessionMap.delete(sessionId);
+			}
+		}
+		if (sessionMap.size === 0) this.#sessionLastCredential.delete(provider);
+		try {
+			this.#store.deleteCachePrefix?.(`${SESSION_STICKY_CACHE_PREFIX}${provider}:`);
+		} catch (err) {
+			logger.debug("Failed to clear provider session sticky credentials from persistent store cache", { err });
+		}
+	}
+
+	/**
 	 * Records which credential was used for a session (for rate-limit switching).
 	 * `lastUsedAtMs` backdates the sticky (session-file pin restores on resume);
 	 * it defaults to now for live selections. Automatic re-recording of the same

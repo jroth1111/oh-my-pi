@@ -769,6 +769,7 @@ mod tests {
 		// `core.hooksPath` would skip the hook below. Absolute, because
 		// `hook_path` joins a relative one onto the linked worktree's root.
 		let hooks = repo.join(".git/hooks");
+		std::fs::create_dir_all(&hooks).expect("create fixture hooks directory");
 		git(&repo, &["config", "commit.gpgSign", "false"]);
 		git(&repo, &["config", "tag.gpgSign", "false"]);
 		git(&repo, &["config", "core.hooksPath", &hooks.to_string_lossy()]);

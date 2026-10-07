@@ -10,6 +10,7 @@ import {
 	defaultSupportedEffort,
 	mapEffortToAnthropicAdaptiveEffort,
 	mapEffortToGoogleThinkingLevel,
+	minimumSupportedEffort,
 	requireSupportedEffort,
 	resolveWireModelId,
 } from "@oh-my-pi/pi-catalog/model-thinking";
@@ -34,6 +35,7 @@ import type { GoogleOptions } from "./providers/google";
 import { getVertexAccessToken } from "./providers/google-auth";
 import type { GoogleGeminiCliOptions } from "./providers/google-gemini-cli";
 import type { GoogleVertexOptions } from "./providers/google-vertex";
+import type { GrokbotOptions } from "./providers/grokbot";
 import { streamKimi } from "./providers/kimi";
 import type { OllamaChatOptions } from "./providers/ollama";
 import type { OpenAICompletionsOptions } from "./providers/openai-completions";
@@ -49,6 +51,7 @@ import {
 	streamGoogle,
 	streamGoogleGeminiCli,
 	streamGoogleVertex,
+	streamGrokBot,
 	streamOllama,
 	streamOpenAICodexResponses,
 	streamOpenAICompletions,
@@ -1124,6 +1127,9 @@ function streamDispatch<TApi extends Api>(
 		case "devin-agent":
 			return streamDevin(providerModel as Model<"devin-agent">, context, providerOptions as DevinOptions);
 
+		case "grokbot-sand":
+			return streamGrokBot(providerModel as Model<"grokbot-sand">, context, providerOptions as GrokbotOptions);
+
 		case "apple-foundation-models":
 			return streamAppleFoundationModels(
 				providerModel as Model<"apple-foundation-models">,
@@ -1921,6 +1927,21 @@ function mapOptionsForApi<TApi extends Api>(
 		fallbacks: options?.fallbacks,
 		acceptEmptyResponse: options?.acceptEmptyResponse,
 		anthropicPrefixMismatchBehavior: options?.anthropicPrefixMismatchBehavior,
+		cursorExcludeTools: options?.cursorExcludeTools,
+		cursorLocalCliMode: options?.cursorLocalCliMode,
+		cursorDevExperimentOverrides: options?.cursorDevExperimentOverrides,
+		cursorClientSupportsInlineImages: options?.cursorClientSupportsInlineImages,
+		cursorClientSupportsRoutedModelUpdate: options?.cursorClientSupportsRoutedModelUpdate,
+		cursorClientSupportsPromptContextUsageRpc: options?.cursorClientSupportsPromptContextUsageRpc,
+		cursorRunId: options?.cursorRunId,
+		cursorAgentSessionId: options?.cursorAgentSessionId,
+		previousResponseId: options?.previousResponseId,
+		parallelToolCalls: options?.parallelToolCalls,
+		seed: options?.seed,
+		logitBias: options?.logitBias,
+		user: options?.user,
+		responseFormat: options?.responseFormat,
+		store: options?.store,
 		anthropicCompaction: options?.anthropicCompaction,
 		anthropicSlowMode: options?.anthropicSlowMode,
 		userProfileId: options?.userProfileId,
@@ -2361,8 +2382,31 @@ function mapOptionsForApi<TApi extends Api>(
 				...base,
 				execHandlers,
 				onToolResult,
-				externalToolExecutor: options?.cursorExternalToolExecutor,
-				wireModelId: resolveWireModelId(cursorModel, effort),
+				toolChoice: options?.toolChoice,
+				// Upstream renamed the flag; accept the PR spelling as fallback
+				// for older callers until the option is removed.
+				externalToolExecutor: options?.cursorExternalToolExecutor ?? options?.cursorToolPassthrough,
+				cursorToolPassthrough: options?.cursorToolPassthrough,
+				cursorExcludeTools: options?.cursorExcludeTools,
+				cursorLocalCliMode: options?.cursorLocalCliMode,
+				cursorDevExperimentOverrides: options?.cursorDevExperimentOverrides,
+				cursorClientSupportsInlineImages: options?.cursorClientSupportsInlineImages,
+				cursorClientSupportsRoutedModelUpdate: options?.cursorClientSupportsRoutedModelUpdate,
+				cursorClientSupportsPromptContextUsageRpc: options?.cursorClientSupportsPromptContextUsageRpc,
+				cursorRunId: options?.cursorRunId,
+				cursorAgentSessionId: options?.cursorAgentSessionId,
+				// A roster-resolved `requestModelId` of "auto" echoes the roster
+				// verbatim (what the CLI sends); otherwise auto mode sends the
+				// "default" wire id, and non-auto resolves from the model's own
+				// requestModelId. Also pin synthetic catalog `auto` so
+				// streamSimple without the gateway header still hits the Cursor
+				// router contract.
+				wireModelId:
+					model.requestModelId === "auto"
+						? "auto"
+						: options?.cursorAutoMode || model.id === "auto"
+							? "default"
+							: resolveWireModelId(cursorModel, effort),
 			});
 		}
 
@@ -2407,6 +2451,40 @@ function mapOptionsForApi<TApi extends Api>(
 			return castApi<"devin-agent">({
 				...base,
 				chatModelUid: resolveWireModelId(devinModel, effort),
+			});
+		}
+		case "grokbot-sand": {
+			const grokbotModel = model as Model<"grokbot-sand">;
+			const allowed = grokbotModel.sandParameterIds ?? [];
+			const acceptsEffort = allowed.includes("effort") || allowed.includes("reasoning");
+			const disableThinking = Boolean(options?.disableReasoning || options?.forceReasoningOff);
+			let effort: Effort | undefined;
+			if (acceptsEffort && grokbotModel.reasoning && grokbotModel.thinking) {
+				if (disableThinking) {
+					// Models with a thinking boolean: omit effort and send thinking:false
+					// below (same as the keep-model retry path). Flooring effort while
+					// also disabling thinking is contradictory and may be rejected.
+					if (!allowed.includes("thinking")) {
+						effort = minimumSupportedEffort(grokbotModel) ?? defaultSupportedEffort(grokbotModel);
+					}
+				} else if (options?.reasoning) {
+					effort = requireSupportedEffort(grokbotModel, options.reasoning);
+				}
+			}
+			// Only pin thinking when the caller chose an effort or disabled reasoning.
+			// Omitting it lets resolveGrokbotRequestedModel apply sandParameterDefaults
+			// (discovered thinking=true + default effort) instead of forcing thinking=false.
+			const thinkingOption =
+				allowed.includes("thinking") && (disableThinking || effort !== undefined)
+					? { thinking: !disableThinking }
+					: {};
+			return castApi<"grokbot-sand">({
+				...base,
+				conversationId: options?.sessionId,
+				stopSequences: options?.stopSequences,
+				effort,
+				toolChoice: options?.toolChoice,
+				...thinkingOption,
 			});
 		}
 		default:

@@ -7,6 +7,11 @@ provider "cursor" {
 		env "CURSOR_API_KEY"
 	}
 
+	// Synthetic auto uses default; authoritative discovery request ids take precedence.
+	models "auto" {
+		request-model-id "default"
+	}
+
 	thinking-mode "effort"
 	// Cursor's default route selects a differently priced backing model per request.
 	models "default" {

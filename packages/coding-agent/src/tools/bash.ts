@@ -692,6 +692,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			requestedTimeoutSec?: number;
 			notices?: readonly string[];
 			wallTimeMs?: number;
+			cwd?: string;
 		} = {},
 	): Promise<AgentToolResult<BashToolDetails>> {
 		const exitCode = result.exitCode;
@@ -719,6 +720,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		const isTimeout = result.timedOut === true;
 
 		const details: BashToolDetails = {};
+		if (options.cwd !== undefined) {
+			details.cwd = options.cwd;
+		}
 		if (timeoutSec === undefined) {
 			details.timeoutDisabled = true;
 		} else {
@@ -782,11 +786,14 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		jobId: string,
 		previewText: string,
 		timeoutSec: number | undefined,
-		options: { requestedTimeoutSec?: number; notices?: readonly string[] } = {},
+		options: { requestedTimeoutSec?: number; notices?: readonly string[]; cwd?: string } = {},
 	): AgentToolResult<BashToolDetails> {
 		const details: BashToolDetails = {
 			async: { state: "running", jobId, type: "bash" },
 		};
+		if (options.cwd !== undefined) {
+			details.cwd = options.cwd;
+		}
 		if (timeoutSec === undefined) {
 			details.timeoutDisabled = true;
 		} else {
@@ -880,6 +887,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						requestedTimeoutSec: options.requestedTimeoutSec,
 						notices: options.notices ?? [],
 						wallTimeMs,
+						cwd: options.commandCwd,
 					});
 					const finalText = this.#extractTextResult(finalResult);
 					latestText = finalText;
@@ -956,11 +964,12 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	): Promise<AgentToolResult<BashToolDetails>> {
 		let command = rawCommand;
 
-		// Extract a leading `cd <path> && ...` into cwd when the model ignores the
-		// cwd parameter. The scanner captures only a single path token and defers
-		// to the shell for anything else (redirects, extra args, shell expansion),
-		// so it never absorbs shell syntax like `cd /tmp 2>/dev/null && ...` into
-		// the structured cwd. Constrained to a top-level `&&` on the first line.
+		// Extract a leading `cd <path> && ...` / `cd <path>; ...` into cwd when the
+		// model ignores the cwd parameter. The scanner captures only a single path
+		// token and defers to the shell for anything else (redirects, extra args,
+		// shell expansion), so it never absorbs shell syntax like
+		// `cd /tmp 2>/dev/null && ...` into the structured cwd. Constrained to a
+		// top-level `&&` or `;` on the first line.
 		if (!cwd) {
 			const cd = extractLeadingCdTarget(command);
 			if (cd) {
@@ -1125,6 +1134,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			return this.#buildBackgroundStartResult(job.jobId, "", timeoutSec, {
 				requestedTimeoutSec,
 				notices: pendingNotices,
+				cwd: commandCwd,
 			});
 		}
 
@@ -1166,6 +1176,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				return this.#buildBackgroundStartResult(job.jobId, "", timeoutSec, {
 					requestedTimeoutSec,
 					notices: pendingNotices,
+					cwd: commandCwd,
 				});
 			}
 			// The job was registered as foreground-backed: hidden from listings and
@@ -1201,6 +1212,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			return this.#buildBackgroundStartResult(job.jobId, job.getLatestText(), timeoutSec, {
 				requestedTimeoutSec,
 				notices,
+				cwd: commandCwd,
 			});
 		}
 
@@ -1470,6 +1482,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					requestedTimeoutSec,
 					notices: bridgeNotices,
 					wallTimeMs: performance.now() - bridgeWallTimeStart,
+					cwd: commandCwd,
 				});
 			} finally {
 				clearTimeout(timeoutTimer);
@@ -1554,6 +1567,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			requestedTimeoutSec,
 			notices: pendingNotices,
 			wallTimeMs,
+			cwd: commandCwd,
 		});
 	}
 }

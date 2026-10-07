@@ -1,0 +1,130 @@
+import { afterEach, describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { clearCustomApis } from "@oh-my-pi/pi-ai/api-registry";
+import { candidateAllowed, startAuthGateway } from "@oh-my-pi/pi-ai/auth-gateway";
+import { AuthStorage } from "@oh-my-pi/pi-ai/auth-storage";
+import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
+
+afterEach(() => {
+	clearCustomApis();
+});
+
+type ErrorBody = { error?: string };
+
+async function withFilterGateway(run: (ctx: { url: string }) => Promise<void>): Promise<void> {
+	registerMockApi();
+	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gw-filters-"));
+	const storage = await AuthStorage.create(path.join(dir, "auth.db"));
+	storage.setRuntimeApiKey("openrouter", "test-key");
+	const mock = createMockModel({
+		provider: "openrouter",
+		id: "known-model",
+		handler: { content: ["ok"] },
+	});
+	const handle = startAuthGateway({
+		bind: "127.0.0.1:0",
+		bearerTokens: ["omp-fixture-bearer-6dc18ed2"],
+		storage,
+		resolveModel: (id: string) => (id === "known-model" ? mock.model : undefined),
+		listModels: () => [mock.model],
+		version: "test",
+	});
+	try {
+		await run({ url: handle.url });
+	} finally {
+		await handle.close();
+		storage.close();
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+}
+
+describe("auth-gateway filter routes", () => {
+	it("returns 501 for POST /v1/realtime with a bearer", async () => {
+		await withFilterGateway(async ({ url }) => {
+			const res = await fetch(`${url}/v1/realtime`, {
+				method: "POST",
+				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2" },
+			});
+			expect(res.status).toBe(501);
+			expect(await res.json()).toEqual({ error: "not available on this gateway" });
+		});
+	});
+
+	it("routes POST /v1/audio/speech and reports an unknown model", async () => {
+		await withFilterGateway(async ({ url }) => {
+			const res = await fetch(`${url}/v1/audio/speech`, {
+				method: "POST",
+				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2", "Content-Type": "application/json" },
+				body: JSON.stringify({ model: "tts-1", input: "hi", voice: "alloy" }),
+			});
+			expect(res.status).toBe(404);
+			expect(await res.json()).toEqual({
+				error: { code: 404, type: "invalid_request_error", message: "Unknown model: tts-1" },
+			});
+		});
+	});
+
+	it("returns 401 for POST /v1/realtime without a bearer (negative)", async () => {
+		await withFilterGateway(async ({ url }) => {
+			const res = await fetch(`${url}/v1/realtime`, { method: "POST" });
+			expect(res.status).toBe(401);
+			const body = (await res.json()) as ErrorBody;
+			expect(body.error).toBe("unauthorized");
+		});
+	});
+
+	it("returns 400 for POST /v1/images/generations when prompt is missing", async () => {
+		await withFilterGateway(async ({ url }) => {
+			const res = await fetch(`${url}/v1/images/generations`, {
+				method: "POST",
+				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2", "Content-Type": "application/json" },
+				body: JSON.stringify({ model: "gpt-image-1" }),
+			});
+			expect(res.status).toBe(400);
+			expect(await res.json()).toEqual({
+				error: {
+					code: 400,
+					type: "invalid_request_error",
+					message: "images: prompt must be a string (length at least 1) (was missing)",
+				},
+			});
+		});
+	});
+
+	it("returns 401 for POST /v1/images/generations without a bearer (negative)", async () => {
+		await withFilterGateway(async ({ url }) => {
+			const res = await fetch(`${url}/v1/images/generations`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ prompt: "a cube" }),
+			});
+			expect(res.status).toBe(401);
+			const body = (await res.json()) as ErrorBody;
+			expect(body.error).toBe("unauthorized");
+		});
+	});
+});
+
+describe("auth-gateway portability skip gate", () => {
+	it("rejects a required provider mismatch (negative)", () => {
+		expect(
+			candidateAllowed(
+				{ scope: "provider", origin: "anthropic" },
+				{ id: "openai-1", provider: "openai" },
+				"required",
+			),
+		).toBe(false);
+	});
+
+	it("allows a required provider match", () => {
+		expect(
+			candidateAllowed(
+				{ scope: "provider", origin: "anthropic" },
+				{ id: "claude-1", provider: "anthropic" },
+				"required",
+			),
+		).toBe(true);
+	});
+});

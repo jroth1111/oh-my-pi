@@ -193,6 +193,22 @@ export function extractSegments(
 const SPACE_BUFFER = " ".repeat(512);
 const TAB_SPACES = " ".repeat(DEFAULT_TAB_WIDTH);
 
+/** Truncation lengths for different content types */
+export const TRUNCATE_LENGTHS = {
+	/** Short titles, labels */
+	TITLE: 60,
+	/** Medium-length content (messages, previews) */
+	CONTENT: 80,
+	/** Longer content (code, explanations) */
+	LONG: 100,
+	/** Full line content */
+	LINE: 110,
+	/** Very short (task previews, badges) */
+	SHORT: 40,
+	/** Idle recap status line (~40-word LLM reply) */
+	RECAP: 280,
+} as const;
+
 /*
  * Replace tabs with the fixed display tab width for consistent rendering.
  */

@@ -35,6 +35,13 @@ async function withDiscoveryHome<T>(fn: (paths: DiscoveryPaths) => Promise<T>): 
 	const previousUserProfile = process.env.USERPROFILE;
 	process.env.HOME = home;
 	process.env.USERPROFILE = home;
+	// A leaked PI_CODING_AGENT_DIR / profile selection from an earlier test file
+	// would be baked into the dirs resolver by __resetDirsFromEnvForTests and
+	// point user-config discovery at a foreign (possibly deleted) directory.
+	const savedDirEnv = ["PI_CODING_AGENT_DIR", "OMP_PROFILE", "PI_PROFILE"].map(
+		key => [key, process.env[key]] as const,
+	);
+	for (const [key] of savedDirEnv) delete process.env[key];
 	__resetDirsFromEnvForTests();
 	try {
 		return await fn({
@@ -48,6 +55,10 @@ async function withDiscoveryHome<T>(fn: (paths: DiscoveryPaths) => Promise<T>): 
 		else process.env.HOME = previousHome;
 		if (previousUserProfile === undefined) delete process.env.USERPROFILE;
 		else process.env.USERPROFILE = previousUserProfile;
+		for (const [key, value] of savedDirEnv) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
 		__resetDirsFromEnvForTests();
 	}
 }
