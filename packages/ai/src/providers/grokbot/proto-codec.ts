@@ -8,6 +8,7 @@
  * Typed exports also re-exported from `./proto.ts`. Prefer importing via
  * `./proto.ts` from outside this folder.
  */
+import { frameConnectPayload } from "@oh-my-pi/pi-utils";
 
 export const CONNECT_END_STREAM_FLAG = 0b00000010;
 
@@ -24,12 +25,7 @@ type DecodedField = {
 };
 
 export function frameConnectProto(protoBytes: BytesLike, flags = 0): Buffer {
-	const payload = Buffer.isBuffer(protoBytes) ? protoBytes : Buffer.from(protoBytes);
-	const frame = Buffer.alloc(5 + payload.length);
-	frame[0] = flags;
-	frame.writeUInt32BE(payload.length, 1);
-	payload.copy(frame, 5);
-	return frame;
+	return frameConnectPayload(protoBytes, flags);
 }
 
 const WIRE_VARINT = 0;
