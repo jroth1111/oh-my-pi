@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added explicit Grok Bot Opus 5.5 low, medium, high, and xhigh selectors backed by canonical Sand effort parameters.
+
 ## [18.6.0] - 2026-10-03
 
 ### Added

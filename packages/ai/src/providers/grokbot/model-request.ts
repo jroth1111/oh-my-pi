@@ -97,6 +97,10 @@ function resolveSandEffortWireValue(
 		const value = defaults?.effort?.trim();
 		if (value) return value;
 	}
+	if (allowed.has("reasoning_effort")) {
+		const value = defaults?.reasoning_effort?.trim();
+		if (value) return value;
+	}
 	if (allowed.has("reasoning")) {
 		const value = defaults?.reasoning?.trim();
 		if (value) return value;
@@ -162,6 +166,9 @@ export function resolveGrokbotRequestedModel(
 		if (effortValue) {
 			if (allowed.has("effort")) {
 				parameters.push({ id: "effort", value: effortValue });
+			} else if (allowed.has("reasoning_effort")) {
+				// Anthropic Haiku/Sonnet sand rows name the ladder `reasoning_effort`.
+				parameters.push({ id: "reasoning_effort", value: effortValue });
 			} else if (allowed.has("reasoning")) {
 				parameters.push({ id: "reasoning", value: effortValue });
 			}

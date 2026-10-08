@@ -22,6 +22,7 @@ import {
 	joinGrokbotBackendUrl,
 	loadGrokbotConfig,
 	mergeGrokbotHeaders,
+	grokbotMetadataHeaders,
 	mintGrokbotAccessToken,
 	resolveGrokbotClientVersion,
 } from "./grokbot-auth";
@@ -107,7 +108,7 @@ export async function fetchGrokbotAvailableModels(
 		const postAvailableModels = async (accessToken: string) =>
 			fetchImpl(requestUrl, {
 				method: "POST",
-				headers: mergeGrokbotHeaders(options.headers, grokbotClientHeaders(cfg), {
+				headers: mergeGrokbotHeaders(grokbotMetadataHeaders(options.headers), grokbotClientHeaders(cfg), {
 					authorization: `Bearer ${accessToken}`,
 					"x-cursor-checksum": createGrokbotChecksum(machineId),
 					"x-ghost-mode": "true",
@@ -370,9 +371,11 @@ function collectEffortValues(
 ): { efforts: Effort[]; unrecognizedEffortOnly: boolean } {
 	const effortParam = parameterIds.includes("effort")
 		? "effort"
-		: parameterIds.includes("reasoning")
-			? "reasoning"
-			: undefined;
+		: parameterIds.includes("reasoning_effort")
+			? "reasoning_effort"
+			: parameterIds.includes("reasoning")
+				? "reasoning"
+				: undefined;
 	if (!effortParam) return { efforts: [], unrecognizedEffortOnly: false };
 
 	const values = new Set<string>();

@@ -178,9 +178,9 @@ function encodeRequestedModel(rm: unknown): Buffer {
 	const params = Array.isArray(rec.parameters) ? rec.parameters : [];
 	for (const p of params) chunks.push(encodeMessage(3, encodeParameter(p as ProtoRecord)));
 	if (rec.builtInModel || rec.built_in_model) chunks.push(encodeBool(4, true));
-	if (rec.isVariantStringRepresentation || rec.is_variant_string_representation) {
-		chunks.push(encodeBool(5, true));
-	}
+	// Field 5 (`is_variant_string_representation`) was removed from sand-host's
+	// InferenceRequestedModel (host 3f90dc1: `1 model_id|2 max_mode|3 parameters|4 built_in_model`).
+	// Keep the in-memory flag for callers/tests but never put it on the wire.
 	return concat(chunks);
 }
 
@@ -349,6 +349,8 @@ function encodeCoreMessage(msg: ProtoRecord): Buffer {
 			? msg.reasoning_parts
 			: [];
 	for (const rp of reasoning) chunks.push(encodeMessage(7, encodeReasoningPart(rp as ProtoRecord)));
+	const nativeContent = msg.anthropicNativeContent ?? msg.anthropic_native_content;
+	if (typeof nativeContent === "string") chunks.push(encodeString(18, nativeContent));
 	return concat(chunks);
 }
 
@@ -704,6 +706,7 @@ function decodeCoreMessage(buf: BytesLike): ProtoRecord {
 	if (tcs.length) msg.toolCalls = tcs;
 	const rps = all(fields, 7).map(f => decodeReasoningPart(fieldBytes(f)));
 	if (rps.length) msg.reasoningParts = rps;
+	if (first(fields, 18)) msg.anthropicNativeContent = asString(first(fields, 18));
 	return msg;
 }
 
@@ -813,6 +816,10 @@ function encodeStreamError(err: ProtoRecord): Buffer {
 }
 
 export function encodeInferenceStreamResponse(resp: ProtoRecord): Buffer {
+	if (resp.providerMetadata || resp.provider_metadata) {
+		const metadata = (resp.providerMetadata ?? resp.provider_metadata) as ProtoRecord;
+		return encodeMessage(6, encodeMessage(1, encodeStruct((metadata.metadata ?? {}) as ProtoRecord)));
+	}
 	if (resp.textPart || resp.text_part) {
 		return encodeMessage(1, encodeTextStreamPart((resp.textPart || resp.text_part) as ProtoRecord));
 	}

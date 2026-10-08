@@ -906,16 +906,33 @@ function matchModel(
 /**
  * Recover the effort a retired wire-tier id (e.g. `gemini-3.8-flash-high`) implied before it was
  * collapsed into a logical model. Only a route owned by exactly one level carries intent: the
- * model's default wire id and ids shared by several levels imply nothing, so the caller's level
- * still applies.
+ * ids shared by several levels imply nothing, so the caller's level still applies.
+ * Native adapter tier selectors remain explicit, including the default tier.
  */
 function inferWireRouteThinkingLevel(pattern: string, model: Model<Api>): ConfiguredThinkingLevel | undefined {
-	const routing = model.thinking?.effortRouting;
-	if (!routing) return undefined;
 	const normalized = pattern.trim().toLowerCase();
 	const providerPrefix = `${model.provider.toLowerCase()}/`;
 	const wireId = normalized.startsWith(providerPrefix) ? normalized.slice(providerPrefix.length) : normalized;
-	if (wireId === model.id.toLowerCase() || wireId === model.requestModelId?.toLowerCase()) return undefined;
+	// Native adapter tier selectors retain explicit intent even when the tier
+	// is the default wire id or Sand represents it as a request parameter.
+	const alias = resolveVariantSelector(model.provider, wireId);
+	const collapsed = collapseVariantId(model.provider, wireId);
+	if (
+		(model.api === "grokbot-sand" || model.api === "cursor-agent") &&
+		alias !== undefined &&
+		(alias.toLowerCase() === model.id.toLowerCase() || alias.toLowerCase() === model.requestModelId?.toLowerCase()) &&
+		collapsed.effort !== undefined &&
+		collapsed.effort !== "off" &&
+		model.thinking?.efforts?.includes(collapsed.effort)
+	)
+		return parseConfiguredThinkingLevel(collapsed.effort);
+	const routing = model.thinking?.effortRouting;
+	if (!routing) return undefined;
+	if (
+		wireId === model.id.toLowerCase() ||
+		(model.api !== "grokbot-sand" && model.api !== "cursor-agent" && wireId === model.requestModelId?.toLowerCase())
+	)
+		return undefined;
 
 	const levels = [ThinkingLevel.Off, ...(model.thinking?.efforts ?? [])];
 	const matches = levels.filter(level => routing[level]?.toLowerCase() === wireId);

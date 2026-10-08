@@ -109,12 +109,12 @@ describe("grokbot secrets dotenv parsing", () => {
 		await fs.mkdir(path.join(agentDir, "secrets"), { recursive: true });
 		await Bun.write(
 			secretsPathFor(agentDir),
-			["GROKBOT_NAMESPACE=lab", "GROKBOT_CLIENT_VERSION=0.30.0-lab"].join("\n"),
+			["GROKBOT_NAMESPACE=lab", "GROKBOT_CLIENT_VERSION=0.69.0-lab"].join("\n"),
 		);
 
 		await runWithGrokbotAuthSourceAsync(authSource(agentDir), async () => {
 			const identity = await resolveGrokbotDiscoveryIdentityAsync();
-			expect(identity).toEqual({ namespace: "lab", clientVersion: "0.30.0-lab" });
+			expect(identity).toEqual({ namespace: "lab", clientVersion: "0.69.0-lab" });
 			expect(resolveGrokbotDiscoveryIdentity()).toEqual(identity);
 
 			const fromSecrets = resolveModelCacheProviderId("grokbot", {
@@ -125,13 +125,13 @@ describe("grokbot secrets dotenv parsing", () => {
 				apiKey: "renewer",
 				baseUrl: "https://api2.cursor.sh",
 				namespace: "lab",
-				clientVersion: "0.30.0-lab",
+				clientVersion: "0.69.0-lab",
 			});
 			const prod = resolveModelCacheProviderId("grokbot", {
 				apiKey: "renewer",
 				baseUrl: "https://api2.cursor.sh",
 				namespace: "prod",
-				clientVersion: "0.30.0",
+				clientVersion: "0.69.0",
 			});
 			expect(fromSecrets).toBe(explicit);
 			expect(fromSecrets).not.toBe(prod);
@@ -144,35 +144,35 @@ describe("grokbot secrets dotenv parsing", () => {
 		await fs.mkdir(path.join(agentDir, "secrets"), { recursive: true });
 		await Bun.write(
 			secretsPathFor(agentDir),
-			["GROKBOT_NAMESPACE=lab", "GROKBOT_CLIENT_VERSION=0.30.0-lab"].join("\n"),
+			["GROKBOT_NAMESPACE=lab", "GROKBOT_CLIENT_VERSION=0.69.0-lab"].join("\n"),
 		);
 
 		await runWithGrokbotAuthSourceAsync(
 			authSource(agentDir, {
 				GROKBOT_MACHINE_ID: "machine",
 				GROKBOT_NAMESPACE: "lab",
-				GROKBOT_CLIENT_VERSION: "0.30.0-lab",
+				GROKBOT_CLIENT_VERSION: "0.69.0-lab",
 			}),
 			async () => {
 				// Fully resolved overrides must win over secrets-file values (no reread).
 				expect(
 					resolveGrokbotDiscoveryIdentity({
 						namespace: "prod",
-						clientVersion: "0.30.0",
+						clientVersion: "0.69.0",
 					}),
-				).toEqual({ namespace: "prod", clientVersion: "0.30.0" });
+				).toEqual({ namespace: "prod", clientVersion: "0.69.0" });
 				expect(
 					await resolveGrokbotDiscoveryIdentityAsync({
 						namespace: "prod",
-						clientVersion: "0.30.0",
+						clientVersion: "0.69.0",
 					}),
-				).toEqual({ namespace: "prod", clientVersion: "0.30.0" });
+				).toEqual({ namespace: "prod", clientVersion: "0.69.0" });
 
 				const withPassThrough = resolveModelCacheProviderId("grokbot", {
 					apiKey: "renewer",
 					baseUrl: "https://api2.cursor.sh",
 					namespace: "prod",
-					clientVersion: "0.30.0",
+					clientVersion: "0.69.0",
 				});
 				const fromSecrets = resolveModelCacheProviderId("grokbot", {
 					apiKey: "renewer",
@@ -183,7 +183,7 @@ describe("grokbot secrets dotenv parsing", () => {
 				const options = grokbotModelManagerOptions({
 					apiKey: "renewer",
 					namespace: "prod",
-					clientVersion: "0.30.0",
+					clientVersion: "0.69.0",
 				});
 				expect(options.cacheProviderId).toBe(withPassThrough);
 
@@ -209,13 +209,13 @@ describe("grokbot secrets dotenv parsing", () => {
 				const manager = grokbotModelManagerOptions({
 					apiKey: "renewer",
 					namespace: "prod",
-					clientVersion: "0.30.0",
+					clientVersion: "0.69.0",
 					fetch: fetchImpl,
 				});
 				expect(await manager.fetchDynamicModels?.()).not.toBeNull();
 				expect(seen.length).toBeGreaterThanOrEqual(2);
 				expect(seen.every(h => h["x-sand-box-namespace"] === "prod")).toBe(true);
-				expect(seen.every(h => h["x-cursor-client-version"] === "0.30.0")).toBe(true);
+				expect(seen.every(h => h["x-cursor-client-version"] === "0.69.0")).toBe(true);
 				expect(seen.some(h => h["x-sand-box-namespace"] === "lab")).toBe(false);
 			},
 		);
@@ -304,7 +304,7 @@ describe("grokbot secrets dotenv parsing", () => {
 				apiKey: GROKBOT_AUTHENTICATED_SENTINEL,
 				baseUrl: "https://api2.cursor.sh",
 				namespace: "prod",
-				clientVersion: "0.30.0",
+				clientVersion: "0.69.0",
 			});
 		});
 		const cacheB = runWithGrokbotAuthSource(authSource(agentDirB), () => {
@@ -313,7 +313,7 @@ describe("grokbot secrets dotenv parsing", () => {
 				apiKey: GROKBOT_AUTHENTICATED_SENTINEL,
 				baseUrl: "https://api2.cursor.sh",
 				namespace: "prod",
-				clientVersion: "0.30.0",
+				clientVersion: "0.69.0",
 			});
 		});
 		expect(cacheA).not.toBe(cacheB);
@@ -325,7 +325,7 @@ describe("grokbot secrets dotenv parsing", () => {
 					apiKey: "file-renewal-a",
 					baseUrl: "https://api2.cursor.sh",
 					namespace: "prod",
-					clientVersion: "0.30.0",
+					clientVersion: "0.69.0",
 				}),
 			).toBe(cacheA);
 			// Precomputed cacheCredential matches the expanded sentinel and skips
@@ -337,14 +337,14 @@ describe("grokbot secrets dotenv parsing", () => {
 					cacheCredential: "file-renewal-a",
 					baseUrl: "https://api2.cursor.sh",
 					namespace: "prod",
-					clientVersion: "0.30.0",
+					clientVersion: "0.69.0",
 				}),
 			).toBe(cacheA);
 			expect(
 				grokbotModelManagerOptions({
 					apiKey: GROKBOT_AUTHENTICATED_SENTINEL,
 					namespace: "prod",
-					clientVersion: "0.30.0",
+					clientVersion: "0.69.0",
 					cacheCredential: "file-renewal-a",
 				}).cacheProviderId,
 			).toBe(cacheA);
@@ -388,7 +388,7 @@ describe("grokbot secrets dotenv parsing", () => {
 		const manager = grokbotModelManagerOptions({
 			apiKey: GROKBOT_AUTHENTICATED_SENTINEL,
 			namespace: "prod",
-			clientVersion: "0.30.0",
+			clientVersion: "0.69.0",
 			cacheCredential: "file-renewal-a",
 			fetch: fetchImpl,
 		});
@@ -472,7 +472,7 @@ describe("grokbot backend URL join", () => {
 			{ preconnect: fetch.preconnect },
 		) as typeof fetch;
 		await mintGrokbotAccessToken(
-			{ renewal: "renewer", machineId: "machine", namespace: "prod", clientVersion: "0.30.0" },
+			{ renewal: "renewer", machineId: "machine", namespace: "prod", clientVersion: "0.69.0" },
 			fetchImpl,
 			"https://proxy.example/grokbot",
 		);
@@ -492,7 +492,7 @@ describe("grokbot backend URL join", () => {
 			{ preconnect: fetch.preconnect },
 		) as typeof fetch;
 		await mintGrokbotAccessToken(
-			{ renewal: "renewer", machineId: "machine", namespace: "prod", clientVersion: "0.30.0" },
+			{ renewal: "renewer", machineId: "machine", namespace: "prod", clientVersion: "0.69.0" },
 			fetchImpl,
 			"https://proxy.example/grokbot",
 			undefined,
@@ -518,7 +518,7 @@ describe("grokbot backend URL join", () => {
 			{ preconnect: fetch.preconnect },
 		) as typeof fetch;
 		await mintGrokbotAccessToken(
-			{ renewal: "renewer", machineId: "machine", namespace: "prod", clientVersion: "0.30.0" },
+			{ renewal: "renewer", machineId: "machine", namespace: "prod", clientVersion: "0.69.0" },
 			fetchImpl,
 			"https://proxy.example/grokbot",
 			undefined,
@@ -546,7 +546,7 @@ describe("grokbot backend URL join", () => {
 			},
 			{ preconnect: fetch.preconnect },
 		) as typeof fetch;
-		const cfg = { renewal: "renewer", machineId: "machine", namespace: "prod", clientVersion: "0.30.0" };
+		const cfg = { renewal: "renewer", machineId: "machine", namespace: "prod", clientVersion: "0.69.0" };
 		const first = await mintGrokbotAccessToken(cfg, fetchImpl, "https://proxy.example/grokbot", undefined, {
 			"x-tenant": "a",
 		});
@@ -592,7 +592,7 @@ describe("grokbot AvailableModels headers", () => {
 					...CLEAR_GROKBOT_ENV,
 					GROKBOT_MACHINE_ID: "machine",
 					GROKBOT_NAMESPACE: "prod",
-					GROKBOT_CLIENT_VERSION: "0.30.0",
+					GROKBOT_CLIENT_VERSION: "0.69.0",
 				},
 			},
 			() =>
@@ -600,19 +600,20 @@ describe("grokbot AvailableModels headers", () => {
 					apiKey: "renewer",
 					baseUrl: "https://proxy.example/grokbot",
 					fetch: fetchImpl,
-					headers: { "x-proxy-api-key": "proxy-secret" },
+					headers: { "x-proxy-api-key": "proxy-secret", "X-Inference-Authentication-Jwt": "one-shot-fixture" },
 				}),
 		);
 		expect(models).not.toBeNull();
 		expect(seen.length).toBe(2);
 		expect(seen.every(s => s.headers["x-proxy-api-key"] === "proxy-secret")).toBe(true);
+		expect(seen.every(s => s.headers["x-inference-authentication-jwt"] === undefined)).toBe(true);
 		expect(seen[1]?.url).toContain("/aiserver.v1.AiService/AvailableModels");
 		expect(seen[1]?.headers["connect-protocol-version"]).toBe("1");
 	});
 
 	test("namespace-only AvailableModels override recomputes client version", async () => {
 		// Direct callers may pass namespace: "lab" without clientVersion — identity
-		// must recompute 0.30.0-lab rather than keep the ambient production version.
+		// must recompute 0.69.0-lab rather than keep the ambient production version.
 		const seen: Array<Record<string, string>> = [];
 		const syncIdentitySpy = spyOn(grokbotAuth, "resolveGrokbotDiscoveryIdentity");
 		const fetchImpl = Object.assign(
@@ -639,8 +640,8 @@ describe("grokbot AvailableModels headers", () => {
 						...CLEAR_GROKBOT_ENV,
 						GROKBOT_MACHINE_ID: "machine",
 						// Ambient production namespace with no explicit clientVersion so
-						// loadGrokbotConfig derives 0.30.0 — the namespace-only override
-						// must recompute 0.30.0-lab rather than keep that derived value.
+						// loadGrokbotConfig derives 0.69.0 — the namespace-only override
+						// must recompute 0.69.0-lab rather than keep that derived value.
 						GROKBOT_NAMESPACE: "prod",
 					},
 				},
@@ -656,7 +657,7 @@ describe("grokbot AvailableModels headers", () => {
 			// AvailableModels is the second call (after mint); both carry identity.
 			const modelsHeaders = seen[1] ?? seen[0];
 			expect(modelsHeaders?.["x-sand-box-namespace"]).toBe("lab");
-			expect(modelsHeaders?.["x-cursor-client-version"]).toBe("0.30.0-lab");
+			expect(modelsHeaders?.["x-cursor-client-version"]).toBe("0.69.0-lab");
 			// Derive overrides from the async-loaded config — no sync identity helper.
 			expect(syncIdentitySpy).not.toHaveBeenCalled();
 		} finally {
@@ -690,7 +691,7 @@ describe("grokbot AvailableModels headers", () => {
 					...CLEAR_GROKBOT_ENV,
 					GROKBOT_MACHINE_ID: "machine",
 					GROKBOT_NAMESPACE: "prod",
-					GROKBOT_CLIENT_VERSION: "0.30.0",
+					GROKBOT_CLIENT_VERSION: "0.69.0",
 				},
 			},
 			() =>
@@ -735,7 +736,7 @@ describe("grokbot AvailableModels headers", () => {
 					...CLEAR_GROKBOT_ENV,
 					GROKBOT_MACHINE_ID: "machine",
 					GROKBOT_NAMESPACE: "prod",
-					GROKBOT_CLIENT_VERSION: "0.30.0",
+					GROKBOT_CLIENT_VERSION: "0.69.0",
 				},
 			},
 			() =>
@@ -774,7 +775,7 @@ describe("grokbot AvailableModels headers", () => {
 					...CLEAR_GROKBOT_ENV,
 					GROKBOT_MACHINE_ID: "machine",
 					GROKBOT_NAMESPACE: "prod",
-					GROKBOT_CLIENT_VERSION: "0.30.0",
+					GROKBOT_CLIENT_VERSION: "0.69.0",
 				},
 			},
 			() =>

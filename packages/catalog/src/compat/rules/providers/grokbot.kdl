@@ -3,7 +3,7 @@
 // from neutral seeds instead of TypeScript per-id branches.
 
 provider "grokbot" {
-	default-model "sand-default"
+	default-model "claude-opus-5-5"
 	env "GROKBOT_RENEWAL_CREDENTIAL" "SAND_INFERENCE_RENEWAL_CREDENTIAL"
 	dynamic-models-authoritative #true
 	discovery label="Grok Bot (not Cursor, not xAI)" {
@@ -17,6 +17,12 @@ provider "grokbot" {
 	// keep these rows in sync with GROKBOT_MODEL_SEEDS.
 	seed api="grokbot-sand" base-url="https://api2.cursor.sh" bundle="fallback" {
 		model "sand-default" name="sand-default (routed)" {
+			reasoning #false
+			input "text"
+			cost input=0 output=0 cache-read=0 cache-write=0
+			limits
+		}
+		model "sand-default-preferred" name="Grok Bot preferred (server routing, may use Opus 5.5)" {
 			reasoning #false
 			input "text"
 			cost input=0 output=0 cache-read=0 cache-write=0
@@ -52,6 +58,97 @@ provider "grokbot" {
 			cost input=0 output=0 cache-read=0 cache-write=0
 			limits
 		}
+		// Claude/Anthropic offline-fallback rows (from captured AvailableModels 2026-10-08).
+		model "claude-opus-5-5" name="Claude Opus 5.5" {
+			reasoning #true
+			input "text" "image"
+			cost input=0 output=0 cache-read=0 cache-write=0
+			limits context=300000
+		}
+		model "claude-opus-5" name="Claude Opus 5" {
+			reasoning #true
+			input "text" "image"
+			cost input=0 output=0 cache-read=0 cache-write=0
+			limits context=300000
+		}
+		model "claude-opus-4-8" name="Claude Opus 4.8" {
+			reasoning #true
+			input "text" "image"
+			cost input=0 output=0 cache-read=0 cache-write=0
+			limits context=300000
+		}
+		model "claude-opus-4-7" name="Claude Opus 4.7" {
+			reasoning #true
+			input "text" "image"
+			cost input=0 output=0 cache-read=0 cache-write=0
+			limits context=300000
+		}
+		model "claude-opus-4-6" name="Claude Opus 4.6" {
+			reasoning #true
+			input "text" "image"
+			cost input=0 output=0 cache-read=0 cache-write=0
+			limits context=1000000
+		}
+		model "claude-opus-4-5" name="Claude Opus 4.5" {
+			reasoning #true
+			input "text" "image"
+			cost input=0 output=0 cache-read=0 cache-write=0
+			limits context=200000
+		}
+		model "claude-sonnet-5-5" name="Claude Sonnet 5.5" {
+			reasoning #true
+			input "text" "image"
+			cost input=0 output=0 cache-read=0 cache-write=0
+			limits context=300000
+		}
+		model "claude-sonnet-5" name="Claude Sonnet 5" {
+			reasoning #true
+			input "text" "image"
+			cost input=0 output=0 cache-read=0 cache-write=0
+			limits context=300000
+		}
+		model "claude-sonnet-4-6" name="Claude Sonnet 4.6" {
+			reasoning #true
+			input "text" "image"
+			cost input=0 output=0 cache-read=0 cache-write=0
+			limits context=1000000
+		}
+		model "claude-sonnet-4-5" name="Claude Sonnet 4.5" {
+			reasoning #true
+			input "text" "image"
+			cost input=0 output=0 cache-read=0 cache-write=0
+			limits context=200000
+		}
+		model "claude-sonnet-4" name="Claude Sonnet 4" {
+			reasoning #true
+			input "text" "image"
+			cost input=0 output=0 cache-read=0 cache-write=0
+			limits context=200000
+		}
+		model "claude-haiku-5-5" name="Claude Haiku 5.5" {
+			reasoning #true
+			input "text" "image"
+			cost input=0 output=0 cache-read=0 cache-write=0
+			limits context=300000
+		}
+		model "claude-haiku-4-5" name="Claude Haiku 4.5" {
+			reasoning #true
+			input "text" "image"
+			cost input=0 output=0 cache-read=0 cache-write=0
+			limits context=200000
+		}
+		model "claude-fable-5-1" name="Claude Fable 5.1" {
+			reasoning #true
+			input "text" "image"
+			cost input=0 output=0 cache-read=0 cache-write=0
+			limits context=300000
+		}
+		model "claude-fable-5" name="Claude Fable 5" {
+			reasoning #true
+			input "text" "image"
+			cost input=0 output=0 cache-read=0 cache-write=0
+			limits context=300000
+		}
 	}
 
 	// AvailableModels / seed-owned ladders must survive generate-models rebake,
@@ -80,6 +177,12 @@ provider "grokbot" {
 	// AvailableModels omits contextTokenLimit (proto3 zero/absent).
 	// Synthetic sand-default router: reviewed reasoning capability (discovery/seeds stay neutral).
 	models "sand-default" {
+		reasoning #true
+		sand-tools-wire "parent-chat"
+		sand-promote-json-text-tools #true
+	}
+	// Live sand_default_model (host 3f90dc1): same parent-chat router wire as sand-default.
+	models "sand-default-preferred" {
 		reasoning #true
 		sand-tools-wire "parent-chat"
 		sand-promote-json-text-tools #true
@@ -117,7 +220,7 @@ provider "grokbot" {
 		sand-empty-tools-retry-wire "keep-model"
 		sand-accept-empty-write-followup #true
 	}
-	models "sand-default" "sand-cua" "sand-automation" "default" "default[]" "auto" "auto[]" {
+	models "sand-default" "sand-default-preferred" "sand-cua" "sand-automation" "default" "default[]" "auto" "auto[]" {
 		context-window-floor 200000
 	}
 	// Static offline seed for grok-4.6: exact selector so cascade upgrades
@@ -135,5 +238,104 @@ provider "grokbot" {
 	// Sand rejects any tools payload for grok-4.5 (HTTP 422); keep text-only.
 	models "grok-4.5*" {
 		supports-tools #false
+	}
+	// Claude/Anthropic review rules (effort ladders, context floors, sand param ids)
+	// from captured AvailableModels 2026-10-08. Live discovery stays authoritative.
+	models "claude-opus-5-5" {
+		reasoning #true
+		thinking-mode "effort"
+		thinking-efforts "low" "medium" "high" "xhigh" "max"
+		context-window-floor 300000
+		sand-parameter-ids "context" "effort" "fast"
+	}
+	models "claude-opus-5" {
+		reasoning #true
+		thinking-mode "effort"
+		thinking-efforts "low" "medium" "high" "xhigh" "max"
+		context-window-floor 300000
+		sand-parameter-ids "thinking" "context" "effort" "fast"
+	}
+	models "claude-opus-4-8" {
+		reasoning #true
+		thinking-mode "effort"
+		thinking-efforts "low" "medium" "high" "xhigh" "max"
+		context-window-floor 300000
+		sand-parameter-ids "thinking" "context" "effort" "fast"
+	}
+	models "claude-opus-4-7" {
+		reasoning #true
+		thinking-mode "effort"
+		thinking-efforts "low" "medium" "high" "xhigh" "max"
+		context-window-floor 300000
+		sand-parameter-ids "thinking" "context" "effort" "fast"
+	}
+	models "claude-opus-4-6" {
+		reasoning #true
+		thinking-mode "effort"
+		thinking-efforts "low" "medium" "high" "max"
+		context-window-floor 1000000
+		sand-parameter-ids "thinking" "context" "effort"
+	}
+	models "claude-opus-4-5" {
+		reasoning #true
+		context-window-floor 200000
+		sand-parameter-ids "thinking"
+	}
+	models "claude-sonnet-5-5" {
+		reasoning #true
+		thinking-mode "effort"
+		thinking-efforts "low" "medium" "high" "xhigh" "max"
+		context-window-floor 300000
+		sand-parameter-ids "context" "reasoning_effort"
+	}
+	models "claude-sonnet-5" {
+		reasoning #true
+		thinking-mode "effort"
+		thinking-efforts "low" "medium" "high" "xhigh" "max"
+		context-window-floor 300000
+		sand-parameter-ids "thinking" "context" "effort"
+	}
+	models "claude-sonnet-4-6" {
+		reasoning #true
+		thinking-mode "effort"
+		thinking-efforts "low" "medium" "high" "max"
+		context-window-floor 1000000
+		sand-parameter-ids "thinking" "context" "effort"
+	}
+	models "claude-sonnet-4-5" {
+		reasoning #true
+		context-window-floor 200000
+		sand-parameter-ids "thinking" "context"
+	}
+	models "claude-sonnet-4" {
+		reasoning #true
+		context-window-floor 200000
+		sand-parameter-ids "thinking" "context"
+	}
+	models "claude-haiku-5-5" {
+		reasoning #true
+		thinking-mode "effort"
+		thinking-efforts "low" "medium" "high" "xhigh" "max"
+		context-window-floor 300000
+		sand-parameter-ids "thinking" "context" "reasoning_effort"
+	}
+	models "claude-haiku-4-5" {
+		reasoning #true
+		context-window-floor 200000
+		sand-parameter-ids "thinking"
+	}
+	models "claude-fable-5-1" {
+		reasoning #true
+		thinking-mode "effort"
+		thinking-efforts "low" "medium" "high" "xhigh" "max"
+		context-window-floor 300000
+		sand-parameter-ids "thinking" "context" "effort"
+	}
+	models "claude-fable-5" {
+		reasoning #true
+		thinking-mode "effort"
+		thinking-efforts "low" "medium" "high" "xhigh" "max"
+		context-window-floor 300000
+		sand-parameter-ids "thinking" "context" "effort"
 	}
 }

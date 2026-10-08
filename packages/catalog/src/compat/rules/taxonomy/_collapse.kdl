@@ -27,6 +27,18 @@ collapse {
 	// `-fast` is a parallel SKU lane. It stays in the logical identifier while
 	// the effort token immediately before it selects the wire sibling.
 	effort-lane-suffix "-fast" "cursor"
+	// Sand accepts the canonical Opus id plus an effort parameter. Tier names
+	// are client selectors, not invented upstream model ids.
+	variant-family "grokbot" "claude-opus-5-5" name="Claude Opus 5.5" {
+		members "claude-opus-5-5" "claude-opus-5-5-low" "claude-opus-5-5-medium" "claude-opus-5-5-high" "claude-opus-5-5-xhigh"
+		route "low" "claude-opus-5-5"
+		route "medium" "claude-opus-5-5"
+		route "high" "claude-opus-5-5"
+		route "xhigh" "claude-opus-5-5"
+		route "max" "claude-opus-5-5"
+		mode "effort"
+		efforts "low" "medium" "high" "xhigh" "max"
+	}
 
 	// Reviewed per-provider variant families: logical models served as
 	// per-effort/thinking sibling wire ids, with explicit routing, ladders,

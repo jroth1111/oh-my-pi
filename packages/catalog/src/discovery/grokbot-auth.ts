@@ -31,9 +31,9 @@ export function joinGrokbotBackendUrl(baseUrl: string, apiPath: string): URL {
 }
 /**
  * Stamped sand client app version (matches current sand-host client stamp).
- * Wire header uses the base (`0.30.0`) for prod, or base+`-dev`/`-lab`.
+ * Wire header uses the base (`0.69.0`) for prod, or base+`-dev`/`-lab`.
  */
-export const GROKBOT_STAMPED_CLIENT_VERSION = "0.30.0-pre.16";
+export const GROKBOT_STAMPED_CLIENT_VERSION = "0.69.0-pre.14";
 /** @deprecated Prefer GROKBOT_STAMPED_CLIENT_VERSION; kept for callers that want the stamp string. */
 export const GROKBOT_DEFAULT_CLIENT_VERSION = GROKBOT_STAMPED_CLIENT_VERSION;
 export const GROKBOT_DEFAULT_NAMESPACE = "prod";
@@ -118,7 +118,7 @@ function tokenCacheKey(
 	return `${cfg.renewal}\0${backend}\0${cfg.namespace}\0${cfg.clientVersion}\0${fingerprintRequestHeaders(requestHeaders)}`;
 }
 
-/** Strip stamp suffix (`0.30.0-pre.16` → `0.30.0`), matching sand-host `stampedVersionBaseOf`. */
+/** Strip stamp suffix (`0.69.0-pre.14` → `0.69.0`), matching sand-host `stampedVersionBaseOf`. */
 export function stampedVersionBaseOf(stamped: string | undefined | null): string | undefined {
 	const match = STAMPED_VERSION_BASE.exec(stamped?.trim() ?? "");
 	return match?.[1];
@@ -325,6 +325,18 @@ export function grokbotClientHeaders(cfg: Pick<GrokbotConfig, "clientVersion" | 
  * A plain Object.assign would let `authorization` and `Authorization` coexist,
  * and Bun's Headers constructor then joins both values comma-separated on the wire.
  */
+export const GROKBOT_INFERENCE_AUTHENTICATION_HEADER = "x-inference-authentication-jwt";
+
+/** Stream attestations are single-use; metadata requests must not consume them. */
+export function grokbotMetadataHeaders(...sources: Array<Record<string, string> | undefined>): Record<string, string> {
+	const result: Record<string, string> = {};
+	for (const source of sources)
+		for (const [key, value] of Object.entries(source ?? {})) {
+			if (key.toLowerCase() !== GROKBOT_INFERENCE_AUTHENTICATION_HEADER) result[key] = value;
+		}
+	return result;
+}
+
 export function mergeGrokbotHeaders(...headerSources: (Record<string, string> | undefined)[]): Record<string, string> {
 	const merged: Record<string, string> = {};
 	const keyByLower = new Map<string, string>();
@@ -383,6 +395,7 @@ export async function mintGrokbotAccessToken(
 	if (!cfg.renewal) {
 		throw new Error(`Grok Bot renewer missing. Set GROKBOT_RENEWAL_CREDENTIAL or write ${grokbotSecretsPath()}`);
 	}
+	requestHeaders = grokbotMetadataHeaders(requestHeaders);
 	const cacheKey = tokenCacheKey(cfg, backend, requestHeaders);
 	const cached = tokenCache.get(cacheKey);
 	if (cached?.accessToken && Date.now() < cached.expiresAtMs - 60_000) {

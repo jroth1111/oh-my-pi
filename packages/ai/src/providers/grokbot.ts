@@ -5,6 +5,8 @@ import { logger } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
 import type {
 	Api,
+	AnthropicNativeContentBlock,
+	AnthropicNativeContentPayload,
 	AssistantMessage,
 	AssistantMessageEvent,
 	Context,
@@ -23,7 +25,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream";
 import { notifyProviderResponse } from "../utils/provider-response";
 import { toolWireSchema } from "../utils/schema/wire";
 import { normalizeSystemPrompts } from "../utils";
-import { transformMessages } from "./transform-messages";
+import { redactSensitiveCredentials, sharesNativeThinkingLineage, transformMessages } from "./transform-messages";
 import {
 	clearGrokbotTokenCache,
 	createGrokbotChecksum,
@@ -37,7 +39,15 @@ import {
 import { AUTHENTICATED_SENTINEL } from "../registry/types";
 import { resolveGrokbotRequestedModel, type GrokbotRequestedModel } from "./grokbot/model-request";
 import {
+	GROKBOT_INFERENCE_AUTHENTICATION_HEADER,
+	grokbotMetadataHeaders,
+	grokbotInferenceContextHeaders,
+	resolveGrokbotInferenceRequestContext,
+	takeGrokbotInferenceAuthenticationJwt,
+} from "./grokbot/inference-auth";
+import {
 	applyAnthropicSandToolWire,
+	isAnthropicSandModelId,
 	resolveAnthropicSandToolsWire,
 	type AnthropicSandToolsWire,
 	type AnthropicSandToolWireResult,
@@ -406,6 +416,36 @@ function reasoningFromPart(part: unknown) {
 	return undefined;
 }
 
+/**
+ * Collect signed Anthropic/Claude thinking from a finished assistant turn into a
+ * replayable {@link AnthropicNativeContentPayload}. Only signed `thinking` and
+ * `redactedThinking` blocks are carried — unsigned deltas cannot be replayed to
+ * Anthropic. Returns undefined when the turn produced no native reasoning.
+ */
+function buildAnthropicNativeContentPayload(
+	content: AssistantMessage["content"],
+	provider: string,
+	model: string | undefined,
+): AnthropicNativeContentPayload | undefined {
+	const blocks: AnthropicNativeContentBlock[] = [];
+	for (const part of content) {
+		if (part.type === "thinking") {
+			const signature = typeof part.thinkingSignature === "string" ? part.thinkingSignature : undefined;
+			if (!signature) continue;
+			blocks.push({
+				type: "thinking",
+				thinking: typeof part.thinking === "string" ? part.thinking : "",
+				signature,
+			});
+		} else if (part.type === "redactedThinking") {
+			const data = typeof part.data === "string" ? part.data : "";
+			if (data) blocks.push({ type: "redacted_thinking", data });
+		}
+	}
+	if (blocks.length === 0) return undefined;
+	return { type: "anthropicNativeContent", provider, ...(model ? { model } : undefined), blocks };
+}
+
 function toolResultExperimentalContent(msg: Record<string, unknown>): SandContentPart[] | undefined {
 	if (!Array.isArray(msg.content)) return undefined;
 	const experimental: SandContentPart[] = [];
@@ -528,6 +568,45 @@ export function toInferenceMessages(
 			const toolCalls: InferenceToolCall[] = [];
 			const reasoningParts: InferenceReasoning[] = [];
 			const texts: string[] = [];
+			// Anthropic/Claude signed thinking replays from the opaque provider
+			// payload (byte-identical signatures) so display/compaction stripping
+			// ThinkingContent from `content` never drops it. Falls back to
+			// content-derived reasoning when no native payload is present.
+			const payload = msg.providerPayload;
+			const nativePayload =
+				payload?.type === "anthropicNativeContent" &&
+				payload.provider === model.provider &&
+				sharesNativeThinkingLineage(msg, model) &&
+				sharesNativeThinkingLineage(
+					{ api: msg.api, provider: payload.provider, model: payload.model ?? msg.model },
+					model,
+				) &&
+				Array.isArray(payload.blocks) &&
+				(payload.nativeContent === undefined ||
+					redactSensitiveCredentials(payload.nativeContent) === payload.nativeContent) &&
+				payload.blocks.every(block =>
+					block.type === "redacted_thinking"
+						? typeof block.data === "string" && block.data.length > 0
+						: typeof block.signature === "string" &&
+							block.signature.trim().length > 0 &&
+							typeof block.thinking === "string" &&
+							redactSensitiveCredentials(block.thinking) === block.thinking,
+				)
+					? payload
+					: undefined;
+			if (nativePayload) {
+				for (const b of nativePayload.blocks) {
+					if (b.type === "redacted_thinking") {
+						reasoningParts.push({ isRedacted: true, redactedData: b.data ?? "", text: "" });
+					} else {
+						reasoningParts.push({
+							isRedacted: false,
+							text: b.thinking ?? "",
+							...(b.signature ? { signature: b.signature } : undefined),
+						});
+					}
+				}
+			}
 			const content = msg.content;
 			if (typeof content === "string") {
 				if (content) texts.push(content);
@@ -539,7 +618,7 @@ export function toInferenceMessages(
 						toolCalls.push(tc);
 						continue;
 					}
-					const thinking = reasoningFromPart(part);
+					const thinking = nativePayload ? undefined : reasoningFromPart(part);
 					if (thinking) {
 						reasoningParts.push(thinking);
 						continue;
@@ -549,11 +628,12 @@ export function toInferenceMessages(
 				}
 			}
 			const proto: Record<string, unknown> = { role: ROLE.assistant };
+			if (nativePayload?.nativeContent) proto.anthropicNativeContent = nativePayload.nativeContent;
 			const text = texts.join("");
 			if (text) proto.text = text;
 			if (toolCalls.length) proto.toolCalls = toolCalls;
 			if (reasoningParts.length) proto.reasoningParts = reasoningParts;
-			if (proto.text || proto.toolCalls || proto.reasoningParts) out.push(proto);
+			if (proto.text || proto.toolCalls || proto.reasoningParts || proto.anthropicNativeContent) out.push(proto);
 			continue;
 		}
 
@@ -955,7 +1035,7 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 				fetchImpl,
 				model.baseUrl || GROKBOT_BACKEND,
 				options?.signal,
-				{ ...(model.headers ?? {}), ...(options?.headers ?? {}) },
+				grokbotMetadataHeaders(model.headers, options?.headers),
 				"inference",
 			);
 			let jwtRemintUsed = false;
@@ -989,6 +1069,7 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 			};
 			let body: Record<string, unknown> = {};
 			let routedResponseModel = "";
+			let nativeAnthropicContent: string | undefined;
 			/** Buffer until a block is accepted (completed tool / visible text), so empty
 			 * retries can discard thinking without freezing successful live streams.
 			 * Incomplete sibling toolcall_* stay in a per-index buffer until end or drop. */
@@ -1079,7 +1160,7 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 					fetchImpl,
 					model.baseUrl || GROKBOT_BACKEND,
 					options?.signal,
-					{ ...(model.headers ?? {}), ...(options?.headers ?? {}) },
+					grokbotMetadataHeaders(model.headers, options?.headers),
 					"inference",
 				);
 				discardAttemptEvents();
@@ -1251,6 +1332,7 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 				delete output.responseId;
 				delete output.upstreamModel;
 				routedResponseModel = "";
+				nativeAnthropicContent = undefined;
 			};
 
 			/** Stash usage from an abandoned tool attempt, then zero for the replay stream. */
@@ -1365,7 +1447,7 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 				// model.headers + options.headers first; provider-owned auth/client
 				// headers win so reverse-proxy keys cannot override sand identity.
 				// Case-insensitive merge prevents Authorization/authorization duplicates.
-				const headers = mergeGrokbotHeaders(model.headers, options?.headers, grokbotClientHeaders(authCfg), {
+				let headers = mergeGrokbotHeaders(model.headers, options?.headers, grokbotClientHeaders(authCfg), {
 					authorization: `Bearer ${accessToken}`,
 					"x-cursor-checksum": createGrokbotChecksum(authCfg.machineId),
 					"x-ghost-mode": "true",
@@ -1374,6 +1456,23 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 					accept: "application/connect+proto",
 					"connect-protocol-version": "1",
 				});
+				const inferenceContext = await resolveGrokbotInferenceRequestContext(options ?? {});
+				headers = mergeGrokbotHeaders(headers, grokbotInferenceContextHeaders(inferenceContext));
+				const inferenceAuthenticationJwt = await takeGrokbotInferenceAuthenticationJwt(
+					{
+						...options,
+						grokbotInferenceAuthenticationJwt:
+							options?.grokbotInferenceAuthenticationJwt !== undefined
+								? options.grokbotInferenceAuthenticationJwt
+								: inferenceContext?.inferenceProxyJwt,
+					},
+					headers,
+				);
+				if (inferenceAuthenticationJwt) {
+					headers = mergeGrokbotHeaders(headers, {
+						[GROKBOT_INFERENCE_AUTHENTICATION_HEADER]: inferenceAuthenticationJwt,
+					});
+				}
 
 				logger.debug("grokbot: stream request", {
 					modelId: (body.requestedModel as GrokbotRequestedModel).modelId,
@@ -1386,6 +1485,7 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 					hasModelConfig: Boolean(modelConfig),
 					anthropicWireMode: anthropicWire.wireMode,
 					anthropicOriginalModelId: anthropicWire.originalModelId,
+					hasInferenceAttestation: Boolean(inferenceAuthenticationJwt),
 				});
 
 				const backend = model.baseUrl || GROKBOT_BACKEND;
@@ -1406,7 +1506,13 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 					// Drain the body but do not attach it — reverse proxies may echo
 					// Authorization / payload into error pages (mint path is status-only too).
 					await response.text().catch(() => "");
-					throw new Error(`Grok Bot stream failed (HTTP ${response.status})`);
+					throw new Error(
+						`Grok Bot stream failed (HTTP ${response.status})${
+							response.status === 403 && !inferenceAuthenticationJwt
+								? "; no per-request inference attestation was supplied by the authorized runtime"
+								: ""
+						}`,
+					);
 				}
 
 				if (!started) {
@@ -1830,6 +1936,12 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 							);
 						}
 
+						const providerMetadata = parsed.providerMetadata as
+							| { metadata?: { cursor?: { anthropicNativeContent?: unknown } } }
+							| undefined;
+						const nativeContent = providerMetadata?.metadata?.cursor?.anthropicNativeContent;
+						if (typeof nativeContent === "string" && nativeContent.length > 0)
+							nativeAnthropicContent = nativeContent;
 						const errObj = firstPresent(parsed, ["error"]);
 						if (errObj && typeof errObj === "object") {
 							const e = errObj as Record<string, unknown>;
@@ -2214,6 +2326,29 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 				output.usage = addAbandonedUsage(abandonedAttemptUsage, output.usage);
 			}
 			calculateCost(model, output.usage);
+			// Carry signed Anthropic thinking so the next turn replays it verbatim.
+			if (
+				nativeAnthropicContent ||
+				isAnthropicSandModelId(output.upstreamModel || model.requestModelId || model.id, model.provider)
+			) {
+				const nativePayload = buildAnthropicNativeContentPayload(
+					output.content,
+					model.provider,
+					output.upstreamModel || model.id,
+				);
+				if (nativePayload) {
+					if (nativeAnthropicContent) nativePayload.nativeContent = nativeAnthropicContent;
+					output.providerPayload = nativePayload;
+				} else if (nativeAnthropicContent) {
+					output.providerPayload = {
+						type: "anthropicNativeContent",
+						provider: model.provider,
+						model: output.upstreamModel || model.requestModelId || model.id,
+						blocks: [],
+						nativeContent: nativeAnthropicContent,
+					};
+				}
+			}
 			logger.debug("grokbot: stream done", {
 				stopReason: output.stopReason,
 				contentTypes: output.content.map(b => b.type),

@@ -1,8 +1,14 @@
 # Changelog
 
 ## [Unreleased]
+
+### Added
+
+- Added opt-in `retry.waitForConnection` to wait through provider connection loss without exhausting the API retry budget or switching models. Waits are cancellable and preserve completed tool results; repeated visible partial-text continuations retain their existing cap. Defaults to `false`, preserving ordinary error and fallback behavior ([#14380](https://github.com/can1357/oh-my-pi/pull/14380) by [@jroth1111](https://github.com/jroth1111)).
+
 ### Fixed
 
+- Explicit native Opus effort-tier selectors retain their selected reasoning level, including the low tier.
 ### Fixed
 
 - Fixed follow-up hashline edits being rejected as anchored on lines "never displayed" after an earlier edit shifted those lines, when the replacement carries the anchored content; genuinely stale line numbers are still rejected ([#14254](https://github.com/can1357/oh-my-pi/pull/14254) by [@abilliontokens](https://github.com/abilliontokens)).

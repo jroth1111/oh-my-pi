@@ -17,6 +17,26 @@ Process env beats the secrets file. Never print these values. `/login grokbot` o
 
 If `-p` exits with `No API key found for grokbot`, this checkout did not see a renewer (missing `secrets/grokbot.env` or env vars). Published global `omp` 18.0.1 will also fail here because it does not register the provider at all.
 
+### Per-request inference authorization
+
+Renewal yields account authentication; it does not create the control-plane attestation required by a protected Sand Stream deployment. The Stream bearer is the host's `grokBotToken` when renewal returns one, not its metadata `accessToken`.
+
+An authorized launcher can supply `x-inference-authentication-jwt` through:
+
+- `INFERENCE_PROXY_JWT`, for one outbound Stream attempt.
+- `GROKBOT_INFERENCE_AUTHENTICATION_JWT_FILE`, an OMP-specific handoff path. The exact configured file is atomically claimed, read, and deleted.
+- SDK option `grokbotInferenceAuthenticationJwt`, preferably a callback returning a fresh issuer-provided token for each Stream attempt; `grokbotInferenceAuthenticationJwtFile` supplies an explicit handoff file instead.
+
+The host also forwards the authorized workload context (`x-cursor-workload`, `x-cursor-workload-job-id`, `x-cursor-workload-user`, and optional traffic/retry-policy headers). SDK option `grokbotInferenceRequestContext` accepts that issuer-provided context or a per-attempt supplier, including its `inferenceProxyJwt`. OMP does not invent these identities. The archive confirms this header contract, but does not include the launcher/issuer implementation or establish its native token-file environment variable.
+
+An environment token, file, or static header cannot serve a whole tool loop: retries and subsequent turns need fresh attestations. Reuse is rejected locally. The callback is invoked again after a bearer remint or internal retry. Attestation headers are never forwarded to renewal or model discovery, and token values are never logged. OMP does not forge or mint these tokens from renewal credentials, scrape another process, or attach to another agent's traffic.
+
+Successful catalog discovery or reaching Stream with `permission_denied` does not prove inference access. Confirm successful serving from `responseInfo.model` (stored as `upstreamModel`), then check native reasoning/tool response content. Self-reported model names are not verification.
+
+### Explicit Opus 5.5 effort selectors
+
+`grokbot/claude-opus-5-5-low`, `-medium`, `-high`, and `-xhigh` select the corresponding effort explicitly. Sand receives its canonical `claude-opus-5-5` id plus the advertised `effort` parameter; these selectors do not fabricate new server-side model ids. Signed thinking is retained across native effort variants of the same model lineage.
+
 ## Catalog (live AvailableModels)
 
 Do not rely on the six offline seeds (`sand-default`, `sand-cua`, `sand-automation`, `default`, `auto`, `grok-4.6`). With a valid renewer + machine id, discovery refreshes `POST /aiserver.v1.AiService/AvailableModels` and unions the sand routers.

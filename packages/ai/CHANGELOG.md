@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Grok Bot supports issuer-provided, single-use inference attestations and preserves native Opus thinking across effort variants.
+- Preserve nested connection-failure evidence when SDK errors are flattened into provider error messages ([#14380](https://github.com/can1357/oh-my-pi/pull/14380) by [@jroth1111](https://github.com/jroth1111)).
+
 ## [18.6.0] - 2026-10-03
 
 ### Fixed
