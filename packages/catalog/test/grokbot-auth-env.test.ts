@@ -612,7 +612,7 @@ describe("grokbot AvailableModels headers", () => {
 
 	test("namespace-only AvailableModels override recomputes client version", async () => {
 		// Direct callers may pass namespace: "lab" without clientVersion — identity
-		// must recompute 0.30.0-lab rather than keep the ambient production version.
+		// must recompute the stamped lab version rather than keep the ambient production version.
 		const seen: Array<Record<string, string>> = [];
 		const syncIdentitySpy = spyOn(grokbotAuth, "resolveGrokbotDiscoveryIdentity");
 		const fetchImpl = Object.assign(
@@ -638,9 +638,9 @@ describe("grokbot AvailableModels headers", () => {
 					env: {
 						...CLEAR_GROKBOT_ENV,
 						GROKBOT_MACHINE_ID: "machine",
-						// Ambient production namespace with no explicit clientVersion so
-						// loadGrokbotConfig derives 0.30.0 — the namespace-only override
-						// must recompute 0.30.0-lab rather than keep that derived value.
+						// Ambient production namespace with no explicit clientVersion:
+						// the namespace-only override must recompute the lab suffix
+						// rather than keep the derived production version.
 						GROKBOT_NAMESPACE: "prod",
 					},
 				},
@@ -656,7 +656,7 @@ describe("grokbot AvailableModels headers", () => {
 			// AvailableModels is the second call (after mint); both carry identity.
 			const modelsHeaders = seen[1] ?? seen[0];
 			expect(modelsHeaders?.["x-sand-box-namespace"]).toBe("lab");
-			expect(modelsHeaders?.["x-cursor-client-version"]).toBe("0.30.0-lab");
+			expect(modelsHeaders?.["x-cursor-client-version"]).toBe("0.69.0-lab");
 			// Derive overrides from the async-loaded config — no sync identity helper.
 			expect(syncIdentitySpy).not.toHaveBeenCalled();
 		} finally {

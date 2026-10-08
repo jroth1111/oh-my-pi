@@ -801,9 +801,9 @@ describe("grokbot checksum", () => {
 describe("grokbot sand-host client parity", () => {
 	test("strips stamped version and applies namespace suffixes like sand-host", () => {
 		expect(stampedVersionBaseOf("0.30.0-pre.16")).toBe("0.30.0");
-		expect(resolveGrokbotClientVersion("prod")).toBe("0.30.0");
-		expect(resolveGrokbotClientVersion("dev")).toBe("0.30.0-dev");
-		expect(resolveGrokbotClientVersion("lab")).toBe("0.30.0-lab");
+		expect(resolveGrokbotClientVersion("prod")).toBe("0.69.0");
+		expect(resolveGrokbotClientVersion("dev")).toBe("0.69.0-dev");
+		expect(resolveGrokbotClientVersion("lab")).toBe("0.69.0-lab");
 		expect(resolveGrokbotClientVersion("prod", "0.30.0-pre.16", "9.9.9")).toBe("9.9.9");
 	});
 
