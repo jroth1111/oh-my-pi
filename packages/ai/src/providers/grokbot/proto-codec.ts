@@ -178,9 +178,9 @@ function encodeRequestedModel(rm: unknown): Buffer {
 	const params = Array.isArray(rec.parameters) ? rec.parameters : [];
 	for (const p of params) chunks.push(encodeMessage(3, encodeParameter(p as ProtoRecord)));
 	if (rec.builtInModel || rec.built_in_model) chunks.push(encodeBool(4, true));
-	if (rec.isVariantStringRepresentation || rec.is_variant_string_representation) {
-		chunks.push(encodeBool(5, true));
-	}
+	// Field 5 (`is_variant_string_representation`) was removed from sand-host's
+	// InferenceRequestedModel (host 3f90dc1: `1 model_id|2 max_mode|3 parameters|4 built_in_model`).
+	// Ignore legacy camelCase/snake_case flags supplied by older callers.
 	return concat(chunks);
 }
 
@@ -579,6 +579,7 @@ function decodeRequestedModel(buf: BytesLike): ProtoRecord {
 		maxMode: asBool(first(fields, 2)),
 		parameters,
 		builtInModel: asBool(first(fields, 4)),
+		// Preserve decoding of historical captures; current requests never emit field 5.
 		isVariantStringRepresentation: asBool(first(fields, 5)),
 	};
 }

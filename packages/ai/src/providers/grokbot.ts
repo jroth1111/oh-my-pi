@@ -1288,7 +1288,6 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 					sandParameterIds: model.sandParameterIds,
 					sandMaxMode: model.sandMaxMode,
 					canonicalModelId: model.requestModelId,
-					sandVariantStringRepresentation: model.sandVariantStringRepresentation,
 					sandWireModelId: model.sandWireModelId,
 					sandWireModelIdWhen: model.sandWireModelIdWhen,
 					toolCount: tools.length,

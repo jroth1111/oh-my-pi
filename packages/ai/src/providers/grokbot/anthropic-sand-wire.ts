@@ -118,13 +118,12 @@ function productProfileForWire(wire: AnthropicSandToolsWire): ProductWireProfile
  * and other advertised parameters (e.g. `context`) that
  * `resolveGrokbotRequestedModel()` already selected.
  */
-const KEEP_MODEL_RETRY_STRIPPED_PARAMS = new Set(["effort", "reasoning", "thinking", "fast"]);
+const KEEP_MODEL_RETRY_STRIPPED_PARAMS = new Set(["effort", "reasoning_effort", "reasoning", "thinking", "fast"]);
 
 function keepModelRequestedModel(requested: GrokbotRequestedModel, anthropic: boolean): GrokbotRequestedModel {
 	if (anthropic) return requested;
 	const next: GrokbotRequestedModel = { modelId: requested.modelId };
 	if (requested.maxMode) next.maxMode = true;
-	if (requested.isVariantStringRepresentation) next.isVariantStringRepresentation = true;
 	const kept = requested.parameters?.filter(p => !KEEP_MODEL_RETRY_STRIPPED_PARAMS.has(p.id));
 	if (kept && kept.length > 0) next.parameters = kept;
 	return next;

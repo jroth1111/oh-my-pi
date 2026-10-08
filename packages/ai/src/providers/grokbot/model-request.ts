@@ -8,6 +8,7 @@ export type GrokbotRequestedModel = {
 	modelId: string;
 	maxMode?: boolean;
 	parameters?: GrokbotRequestedParameter[];
+	/** @deprecated Accepted on legacy request objects but never encoded on the current Sand wire. */
 	isVariantStringRepresentation?: boolean;
 };
 
@@ -53,7 +54,7 @@ export type GrokbotRequestedModelOptions = {
 	sandMaxMode?: boolean;
 	/** Canonical wire model id when `modelId` was an alias. */
 	canonicalModelId?: string;
-	/** When true, set `isVariantStringRepresentation` on the sand requestedModel wire. */
+	/** @deprecated Retired from the Sand wire; accepted for older callers and ignored. */
 	sandVariantStringRepresentation?: boolean;
 	/**
 	 * Catalog `sand-wire-model-id` rewrite. When set, the request is a bare
@@ -95,6 +96,10 @@ function resolveSandEffortWireValue(
 	const defaults = options?.sandParameterDefaults;
 	if (allowed.has("effort")) {
 		const value = defaults?.effort?.trim();
+		if (value) return value;
+	}
+	if (allowed.has("reasoning_effort")) {
+		const value = defaults?.reasoning_effort?.trim();
 		if (value) return value;
 	}
 	if (allowed.has("reasoning")) {
@@ -162,6 +167,9 @@ export function resolveGrokbotRequestedModel(
 		if (effortValue) {
 			if (allowed.has("effort")) {
 				parameters.push({ id: "effort", value: effortValue });
+			} else if (allowed.has("reasoning_effort")) {
+				// Anthropic Haiku/Sonnet sand rows name the ladder `reasoning_effort`.
+				parameters.push({ id: "reasoning_effort", value: effortValue });
 			} else if (allowed.has("reasoning")) {
 				parameters.push({ id: "reasoning", value: effortValue });
 			}
@@ -184,12 +192,6 @@ export function resolveGrokbotRequestedModel(
 	}
 
 	const requested: GrokbotRequestedModel = { modelId: wireId };
-	// Discovery resolves selector strings to a canonical id plus parameters.
-	// The variant-string flag only applies when modelId still contains that
-	// opaque selector; setting it on the canonical id makes Sand reject the id.
-	if (options?.sandVariantStringRepresentation === true && !options.canonicalModelId?.trim()) {
-		requested.isVariantStringRepresentation = true;
-	}
 	if (options?.sandMaxMode === true) {
 		requested.maxMode = true;
 	}

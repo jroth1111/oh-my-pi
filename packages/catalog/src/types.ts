@@ -1528,7 +1528,7 @@ export interface Model<TApi extends Api = Api> {
 	sandParameterDefaults?: Readonly<Record<string, string>>;
 	/** When true, Grok Bot stream sets `requestedModel.maxMode`. Default false. */
 	sandMaxMode?: boolean;
-	/** When true, sand requests set `requestedModel.isVariantStringRepresentation`. */
+	/** Marks a discovered variant-string selector; current Sand requests omit the retired wire flag. */
 	sandVariantStringRepresentation?: boolean;
 	/**
 	 * Per-wire-id `max_mode` markers for the members a collapsed Cursor row

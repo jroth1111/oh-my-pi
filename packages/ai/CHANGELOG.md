@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Grok Bot requests omit the retired variant-string wire flag and support advertised `reasoning_effort` parameters.
 - Updated Grok Bot's default Sand client stamp while preserving explicit client-version overrides.
 - Preserve nested connection-failure evidence when SDK errors are flattened into provider error messages ([#14380](https://github.com/can1357/oh-my-pi/pull/14380) by [@jroth1111](https://github.com/jroth1111)).
 

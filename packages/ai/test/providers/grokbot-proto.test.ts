@@ -47,6 +47,21 @@ const conversionModel: Model<"grokbot-sand"> = buildModel({
 });
 
 describe("grokbot proto", () => {
+	test("omits retired requested-model field 5 even when a legacy caller supplies it", () => {
+		const encoded = encodeInferenceStreamRequest({
+			requestedModel: {
+				modelId: "m",
+				maxMode: true,
+				parameters: [{ id: "effort", value: "high" }],
+				builtInModel: true,
+				isVariantStringRepresentation: true,
+				is_variant_string_representation: true,
+			},
+		});
+		// Fields 1–4 survive; no field-5 tag is emitted into the nested message.
+		expect(encoded.toString("hex")).toBe("3a170a016d10011a0e0a066566666f72741204686967682001");
+	});
+
 	test("round-trips InferenceStreamRequest without harness fields", () => {
 		const req = {
 			messages: [
@@ -244,6 +259,24 @@ describe("grokbot proto", () => {
 });
 
 describe("grokbot requested model mapping", () => {
+	test("sends reasoning_effort rather than effort for advertised Sand ladders and honors thinking off", () => {
+		const options = {
+			sandParameterIds: ["context", "reasoning_effort"],
+			sandParameterDefaults: { context: "300k", reasoning_effort: "medium" },
+		};
+		expect(resolveGrokbotRequestedModel("claude-sonnet-5-5", options).parameters).toEqual([
+			{ id: "context", value: "300k" },
+			{ id: "reasoning_effort", value: "medium" },
+		]);
+		expect(resolveGrokbotRequestedModel("claude-sonnet-5-5", { ...options, effort: "high" }).parameters).toEqual([
+			{ id: "context", value: "300k" },
+			{ id: "reasoning_effort", value: "high" },
+		]);
+		expect(resolveGrokbotRequestedModel("claude-sonnet-5-5", { ...options, thinking: false }).parameters).toEqual([
+			{ id: "context", value: "300k" },
+		]);
+	});
+
 	test("an explicit wire-model rewrite removes parameters and variant flags", () => {
 		const rewritten = resolveGrokbotRequestedModel("gemini-3-flash", {
 			effort: "low",
@@ -398,12 +431,12 @@ describe("grokbot requested model mapping", () => {
 		});
 	});
 
-	test("opaque variant selectors retain their string flag when no canonical mapping exists", () => {
+	test("opaque variant selectors omit the retired string flag without changing the model id", () => {
 		expect(
 			resolveGrokbotRequestedModel("opaque[effort=high]", {
 				sandVariantStringRepresentation: true,
 			}),
-		).toEqual({ modelId: "opaque[effort=high]", isVariantStringRepresentation: true });
+		).toEqual({ modelId: "opaque[effort=high]" });
 	});
 
 	test("preserves discovered minimal and max effort on the wire", () => {
