@@ -33,6 +33,7 @@ export const stateDefs = {
 	TodoItem: {
 		content: "string",
 		status: "TodoStatus",
+		"droppedBy?": "'user'",
 		"blocker?": doc("string", "What a `blocked` task is waiting on."),
 		"details?": "string",
 		"notes?": "string[]",

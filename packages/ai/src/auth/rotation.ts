@@ -17,6 +17,7 @@ import type { CredentialBlocks } from "./blocks";
 import type { KeyOverrides } from "./cascade";
 import type { SessionAffinity } from "./affinity";
 import type { CredentialPool } from "./pool";
+import { resolveCredentialIdentityKey } from "./sqlite-credential-store";
 import type { AuthCredentialStore } from "./store";
 import type {
 	AuthCredential,
@@ -45,6 +46,13 @@ import {
 const SIBLING_UNBLOCK_WAIT_MAX_MS = 5_000;
 /** Slack past a sibling's deadline so the post-wait resolve sees the block expired. */
 const SIBLING_UNBLOCK_SLACK_MS = 25;
+
+/**
+ * Provider billing-deactivation phrases (Anthropic `deactivated_workspace`,
+ * ChatGPT deactivated org/workspace) — a 402 whose workspace/org was turned
+ * off, which must fan out to every stored row sharing the organization identity.
+ */
+const WORKSPACE_DEACTIVATED_PATTERN = /\bdeactivated_workspace\b|\bdeactivated[_ ](?:org|organization|workspace)\b/i;
 
 /** Routing scope and strategy for one failed credential. */
 export type CredentialBlockRouting = {
@@ -293,6 +301,12 @@ export class RateLimits implements LimitsApi {
 		const targetIndex = this.#deps.pool
 			.entries(provider)
 			.findIndex(entry => entry.id === targetCredentialId && entry.credential.type === credentialType);
+		const probeScope = routing.blockScope ?? "";
+		if (options?.retryAfterMs !== undefined) {
+			this.#deps.blocks.noteRetryAfter(targetCredentialId, probeScope, blockedUntil);
+		} else {
+			this.#deps.blocks.noteHardCooldown(targetCredentialId, probeScope);
+		}
 		const rotation = this.#blockCredentialForRotation(
 			provider,
 			sessionId,
@@ -315,6 +329,34 @@ export class RateLimits implements LimitsApi {
 			return typeof parsed.token === "string" ? parsed.token : undefined;
 		} catch {
 			return undefined;
+		}
+	}
+
+	/**
+	 * A `deactivated_workspace` 402 disables the whole organization, not one row:
+	 * propagate the block to every stored OAuth credential sharing the source's
+	 * organization-qualified identity key. A shared accountId across different
+	 * orgId workspaces must not fan out — only identical identity keys match.
+	 */
+	#fanOutWorkspaceDeactivation(
+		provider: string,
+		credentialId: number,
+		blockedUntil: number,
+		retryAfter: boolean,
+	): void {
+		const entries = this.#deps.pool.entries(provider);
+		const source = entries.find(entry => entry.id === credentialId);
+		if (source === undefined || source.credential.type !== "oauth") return;
+		const sourceKey = resolveCredentialIdentityKey(provider, source.credential);
+		const providerKey = providerTypeKey(provider, "oauth");
+		for (let index = 0; index < entries.length; index += 1) {
+			const entry = entries[index]!;
+			if (entry.id === credentialId || entry.credential.type !== "oauth") continue;
+			const key = resolveCredentialIdentityKey(provider, entry.credential);
+			const sameIdentity = sourceKey !== null && key !== null && sourceKey === key;
+			if (!sameIdentity) continue;
+			if (retryAfter) this.#deps.blocks.noteRetryAfter(entry.id, "", blockedUntil);
+			this.#deps.blocks.mark(provider, providerKey, index, blockedUntil);
 		}
 	}
 
@@ -408,7 +450,12 @@ export class RateLimits implements LimitsApi {
 		const message = error instanceof Error ? error.message : typeof error === "string" ? error : undefined;
 		const exactCursorModelPolicy = AIError.isCursorPlanAccountPolicyError(error, provider);
 		const accountPolicy = exactCursorModelPolicy || AIError.isAccountPolicyError(error);
-		if (!accountPolicy && (AIError.isUsageLimit(error) || isUsageLimitOutcome(status, message))) {
+		const workspaceDeactivated =
+			status === 402 && typeof message === "string" && WORKSPACE_DEACTIVATED_PATTERN.test(message);
+		if (
+			!accountPolicy &&
+			(workspaceDeactivated || AIError.isUsageLimit(error) || isUsageLimitOutcome(status, message))
+		) {
 			// Thread the provider-specified reset window (e.g. Devin "Your limit
 			// will reset in 13 minutes") into the block duration so the credential
 			// is not reselected and hammered while the cap remains active.
@@ -421,6 +468,35 @@ export class RateLimits implements LimitsApi {
 				credentialId: options?.credentialId,
 				signal: options?.signal,
 			});
+			if (workspaceDeactivated) {
+				const target = await this.#resolveCredentialTarget(provider, sessionId, {
+					credentialId: options?.credentialId,
+					apiKey: options?.apiKey,
+				});
+				let credentialId =
+					options?.credentialId ?? (target ? this.#deps.pool.entries(provider)[target.index]?.id : undefined);
+				// Delayed deactivated_workspace can arrive after bearer rotation; reuse the
+				// same durable fingerprint history markReached already consults.
+				if (credentialId === undefined && options?.apiKey) {
+					credentialId = this.#deps.pool.idForBearer(provider, options.apiKey);
+				}
+				if (credentialId !== undefined) {
+					const sourceIndex = this.#deps.pool.entries(provider).findIndex(entry => entry.id === credentialId);
+					const providerKey = providerTypeKey(provider, "oauth");
+					const until =
+						sourceIndex >= 0
+							? (this.#deps.blocks.blockedUntil(provider, providerKey, sourceIndex) ??
+								Date.now() + DEFAULT_BLOCK_MS)
+							: Date.now() + DEFAULT_BLOCK_MS;
+					this.#deps.blocks.noteRetryAfter(credentialId, "", until);
+					// markReached is chat/spark scoped for openai-codex; workspace
+					// deactivation must also block the source credential globally.
+					if (sourceIndex >= 0) {
+						this.#deps.blocks.mark(provider, providerKey, sourceIndex, until);
+					}
+					this.#fanOutWorkspaceDeactivation(provider, credentialId, until, true);
+				}
+			}
 			return awaitSiblingUnblock(mark, options?.signal);
 		}
 

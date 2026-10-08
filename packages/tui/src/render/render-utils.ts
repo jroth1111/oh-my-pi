@@ -15,7 +15,7 @@ import { formatKeyHint, type KeyId } from "../app-keybindings";
 import { getKeybindings } from "../keybindings";
 import type { Theme } from "../theme/theme";
 import type { Component } from "../tui";
-import { replaceTabs, sliceByColumn, truncateToWidth, visibleWidth } from "../utils";
+import { replaceTabs, sliceByColumn, TRUNCATE_LENGTHS, truncateToWidth, visibleWidth } from "../utils";
 import { Hasher } from "./utils";
 
 export { Ellipsis } from "@oh-my-pi/pi-natives";
@@ -181,21 +181,7 @@ export function formatFeedModelBadge(
 	return uiTheme.fg("accent", prefix) + uiTheme.fg("dim", `${model}${suffix}`);
 }
 
-/** Truncation lengths for different content types */
-export const TRUNCATE_LENGTHS = {
-	/** Short titles, labels */
-	TITLE: 60,
-	/** Medium-length content (messages, previews) */
-	CONTENT: 80,
-	/** Longer content (code, explanations) */
-	LONG: 100,
-	/** Full line content */
-	LINE: 110,
-	/** Very short (task previews, badges) */
-	SHORT: 40,
-	/** Idle recap status line (~40-word LLM reply) */
-	RECAP: 280,
-} as const;
+export { TRUNCATE_LENGTHS } from "../utils";
 
 /** Keybinding action that toggles tool-output expansion. */
 const EXPAND_ACTION = "app.tools.expand";

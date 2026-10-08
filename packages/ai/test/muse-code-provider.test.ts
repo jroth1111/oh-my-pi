@@ -53,7 +53,10 @@ describe("Muse Code provider", () => {
 					retryAfterMs: 60_000,
 				}),
 			).toMatchObject({ switched: false });
-			expect(await storage.keys.get("muse-code", "muse-session")).toBe(encodedMuseCredential);
+			// Sole muse credential is now Retry-After blocked: probe-lease
+			// semantics refuse to vend it until the wait elapses, while the
+			// separate meta pool keeps its PAYG key fully usable.
+			expect(await storage.keys.get("muse-code", "muse-session")).toBeUndefined();
 			expect(await storage.keys.get("meta", "payg-session")).toBe("LLM|payg-key");
 		} finally {
 			storage.close();

@@ -2336,6 +2336,49 @@ impl<'de> Deserialize<'de> for AssistantErrorEvent {
 	}
 }
 
+///
+/// Open record: declared fields are decoded leniently (a value that does not fit stays
+/// in `extra`) and every other key is kept in `extra`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct AssistantRoutedModelEvent {
+	pub model: Option<String>,
+	pub partial: Option<AssistantMessage>,
+	/// Every key not decoded into a declared field.
+	pub extra: Map<String, Value>,
+}
+
+impl Serialize for AssistantRoutedModelEvent {
+	fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+		let mut map = serializer.serialize_map(None)?;
+		if let Some(value) = &self.model {
+			map.serialize_entry("model", value)?;
+		}
+		if let Some(value) = &self.partial {
+			map.serialize_entry("partial", value)?;
+		}
+		for (key, value) in &self.extra {
+			match key.as_str() {
+				"model" if self.model.is_some() => continue,
+				"partial" if self.partial.is_some() => continue,
+				_ => {}
+			}
+			map.serialize_entry(key, value)?;
+		}
+		map.end()
+	}
+}
+
+impl<'de> Deserialize<'de> for AssistantRoutedModelEvent {
+	fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+		let mut extra = Map::<String, Value>::deserialize(deserializer)?;
+		Ok(Self {
+			model: take(&mut extra, "model"),
+			partial: take(&mut extra, "partial"),
+			extra,
+		})
+	}
+}
+
 /// Streaming update for one assistant message, discriminated by `type`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AssistantMessageEvent {
@@ -2352,6 +2395,7 @@ pub enum AssistantMessageEvent {
 	ToolcallEnd(AssistantToolCallEndEvent),
 	Done(AssistantDoneEvent),
 	Error(AssistantErrorEvent),
+	RoutedModel(AssistantRoutedModelEvent),
 }
 
 impl AssistantMessageEvent {
@@ -2371,6 +2415,7 @@ impl AssistantMessageEvent {
 			Some("toolcall_end") => |value| serde_json::from_value(value).map(Self::ToolcallEnd),
 			Some("done") => |value| serde_json::from_value(value).map(Self::Done),
 			Some("error") => |value| serde_json::from_value(value).map(Self::Error),
+			Some("routed_model") => |value| serde_json::from_value(value).map(Self::RoutedModel),
 			other => {
 				return Err(serde_json::Error::custom(format!("unknown AssistantMessageEvent type {other:?}")));
 			}
@@ -2395,6 +2440,7 @@ impl Serialize for AssistantMessageEvent {
 			Self::ToolcallEnd(member) => serialize_tagged(member, &[("type", "toolcall_end")], serializer),
 			Self::Done(member) => serialize_tagged(member, &[("type", "done")], serializer),
 			Self::Error(member) => serialize_tagged(member, &[("type", "error")], serializer),
+			Self::RoutedModel(member) => serialize_tagged(member, &[("type", "routed_model")], serializer),
 		}
 	}
 }
@@ -2877,6 +2923,8 @@ impl SubagentStatus {
 pub struct TodoItem {
 	pub content: String,
 	pub status: TodoStatus,
+	#[serde(rename = "droppedBy", default, skip_serializing_if = "Option::is_none")]
+	pub dropped_by: Option<LitUser>,
 	/// What a `blocked` task is waiting on.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub blocker: Option<String>,
@@ -3800,6 +3848,8 @@ pub struct TodoReminderEvent {
 	pub attempt: i64,
 	#[serde(rename = "maxAttempts")]
 	pub max_attempts: i64,
+	#[serde(rename = "unverifiedMerge", default, skip_serializing_if = "Option::is_none")]
+	pub unverified_merge: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -5656,6 +5706,27 @@ impl AssistantErrorEventReason {
 		match self {
 			Self::Aborted => "aborted",
 			Self::Error => "error",
+		}
+	}
+}
+
+/// The constant `"user"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct LitUser;
+
+impl Serialize for LitUser {
+	fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+		serializer.serialize_str("user")
+	}
+}
+
+impl<'de> Deserialize<'de> for LitUser {
+	fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+		let value = Value::deserialize(deserializer)?;
+		if value.as_str() == Some("user") {
+			Ok(Self)
+		} else {
+			Err(D::Error::custom(format!("expected \"user\", got {value}")))
 		}
 	}
 }

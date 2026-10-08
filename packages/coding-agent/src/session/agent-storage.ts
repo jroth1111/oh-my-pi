@@ -445,37 +445,54 @@ FROM model_usage_legacy
 
 	/** Flushes deferred writes, closes every process-wide database, and permits reopening them. */
 	static close(): void {
-		for (const storage of instances.values()) storage.#close();
+		const pending = [...instances.values()];
 		instances.clear();
 		cancelExitCleanup?.();
 		cancelExitCleanup = undefined;
+		for (const storage of pending) {
+			try {
+				storage.#close();
+			} catch (error) {
+				// A handle whose file was quarantined or deleted under it cannot be
+				// recovered anyway — evict it instead of poisoning the remaining closes.
+				logger.warn("AgentStorage close failed; dropping instance", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
 	}
 
 	#close(): void {
+		if (this.#closing) return;
 		this.#closing = true;
-		// Model-performance batches are synchronous once invoked, so this
-		// persists them before finalizing their statements during process exit.
-		void this.#perfDrain.flush();
-		// Best-effort: a database whose directory was removed (agent dir deleted underneath the
-		// process) cannot checkpoint, and that must not keep the remaining handles open.
 		try {
-			checkpointWal(this.#db);
+			// Model-performance batches are synchronous once invoked, so this
+			// persists them before finalizing their statements during process exit.
+			void this.#perfDrain.flush();
+			// Best-effort: a database whose directory was removed (agent dir deleted underneath the
+			// process) cannot checkpoint, and that must not keep the remaining handles open.
+			try {
+				checkpointWal(this.#db);
+			} catch (error) {
+				logger.debug("AgentStorage: WAL checkpoint on close failed", { error: String(error) });
+			}
+			this.#listSettingsStmt.finalize();
+			this.#upsertModelUsageStmt.finalize();
+			this.#listModelUsageStmt.finalize();
+			this.#upsertModelPerfStmt.finalize();
+			this.#listModelPerfStmt.finalize();
+			for (const kind of USAGE_KINDS) {
+				const stmts = this.#usageStmts[kind];
+				stmts.upsert.finalize();
+				stmts.list.finalize();
+			}
+			// SqliteAuthCredentialStore.close() finalizes its own statements and
+			// closes the shared #db handle — must run after our statements finalize.
+			this.#authStore.close();
 		} catch (error) {
-			logger.debug("AgentStorage: WAL checkpoint on close failed", { error: String(error) });
+			this.#closing = false;
+			throw error;
 		}
-		this.#listSettingsStmt.finalize();
-		this.#upsertModelUsageStmt.finalize();
-		this.#listModelUsageStmt.finalize();
-		this.#upsertModelPerfStmt.finalize();
-		this.#listModelPerfStmt.finalize();
-		for (const kind of USAGE_KINDS) {
-			const stmts = this.#usageStmts[kind];
-			stmts.upsert.finalize();
-			stmts.list.finalize();
-		}
-		// SqliteAuthCredentialStore.close() finalizes its own statements and
-		// closes the shared #db handle — must run after our statements finalize.
-		this.#authStore.close();
 	}
 
 	/**

@@ -1,6 +1,7 @@
 import { clearSubmittedText } from "./helpers/draft";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { journalJudgmentUsage, resolveJudge, sharedJudgmentCache } from "../judgment";
+import { formatGrokbotStatus } from "@oh-my-pi/pi-ai/providers/grokbot";
 import type { AgentSession } from "../session/agent-session";
 import type { SessionOAuthAccountList } from "../session/agent-session-types";
 import {
@@ -614,6 +615,22 @@ export const BUILTIN_SESSION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		handleTui: (_command, runtime) => {
 			runtime.ctx.showTreeSelector();
 			clearSubmittedText(runtime);
+		},
+	},
+	{
+		name: "grokbot",
+		icon: "model",
+		description: "Grok Bot provider status (not Cursor, not xAI/Grok CLI)",
+		handle: async (_command, runtime) => {
+			const renewalCredential = await runtime.session.modelRegistry.authStorage.peekApiKey("grokbot");
+			const baseUrl = runtime.session.modelRegistry.getEffectiveProviderBaseUrl("grokbot");
+			await runtime.output(await formatGrokbotStatus({ renewalCredential, baseUrl }));
+		},
+		handleTui: async (_command, runtime) => {
+			const renewalCredential = await runtime.ctx.session.modelRegistry.authStorage.peekApiKey("grokbot");
+			const baseUrl = runtime.ctx.session.modelRegistry.getEffectiveProviderBaseUrl("grokbot");
+			runtime.ctx.showStatus(await formatGrokbotStatus({ renewalCredential, baseUrl }));
+			runtime.ctx.editor.setText("");
 		},
 	},
 	{

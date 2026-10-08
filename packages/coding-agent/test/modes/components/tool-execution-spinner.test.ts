@@ -6,7 +6,11 @@ import { CollabGuestLink } from "@oh-my-pi/pi-coding-agent/collab/guest";
 import { COLLAB_PROTO, formatCollabLink } from "@oh-my-pi/pi-coding-agent/collab/protocol";
 import { CollabSocket } from "@oh-my-pi/pi-coding-agent/collab/relay-client";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { stopSharedSpinnerTicker, ToolExecutionComponent } from "@oh-my-pi/pi-tui/chat/tool-execution";
+import {
+	__sharedSpinnerTickerArmedForTests,
+	stopSharedSpinnerTicker,
+	ToolExecutionComponent,
+} from "@oh-my-pi/pi-tui/chat/tool-execution";
 import { TranscriptContainer } from "@oh-my-pi/pi-tui/chrome/transcript-container";
 import { SPINNER_ADVANCE_MS } from "@oh-my-pi/pi-tui/components/loader";
 import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/event-controller";
@@ -481,7 +485,7 @@ describe("ToolExecutionComponent live preview spinners", () => {
 				await guest.join(link);
 
 				expect(chatContainer.children).not.toContain(liveBlock);
-				expect(vi.getTimerCount()).toBe(0);
+				expect(__sharedSpinnerTickerArmedForTests()).toBe(false);
 			} finally {
 				hostSocket.close();
 				await guest.leave("test cleanup").catch(() => {});
@@ -691,7 +695,7 @@ describe("ToolExecutionComponent live preview spinners", () => {
 				// rendered row survives the failed resync untouched.
 				expect(chatContainer.children).toContain(displaceableBlock);
 				// ...but it no longer holds the shared ticker open.
-				expect(vi.getTimerCount()).toBe(0);
+				expect(__sharedSpinnerTickerArmedForTests()).toBe(false);
 			} finally {
 				hostSocket.close();
 				await guest.leave("test cleanup").catch(() => {});
@@ -866,7 +870,7 @@ describe("ToolExecutionComponent live preview spinners", () => {
 				expect(chatContainer.children).toContain(pendingBlock);
 				expect(chatContainer.children).toContain(displaceableBlock);
 				// ...but neither holds the shared ticker open any longer.
-				expect(vi.getTimerCount()).toBe(0);
+				expect(__sharedSpinnerTickerArmedForTests()).toBe(false);
 				// seal(), not dispose(): a rollback-preserved row's own renderer
 				// children must not be torn down.
 				expect(pendingDisposeSpy).not.toHaveBeenCalled();

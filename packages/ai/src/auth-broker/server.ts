@@ -35,6 +35,7 @@ import type {
 import {
 	AUTH_BROKER_CAPABILITIES_HEADER,
 	AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES,
+	AUTH_BROKER_CAPABILITY_RETRY_AFTER_BLOCKS,
 	DEFAULT_AUTH_BROKER_BIND,
 	DEFAULT_REFRESH_INTERVAL_MS,
 	DEFAULT_REFRESH_SKEW_MS,
@@ -111,13 +112,13 @@ function isAuthorized(req: Request, tokens: ReadonlySet<string>): boolean {
 	return tokens.has(match[1].trim());
 }
 
-function supportsCodexMeterBlockScopes(req: Request): boolean {
+function supportsBrokerCapability(req: Request, expected: string): boolean {
 	const capabilities = req.headers.get(AUTH_BROKER_CAPABILITIES_HEADER);
-	return (
-		capabilities
-			?.split(",")
-			.some(capability => capability.trim() === AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES) ?? false
-	);
+	return capabilities?.split(",").some(capability => capability.trim() === expected) ?? false;
+}
+
+function supportsCodexMeterBlockScopes(req: Request): boolean {
+	return supportsBrokerCapability(req, AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES);
 }
 
 /**
@@ -337,6 +338,7 @@ function projectCredentialBlocksForLegacyClient(blocks: readonly CredentialBlock
 			blockScope: "shared",
 			blockedUntilMs: Math.max(shared?.blockedUntilMs ?? 0, block.blockedUntilMs),
 			...(updatedAtMs !== undefined ? { updatedAtMs } : {}),
+			...(block.retryAfter === true || shared?.retryAfter === true ? { retryAfter: true } : {}),
 		};
 	}
 	if (shared) projected.push(shared);
@@ -347,6 +349,7 @@ function buildCredentialBlockGroups(
 	blocks: readonly StoredCredentialBlock[],
 	serverNowMs: number,
 	clientSupportsCodexMeterBlockScopes: boolean,
+	clientSupportsRetryAfterBlocks: boolean,
 ): Map<number, CredentialBlockSnapshot[]> {
 	const byCredentialId = new Map<number, CredentialBlockSnapshot[]>();
 	for (const block of blocks) {
@@ -356,6 +359,7 @@ function buildCredentialBlockGroups(
 			blockScope: block.blockScope,
 			blockedUntilMs: block.blockedUntilMs,
 			updatedAtMs: block.updatedAtMs,
+			...(clientSupportsRetryAfterBlocks && block.retryAfter === true ? { retryAfter: true } : {}),
 		};
 		const existing = byCredentialId.get(block.credentialId);
 		if (existing) {
@@ -421,7 +425,7 @@ class SnapshotSource {
 	}
 
 	/** Wire snapshot for one client flavour, projected at the current server time. */
-	build(clientSupportsCodexMeterBlockScopes: boolean): SnapshotResponse {
+	build(clientSupportsCodexMeterBlockScopes: boolean, clientSupportsRetryAfterBlocks: boolean): SnapshotResponse {
 		const rows = this.#currentRows();
 		const serverNowMs = Date.now();
 		const { wire, nextSweepAt } = resolveRefresherSchedule(this.#refresher, serverNowMs);
@@ -429,6 +433,7 @@ class SnapshotSource {
 			this.#storage.blocks.list(rows.credentials.map(entry => entry.id)),
 			serverNowMs,
 			clientSupportsCodexMeterBlockScopes,
+			clientSupportsRetryAfterBlocks,
 		);
 		const credentials: SnapshotEntry[] = rows.credentials.map(entry => {
 			const blocks = blocksByCredentialId.get(entry.id);
@@ -462,12 +467,13 @@ async function serveSnapshot(
 ): Promise<Response> {
 	await source.reload();
 	const clientSupportsCodexMeterBlockScopes = supportsCodexMeterBlockScopes(req);
+	const clientSupportsRetryAfterBlocks = supportsBrokerCapability(req, AUTH_BROKER_CAPABILITY_RETRY_AFTER_BLOCKS);
 	let currentGeneration = source.generation;
 	const clientGeneration = parseGenerationTag(req.headers.get("if-none-match"));
 	const waitMs = parseWaitMs(url);
 
 	if (clientGeneration === undefined || currentGeneration !== clientGeneration || waitMs <= 0) {
-		const body = source.build(clientSupportsCodexMeterBlockScopes);
+		const body = source.build(clientSupportsCodexMeterBlockScopes, clientSupportsRetryAfterBlocks);
 		logger.info("auth-broker snapshot served", {
 			peer,
 			credentials: body.credentials.length,
@@ -487,7 +493,7 @@ async function serveSnapshot(
 	await source.reload();
 	currentGeneration = source.generation;
 	if (currentGeneration !== clientGeneration) {
-		const body = source.build(clientSupportsCodexMeterBlockScopes);
+		const body = source.build(clientSupportsCodexMeterBlockScopes, clientSupportsRetryAfterBlocks);
 		logger.info("auth-broker snapshot long-poll changed", {
 			peer,
 			credentials: body.credentials.length,
@@ -528,6 +534,7 @@ function sseEvent(event: string, body: unknown): Uint8Array {
 interface SnapshotStreamSubscriber {
 	readonly peer: string;
 	readonly codexMeterBlockScopes: boolean;
+	readonly retryAfterBlocks: boolean;
 	/** Fingerprint of the last entry frame sent per credential id. */
 	readonly sent: Map<number, string>;
 	lastGeneration: number;
@@ -682,12 +689,15 @@ class SnapshotStreamHub {
 	}
 
 	#fanOut(): void {
-		const frames = new Map<boolean, SnapshotStreamFrame>();
+		const frames = new Map<string, SnapshotStreamFrame>();
 		for (const subscriber of Array.from(this.#subscribers)) {
-			let frame = frames.get(subscriber.codexMeterBlockScopes);
+			const flavor = `${Number(subscriber.codexMeterBlockScopes)}:${Number(subscriber.retryAfterBlocks)}`;
+			let frame = frames.get(flavor);
 			if (!frame) {
-				frame = new SnapshotStreamFrame(this.#source.build(subscriber.codexMeterBlockScopes));
-				frames.set(subscriber.codexMeterBlockScopes, frame);
+				frame = new SnapshotStreamFrame(
+					this.#source.build(subscriber.codexMeterBlockScopes, subscriber.retryAfterBlocks),
+				);
+				frames.set(flavor, frame);
 			}
 			deliverStreamFrame(subscriber, frame);
 		}
@@ -742,6 +752,7 @@ function serveSnapshotStream(
 	const subscriber: SnapshotStreamSubscriber = {
 		peer,
 		codexMeterBlockScopes: supportsCodexMeterBlockScopes(req),
+		retryAfterBlocks: supportsBrokerCapability(req, AUTH_BROKER_CAPABILITY_RETRY_AFTER_BLOCKS),
 		sent: new Map(),
 		lastGeneration: -1,
 		write,
@@ -751,7 +762,7 @@ function serveSnapshotStream(
 		async start(c) {
 			controller = c;
 			await source.reload();
-			const initial = source.build(subscriber.codexMeterBlockScopes);
+			const initial = source.build(subscriber.codexMeterBlockScopes, subscriber.retryAfterBlocks);
 			subscriber.lastGeneration = initial.generation;
 			for (const entry of initial.credentials) subscriber.sent.set(entry.id, fingerprintEntry(entry));
 			const initialEvent: SnapshotStreamSnapshotEvent = { kind: "snapshot", ...initial };

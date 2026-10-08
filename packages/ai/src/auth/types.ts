@@ -105,6 +105,8 @@ export interface StoredCredentialBlock {
 	blockScope: string;
 	/** Epoch milliseconds. */
 	blockedUntilMs: number;
+	/** True when the block came from a provider Retry-After / usage wait window. */
+	retryAfter?: boolean;
 	/** Last row update timestamp in epoch milliseconds, when provided by the backing store. */
 	updatedAtMs?: number;
 }
@@ -468,6 +470,21 @@ export interface ModelUsageHealthOptions {
 	signal?: AbortSignal;
 }
 
+/** Default in-flight turn reservation TTL; at least the gateway's 255s idleTimeout. */
+export const DEFAULT_TURN_RESERVATION_TTL_MS = 255_000;
+
+export interface TurnReservation {
+	credentialId: number;
+	incarnation: number;
+	requestId: string;
+	expiresAtMs: number;
+	release(): void;
+}
+
+export type TurnReservationResult =
+	| { ok: true; reservation: TurnReservation }
+	| { ok: false; heldByRequestId: string; expiresAtMs: number };
+
 /** Options controlling model, base URL, cancellation, and forced OAuth refresh in KeysApi.get. */
 export type AuthApiKeyOptions = {
 	baseUrl?: string;
@@ -491,6 +508,12 @@ export type AuthApiKeyOptions = {
 	refreshReason?: OAuthRefreshReason;
 	/** When false, select as `sessionId` would without recording the choice as that session's sticky credential. */
 	recordAffinity?: boolean;
+	/**
+	 * Gateway request identity for in-flight turn reservations: when set, a
+	 * credential reserved by a different request counts as blocked, and the
+	 * selected credential is exclusively held for this request until release.
+	 */
+	requestId?: string;
 };
 
 /** Non-secret identity bound to the OAuth credential selected for one request attempt. */

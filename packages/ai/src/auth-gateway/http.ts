@@ -7,7 +7,7 @@
 import { timingSafeEqual as nodeTimingSafeEqual } from "node:crypto";
 import * as os from "node:os";
 import { getInstallId } from "@oh-my-pi/pi-utils";
-import type { Api, Model } from "../types";
+import type { Api, AssistantMessage, Model } from "../types";
 import type { ClientUsageIdentity } from "../usage";
 
 const JSON_HEADERS = {
@@ -34,7 +34,7 @@ export function json(status: number, body: unknown, headers?: Record<string, str
  */
 export function gatewayResponseHeaders(
 	model: Model<Api>,
-	info: { requestId: string; costUsd?: number; startedAt?: number },
+	info: { requestId: string; message?: AssistantMessage; costUsd?: number; startedAt?: number },
 ): Record<string, string> {
 	const headers: Record<string, string> = {
 		"x-request-id": info.requestId,
@@ -42,7 +42,8 @@ export function gatewayResponseHeaders(
 		"x-litellm-model-id": model.id,
 	};
 	if (model.baseUrl) headers["x-litellm-model-api-base"] = model.baseUrl;
-	if (info.costUsd !== undefined) headers["x-litellm-response-cost"] = info.costUsd.toString();
+	const costUsd = info.costUsd ?? info.message?.usage.cost.total;
+	if (costUsd !== undefined) headers["x-litellm-response-cost"] = costUsd.toString();
 	if (info.startedAt !== undefined) {
 		const elapsed = (performance.now() - info.startedAt).toFixed(0);
 		headers["x-litellm-response-duration-ms"] = elapsed;
@@ -164,6 +165,18 @@ const PASSTHROUGH_HEADER_NAMES: Record<string, true> = {
 	"x-prompt-cache-key": true,
 	"x-session-id": true,
 	"x-conversation-id": true,
+	// Cursor-specific gateway control headers. `x-cursor-auto-mode` enables
+	// Cursor's per-turn model selection; `x-cursor-tool-passthrough` surfaces
+	// tool calls as OpenAI `tool_calls` without local execution.
+	// `x-cursor-agent-exclude-tools` is the complement to `allowed-tools`,
+	// dropping named tools from the model's tool set; `local-cli-mode` signals
+	// local CLI mode to Cursor's backend; `x-dev-experiment-overrides` carries
+	// Statsig experiment overrides for feature-flag testing.
+	"x-cursor-auto-mode": true,
+	"x-cursor-tool-passthrough": true,
+	"x-cursor-agent-exclude-tools": true,
+	"local-cli-mode": true,
+	"x-dev-experiment-overrides": true,
 };
 
 /**
@@ -263,9 +276,9 @@ export function resolvePromptCacheKey(body: unknown, headers?: Headers): string 
 
 const CORS_HEADERS: Record<string, string> = {
 	"Access-Control-Allow-Origin": "*",
-	"Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+	"Access-Control-Allow-Methods": "GET, PUT, DELETE, POST, OPTIONS",
 	"Access-Control-Allow-Headers":
-		"authorization, content-type, anthropic-version, anthropic-beta, anthropic-user-profile-id, openai-organization, openai-project, x-stainless-*, x-api-key",
+		"authorization, content-type, anthropic-version, anthropic-beta, anthropic-user-profile-id, openai-organization, openai-project, x-stainless-*, x-api-key, x-cursor-auto-mode, x-cursor-tool-passthrough, x-cursor-agent-exclude-tools, local-cli-mode, x-dev-experiment-overrides",
 	"Access-Control-Expose-Headers":
 		"x-request-id, request-id, x-litellm-model-id, x-litellm-model-api-base, x-litellm-response-cost, x-litellm-response-duration-ms, openai-processing-ms",
 	"Access-Control-Max-Age": "86400",

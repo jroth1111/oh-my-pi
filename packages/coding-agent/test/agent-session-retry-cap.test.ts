@@ -1002,8 +1002,11 @@ describe("AgentSession retry delay cap", () => {
 			// resolution binds the credential to the sibling session, as a
 			// real prior turn would have.
 			const localRegistry = new ModelRegistry(localStorage, path.join(tempDir.path(), "models.yml"));
+			const retrySession = SessionManager.inMemory();
+			await localRegistry.getApiKeyForProvider("opencode-go", retrySession.getSessionId());
 			await localRegistry.getApiKeyForProvider("opencode-go", "sibling-session");
 			await localStorage.limits.markReached("opencode-go", "sibling-session", {
+				credentialId: localStorage.credentials.list("opencode-go")[0]!.id,
 				retryAfterMs: 7_200_000,
 				providerTimed: true,
 			});
@@ -1016,7 +1019,8 @@ describe("AgentSession retry delay cap", () => {
 			});
 			const requestedModels: string[] = [];
 			const agent = new Agent({
-				getApiKey: model => localRegistry.resolver(model, agent.sessionId),
+				// Exercise retry timing against the existing block; selection has separate lease tests.
+				getApiKey: model => localRegistry.authStorage.peekApiKey(model.provider),
 				initialState: {
 					model: exhaustedModel,
 					systemPrompt: ["Test"],
@@ -1041,7 +1045,7 @@ describe("AgentSession retry delay cap", () => {
 
 			session = new AgentSession({
 				agent,
-				sessionManager: SessionManager.inMemory(),
+				sessionManager: retrySession,
 				settings,
 				modelRegistry: localRegistry,
 			});
@@ -1094,11 +1098,14 @@ describe("AgentSession retry delay cap", () => {
 		);
 		try {
 			const localRegistry = new ModelRegistry(localStorage, path.join(tempDir.path(), "models.yml"));
+			const retrySession = SessionManager.inMemory();
+			await localRegistry.getApiKeyForProvider("opencode-go", retrySession.getSessionId());
 			await localRegistry.getApiKeyForProvider("opencode-go", "sibling-session");
 			// The sibling's 20-minute provider-stated block is shorter than
 			// the 30-minute heuristic this session's hintless error will
 			// contribute, so the merged deadline alone cannot distinguish it.
 			await localStorage.limits.markReached("opencode-go", "sibling-session", {
+				credentialId: localStorage.credentials.list("opencode-go")[0]!.id,
 				retryAfterMs: 1_200_000,
 				providerTimed: true,
 			});
@@ -1111,7 +1118,8 @@ describe("AgentSession retry delay cap", () => {
 			});
 			const requestedModels: string[] = [];
 			const agent = new Agent({
-				getApiKey: model => localRegistry.resolver(model, agent.sessionId),
+				// Exercise retry timing against the existing block; selection has separate lease tests.
+				getApiKey: model => localRegistry.authStorage.peekApiKey(model.provider),
 				initialState: {
 					model: exhaustedModel,
 					systemPrompt: ["Test"],
@@ -1136,7 +1144,7 @@ describe("AgentSession retry delay cap", () => {
 
 			session = new AgentSession({
 				agent,
-				sessionManager: SessionManager.inMemory(),
+				sessionManager: retrySession,
 				settings,
 				modelRegistry: localRegistry,
 			});
@@ -1188,10 +1196,13 @@ describe("AgentSession retry delay cap", () => {
 		);
 		try {
 			const localRegistry = new ModelRegistry(localStorage, path.join(tempDir.path(), "models.yml"));
+			const retrySession = SessionManager.inMemory();
+			await localRegistry.getApiKeyForProvider("opencode-go", retrySession.getSessionId());
 			await localRegistry.getApiKeyForProvider("opencode-go", "sibling-session");
 			// Hintless sibling error whose report was unavailable: the stored
 			// block is the 30-minute heuristic fallback, not provider timing.
 			await localStorage.limits.markReached("opencode-go", "sibling-session", {
+				credentialId: localStorage.credentials.list("opencode-go")[0]!.id,
 				retryAfterMs: 1_800_000,
 			});
 
@@ -1203,7 +1214,8 @@ describe("AgentSession retry delay cap", () => {
 			});
 			const requestedModels: string[] = [];
 			const agent = new Agent({
-				getApiKey: model => localRegistry.resolver(model, agent.sessionId),
+				// Exercise retry timing against the existing block; selection has separate lease tests.
+				getApiKey: model => localRegistry.authStorage.peekApiKey(model.provider),
 				initialState: {
 					model: exhaustedModel,
 					systemPrompt: ["Test"],
@@ -1228,7 +1240,7 @@ describe("AgentSession retry delay cap", () => {
 
 			session = new AgentSession({
 				agent,
-				sessionManager: SessionManager.inMemory(),
+				sessionManager: retrySession,
 				settings,
 				modelRegistry: localRegistry,
 			});
@@ -1307,6 +1319,8 @@ describe("AgentSession retry delay cap", () => {
 			await priorStorage.credentials.set("opencode-go", { type: "api_key", key: "opencode-go-usage-key" });
 			await restartedStorage.credentials.reload();
 			// Pre-restart hintless sibling response with no report reset: the
+			const retrySession = SessionManager.inMemory();
+			await restartedStorage.getApiKey("opencode-go", retrySession.getSessionId());
 			// stored block is the 30-minute heuristic guess (no providerTimed).
 			await priorStorage.keys.get("opencode-go", "sibling-session");
 			await priorStorage.limits.markReached("opencode-go", "sibling-session", {
@@ -1323,7 +1337,8 @@ describe("AgentSession retry delay cap", () => {
 			});
 			const requestedModels: string[] = [];
 			const agent = new Agent({
-				getApiKey: model => localRegistry.resolver(model, agent.sessionId),
+				// Exercise retry timing against the existing block; selection has separate lease tests.
+				getApiKey: model => localRegistry.authStorage.peekApiKey(model.provider),
 				initialState: {
 					model: exhaustedModel,
 					systemPrompt: ["Test"],
@@ -1348,7 +1363,7 @@ describe("AgentSession retry delay cap", () => {
 
 			session = new AgentSession({
 				agent,
-				sessionManager: SessionManager.inMemory(),
+				sessionManager: retrySession,
 				settings,
 				modelRegistry: localRegistry,
 			});

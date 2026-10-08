@@ -750,6 +750,38 @@ describe("openai-responses parseRequest", () => {
 			}),
 		).toThrow(/computer_call|call_id|valid bridged Responses input item/);
 	});
+
+	it("parses seed, response_format, parallel_tool_calls, previous_response_id, and user onto options", () => {
+		const parsed = parseRequest({
+			model: "gpt-5.4",
+			input: "hi",
+			seed: 7,
+			response_format: { type: "json_object" },
+			parallel_tool_calls: false,
+			previous_response_id: "resp_prev",
+			user: "user-1",
+			logit_bias: { "42": -1 },
+		});
+		expect(parsed.options.seed).toBe(7);
+		expect(parsed.options.responseFormat).toEqual({ type: "json_object" });
+		expect(parsed.options.parallelToolCalls).toBe(false);
+		expect(parsed.options.previousResponseId).toBe("resp_prev");
+		expect(parsed.options.user).toBe("user-1");
+		expect(parsed.options.logitBias).toEqual({ "42": -1 });
+	});
+
+	it("leaves omitted seed, response_format, parallel_tool_calls, previous_response_id, and user undefined (negative)", () => {
+		const parsed = parseRequest({
+			model: "gpt-5.4",
+			input: "hi",
+		});
+		expect(parsed.options.seed).toBeUndefined();
+		expect(parsed.options.responseFormat).toBeUndefined();
+		expect(parsed.options.parallelToolCalls).toBeUndefined();
+		expect(parsed.options.previousResponseId).toBeUndefined();
+		expect(parsed.options.user).toBeUndefined();
+		expect(parsed.options.logitBias).toBeUndefined();
+	});
 });
 
 describe("openai-responses encodeResponse", () => {
@@ -763,7 +795,7 @@ describe("openai-responses encodeResponse", () => {
 			role: "assistant",
 			api: "openai-responses",
 			provider: "openai",
-			model: "gpt-5",
+			model: "gpt-5-requested",
 			content: [
 				{
 					type: "thinking",
@@ -942,6 +974,22 @@ describe("openai-responses encodeResponse", () => {
 		expect(body.status).toBe("incomplete");
 		expect(body.incomplete_details).toEqual({ reason: "max_output_tokens" });
 	});
+
+	it("keeps provider-qualified request model ids unless Cursor auto routing is active", () => {
+		const message: AssistantMessage = {
+			role: "assistant",
+			api: "openai-responses",
+			provider: "cursor",
+			model: "gpt-5",
+			content: [{ type: "text", text: "ok" }],
+			usage: zeroUsage(),
+			stopReason: "stop",
+			timestamp: 1_700_000_000_000,
+		};
+		expect(encodeResponse(message, "cursor/gpt-5").model).toBe("cursor/gpt-5");
+		expect(encodeResponse(message, "cursor/gpt-5", { cursorAutoMode: true }).model).toBe("gpt-5");
+		expect(encodeResponse(message, "auto", { cursorAutoMode: true }).model).toBe("gpt-5");
+	});
 });
 
 describe("openai-responses encodeStream", () => {
@@ -952,7 +1000,7 @@ describe("openai-responses encodeStream", () => {
 			role: "assistant",
 			api: "openai-responses",
 			provider: "openai",
-			model: "gpt-5",
+			model: "gpt-5-requested",
 			content: [],
 			usage: zeroUsage(),
 			stopReason: "stop",
@@ -963,7 +1011,7 @@ describe("openai-responses encodeStream", () => {
 			role: "assistant",
 			api: "openai-responses",
 			provider: "openai",
-			model: "gpt-5",
+			model: "gpt-5-requested",
 			content: [
 				{ type: "thinking", thinking: "step 1", thinkingSignature: "rs_s1", itemId: "rs_s1" },
 				{ type: "text", text: "Hi!" },
@@ -1112,6 +1160,84 @@ describe("openai-responses encodeStream", () => {
 		});
 		// Critical gotcha: id and call_id are distinct.
 		expect(output[2]!.id).not.toBe(output[2]!.call_id);
+	});
+
+	it("buffers content until Cursor auto routing resolves after early text", async () => {
+		const stream = new AssistantMessageEventStream();
+		const initial: AssistantMessage = {
+			role: "assistant",
+			api: "openai-responses",
+			provider: "cursor",
+			model: "auto",
+			content: [],
+			usage: zeroUsage(),
+			stopReason: "stop",
+			timestamp: 1_700_000_000_000,
+		};
+		const earlyText: AssistantMessage = {
+			...initial,
+			content: [{ type: "text", text: "h" }],
+		};
+		const routed: AssistantMessage = {
+			...earlyText,
+			model: "claude-opus-4-7",
+			content: [{ type: "text", text: "hi" }],
+		};
+
+		queueMicrotask(() => {
+			stream.push({ type: "start", partial: initial });
+			stream.push({ type: "text_start", contentIndex: 0, partial: earlyText });
+			stream.push({ type: "text_delta", contentIndex: 0, delta: "h", partial: earlyText });
+			stream.push({ type: "routed_model", model: "claude-opus-4-7", partial: routed });
+			stream.push({ type: "text_delta", contentIndex: 0, delta: "i", partial: routed });
+			stream.push({ type: "text_end", contentIndex: 0, content: "hi", partial: routed });
+			stream.push({ type: "done", reason: "stop", message: routed });
+			stream.end(routed);
+		});
+
+		const frames = parseSse(await collectStream(encodeStream(stream, "auto", { cursorAutoMode: true })));
+		const created = frames.find(f => f.event === "response.created");
+		expect(created).toBeDefined();
+		const response = (created!.data as { response: { model: string } }).response;
+		expect(response.model).toBe("claude-opus-4-7");
+		const types = frames.map(f => f.event);
+		expect(types.indexOf("response.created")).toBeLessThan(types.indexOf("response.output_item.added"));
+		expect(types.indexOf("response.created")).toBeGreaterThanOrEqual(0);
+	});
+
+	it("streams response.created immediately for literal model id auto without cursorAutoMode", async () => {
+		const stream = new AssistantMessageEventStream();
+		const initial: AssistantMessage = {
+			role: "assistant",
+			api: "openai-responses",
+			provider: "openrouter",
+			model: "auto",
+			content: [],
+			usage: zeroUsage(),
+			stopReason: "stop",
+			timestamp: 1_700_000_000_000,
+		};
+		const withText: AssistantMessage = {
+			...initial,
+			content: [{ type: "text", text: "ok" }],
+		};
+
+		queueMicrotask(() => {
+			stream.push({ type: "start", partial: initial });
+			stream.push({ type: "text_start", contentIndex: 0, partial: withText });
+			stream.push({ type: "text_delta", contentIndex: 0, delta: "ok", partial: withText });
+			stream.push({ type: "text_end", contentIndex: 0, content: "ok", partial: withText });
+			stream.push({ type: "done", reason: "stop", message: withText });
+			stream.end(withText);
+		});
+
+		const frames = parseSse(await collectStream(encodeStream(stream, "auto")));
+		const created = frames.find(f => f.event === "response.created");
+		expect(created).toBeDefined();
+		const response = (created!.data as { response: { model: string } }).response;
+		expect(response.model).toBe("auto");
+		const types = frames.map(f => f.event);
+		expect(types.indexOf("response.created")).toBeLessThan(types.indexOf("response.output_item.added"));
 	});
 
 	it("streams a GA computer_call with provider item id, actions, and safety checks", async () => {
@@ -1427,6 +1553,43 @@ describe("auth-gateway OpenAI Responses multimodal tool outputs", () => {
 			clearCustomApis();
 		}
 	});
+	for (const role of ["user", "developer"]) {
+		it(`rejects ${role} image file IDs before dispatching to a non-Responses upstream`, async () => {
+			registerMockApi();
+			const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gw-responses-file-id-"));
+			const storage = await AuthStorage.create(path.join(dir, "auth.db"));
+			storage.setRuntimeApiKey("openai", "test-key");
+			const mock = createMockModel({ provider: "openai", id: "mock/file-id" });
+			mock.push({ content: ["unexpected provider call"] });
+			const gateway = startAuthGateway({
+				bind: "127.0.0.1:0",
+				bearerTokens: ["test-token"],
+				storage,
+				resolveModel: () => mock.model,
+				version: "test",
+			});
+
+			try {
+				const response = await fetch(`${gateway.url}/v1/responses`, {
+					method: "POST",
+					headers: { "Content-Type": "application/json", Authorization: "Bearer test-token" },
+					body: JSON.stringify({
+						model: "mock/file-id",
+						input: [{ role, content: [{ type: "input_image", file_id: "file_normal_image" }] }],
+					}),
+				});
+				expect(response.status).toBe(400);
+				const body = (await response.json()) as { error: { message: string } };
+				expect(body.error.message).toContain("require a Responses-compatible upstream model");
+				expect(mock.calls).toHaveLength(0);
+			} finally {
+				await gateway.close();
+				storage.close();
+				await fs.rm(dir, { recursive: true, force: true });
+				clearCustomApis();
+			}
+		});
+	}
 });
 describe("auth-gateway OpenAI Responses computer option bridge", () => {
 	it("preserves the native tool, forced choice, and include in stream options", async () => {

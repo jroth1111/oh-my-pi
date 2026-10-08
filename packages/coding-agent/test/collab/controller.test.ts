@@ -1728,6 +1728,8 @@ describe("CollabController", () => {
 				await stalled.promise;
 				// Only the host's 15 s connect timeout can end the stalled attempt.
 				vi.advanceTimersByTime(15_000);
+				// Publication/teardown use real socket IPC; only the connect deadline is virtualized.
+				vi.useRealTimers();
 				expect(await state.firstStatus.promise).toMatch(/auto-start failed: timed out connecting to relay/);
 				// Restore before the retry publishes: Bun's fake clock stalls the
 				// real registry server's listen callback.

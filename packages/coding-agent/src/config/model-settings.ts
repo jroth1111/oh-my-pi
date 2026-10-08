@@ -60,6 +60,12 @@ export const cfgAuthAccountPolicies = register({
 	default: EMPTY_AUTH_ACCOUNT_POLICIES,
 });
 
+export const cfgAuthGatewayRoutesFile = register({
+	id: "auth.gateway.routesFile",
+	type: "string",
+	default: undefined,
+});
+
 export const cfgEnabledModels = register({
 	id: "enabledModels",
 	type: "array",

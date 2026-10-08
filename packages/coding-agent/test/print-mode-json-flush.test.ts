@@ -14,7 +14,8 @@
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { runPrintMode } from "@oh-my-pi/pi-coding-agent/modes/print-mode";
+import { PRINT_MODE_ERROR_ADVISOR_DRAIN_TIMEOUT_MS, runPrintMode } from "@oh-my-pi/pi-coding-agent/modes/print-mode";
+import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 
 interface FlushHarness {
@@ -25,7 +26,7 @@ interface FlushHarness {
 	disposed: () => boolean;
 }
 
-function createFlushHarness(): FlushHarness {
+function createFlushHarness(finalMessage?: AssistantMessage): FlushHarness {
 	const { promise: promptStarted, resolve: markPromptStarted } = Promise.withResolvers<void>();
 	const { promise: promptReleased, resolve: resolvePrompt } = Promise.withResolvers<void>();
 	let subscriber: ((event: AgentSessionEvent) => void) | undefined;
@@ -41,7 +42,7 @@ function createFlushHarness(): FlushHarness {
 			onPersistenceNotice: () => () => {},
 		},
 		settings: Settings.isolated(),
-		getLastAssistantMessage: () => undefined,
+		getLastAssistantMessage: () => finalMessage,
 		extensionRunner: undefined,
 		subscribe: (listener: (event: AgentSessionEvent) => void) => {
 			subscriber = listener;
@@ -150,5 +151,64 @@ describe("print-mode JSON flush (#7635)", () => {
 		// The complete payload survives — not a pipe-buffer-sized prefix.
 		expect(agentEndLine).toContain(payload);
 		expect(JSON.parse(agentEndLine as string)).toMatchObject({ type: "agent_end" });
+	});
+
+	it("flushes an authentication failure and disposes before exiting nonzero", async () => {
+		const message: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api: "grokbot-sand",
+			provider: "grokbot",
+			model: "default",
+			stopReason: "error",
+			errorStatus: 401,
+			errorMessage: "Grok Bot authentication failed",
+			timestamp: 1,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+		};
+		const harness = createFlushHarness(message);
+		const drain = vi.spyOn(harness.session, "waitForAdvisorCatchup");
+		let releaseOutput: (() => void) | undefined;
+		const writes: string[] = [];
+		const issued = Promise.withResolvers<void>();
+		vi.spyOn(process.stdout, "write").mockImplementation((...args: unknown[]) => {
+			writes.push(String(args[0]));
+			const callback = args.at(-1) as (error?: Error | null) => void;
+			releaseOutput = () => callback(null);
+			issued.resolve();
+			return true;
+		});
+		vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+		const exit = vi.spyOn(process, "exit").mockImplementation(() => {
+			expect(harness.disposed()).toBe(true);
+			return undefined as never;
+		});
+		const run = runPrintMode(harness.session, { mode: "json", initialMessage: "probe" });
+		await harness.promptStarted;
+		harness.emit({ type: "agent_end", messages: [message] });
+		harness.resolvePrompt();
+		await issued.promise;
+		expect(exit).not.toHaveBeenCalled();
+		releaseOutput?.();
+		// runPrintMode reports the terminal failure as a nonzero exit code; the
+		// caller owns process.exit after dispose has run.
+		expect(await run).toBe(1);
+		expect(harness.disposed()).toBe(true);
+		expect(JSON.parse(writes.join(""))).toMatchObject({
+			type: "agent_end",
+			messages: [{ stopReason: "error", errorStatus: 401 }],
+		});
+		expect(drain).toHaveBeenCalledWith(PRINT_MODE_ERROR_ADVISOR_DRAIN_TIMEOUT_MS, {
+			waitThroughRecovery: true,
+			strictWithoutDeadline: true,
+		});
+		expect(exit).not.toHaveBeenCalled();
 	});
 });

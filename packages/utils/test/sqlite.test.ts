@@ -1,8 +1,8 @@
 import { Database } from "bun:sqlite";
-import { expect, test } from "bun:test";
+import { describe, expect, it, test } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { isSqliteCorruptionError, openSqliteDatabase, openSqliteDatabaseSync } from "../src/sqlite";
+import { checkpointWal, isSqliteCorruptionError, openSqliteDatabase, openSqliteDatabaseSync } from "../src/sqlite";
 import { TempDir } from "../src/temp";
 
 async function corruptSchemaPages(dbPath: string): Promise<Buffer<ArrayBuffer>> {
@@ -265,4 +265,25 @@ test("a non-corruption init failure on a store that fails quick_check is preserv
 	const backups = (await backupNames(dir.path())).filter(name => !/-wal$|-shm$|-journal$/.test(name));
 	expect(backups).toHaveLength(1);
 	expect(await fs.promises.readFile(path.join(dir.path(), backups[0]!))).toEqual(damaged);
+});
+
+function dbThrowing(code: string, message = code): Database {
+	return {
+		run() {
+			throw Object.assign(new Error(message), { code });
+		},
+	} as unknown as Database;
+}
+
+describe("checkpointWal", () => {
+	it("surfaces lifecycle failures for the owning close path to handle", () => {
+		expect(() => checkpointWal(dbThrowing("SQLITE_MISUSE", "Database has closed"))).toThrow("Database has closed");
+		expect(() => checkpointWal(dbThrowing("SQLITE_IOERR_VNODE"))).toThrow("SQLITE_IOERR_VNODE");
+	});
+
+	it("surfaces real SQLITE_IOERR write and fsync failures", () => {
+		expect(() => checkpointWal(dbThrowing("SQLITE_IOERR_WRITE"))).toThrow(/SQLITE_IOERR_WRITE/);
+		expect(() => checkpointWal(dbThrowing("SQLITE_IOERR_FSYNC"))).toThrow(/SQLITE_IOERR_FSYNC/);
+		expect(() => checkpointWal(dbThrowing("SQLITE_IOERR"))).toThrow(/SQLITE_IOERR/);
+	});
 });

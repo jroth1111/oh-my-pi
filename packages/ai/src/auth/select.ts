@@ -13,6 +13,7 @@ import {
 	providerTypeKey,
 	type CredentialBlocks,
 } from "./blocks";
+import { anonymousProbeRequestKey, type CredentialCoordination } from "./coordination";
 import type { AccountPolicies } from "./policy";
 import { authCredentialEquals, type CredentialPool } from "./pool";
 import {
@@ -67,6 +68,15 @@ export type TryOAuthOptions = {
 	allowFallback?: boolean;
 	/** Receives a non-definitive refresh failure that left this credential unusable; the caller filters for retryable ones. */
 	onTransientRefreshFailure?: (error: unknown) => void;
+	/**
+	 * Last-resort yield for an allowBlocked pass: when every eligible candidate
+	 * is blocked, a plan-fitting account or a restricted session's allowed
+	 * account may still be vended deliberately (the wire answers with the
+	 * authoritative 429 + retry hint) rather than leaking an ineligible sibling.
+	 * This is a yield, not a quota probe, so it skips the sibling check and the
+	 * single-flight probe lease while still honouring foreign turn reservations.
+	 */
+	yieldBlockedCredential?: boolean;
 };
 
 /** Services consulted by CredentialSelector for policy, usage, blocks, refresh, and session affinity. */
@@ -79,6 +89,8 @@ export interface CredentialSelectorDeps {
 	usage: UsageService;
 	refresher: OAuthRefresher;
 	strategies: RankingStrategyResolver;
+	/** In-process requestId reservations and quota-probe leases. */
+	coordination: CredentialCoordination;
 }
 
 /** Picks which stored credential serves a request: ordering, usage ranking, OAuth refresh ladder. */
@@ -202,11 +214,12 @@ export class CredentialSelector {
 			args.order.map(async idx => {
 				const selection = args.credentials[idx];
 				if (!selection) return null;
-				const blockedUntil = this.#deps.blocks.blockedUntil(
+				const blockedUntil = this.#deps.coordination.blockedUntilForRequest(
 					args.provider,
 					args.providerKey,
 					selection.index,
 					args.blockScopes ?? args.blockScope,
+					args.options?.requestId,
 				);
 				if (blockedUntil !== undefined) {
 					return { selection, usage: null, usageChecked: false, blockedUntil };
@@ -232,11 +245,12 @@ export class CredentialSelector {
 			return args.order.map(idx => {
 				const selection = args.credentials[idx];
 				if (!selection) return null;
-				const blockedUntil = this.#deps.blocks.blockedUntil(
+				const blockedUntil = this.#deps.coordination.blockedUntilForRequest(
 					args.provider,
 					args.providerKey,
 					selection.index,
 					args.blockScopes ?? args.blockScope,
+					args.options?.requestId,
 				);
 				return { selection, usage: null, usageChecked: false, blockedUntil };
 			});
@@ -304,20 +318,31 @@ export class CredentialSelector {
 			});
 
 		if (credentials.length === 0) return undefined;
-		if (credentials.length === 1) return credentials[0];
 
 		const providerKey = providerTypeKey(provider, "api_key");
 		const order = this.#getCredentialOrder(providerKey, sessionId, credentials.length);
-		const fallback = credentials[order[0]];
 		const strategy = this.#deps.strategies(provider);
 		if (!strategy) {
 			for (const idx of order) {
 				const candidate = credentials[idx];
-				if (!this.#deps.blocks.isBlocked(provider, providerKey, candidate.index)) {
-					return candidate;
+				if (
+					!this.#deps.coordination.isBlockedForRequest(
+						provider,
+						providerKey,
+						candidate.index,
+						undefined,
+						options?.requestId,
+					)
+				) {
+					if (this.#deps.coordination.tryReserveApiKeySelection(provider, candidate, options?.requestId))
+						return candidate;
 				}
 			}
-			return fallback;
+			for (const idx of order) {
+				const candidate = credentials[idx];
+				if (this.#deps.coordination.tryApiKeyProbe(provider, providerKey, candidate, options)) return candidate;
+			}
+			return undefined;
 		}
 
 		const rankingContext: CredentialRankingContext = {
@@ -336,7 +361,39 @@ export class CredentialSelector {
 			blockScope,
 			blockScopes,
 		});
-		return candidates[0]?.selection ?? fallback;
+		for (const ranked of candidates) {
+			// Recheck quota/usage blocks before reserving: ranking still returns blocked
+			// rows after healthy ones, and reservation conflicts must not promote them.
+			if (
+				this.#deps.coordination.isBlockedForRequest(
+					provider,
+					providerKey,
+					ranked.selection.index,
+					blockScopes,
+					options?.requestId,
+				)
+			) {
+				continue;
+			}
+			if (this.#deps.coordination.tryReserveApiKeySelection(provider, ranked.selection, options?.requestId)) {
+				return ranked.selection;
+			}
+		}
+		for (const ranked of candidates) {
+			if (
+				this.#deps.coordination.tryApiKeyProbe(
+					provider,
+					providerKey,
+					ranked.selection,
+					options,
+					blockScope,
+					blockScopes,
+				)
+			) {
+				return ranked.selection;
+			}
+		}
+		return undefined;
 	}
 
 	async #rankOAuthSelections(args: {
@@ -365,11 +422,12 @@ export class CredentialSelector {
 			args.order.map(async idx => {
 				const selection = args.credentials[idx];
 				if (!selection) return null;
-				let blockedUntil = this.#deps.blocks.blockedUntil(
+				let blockedUntil = this.#deps.coordination.blockedUntilForRequest(
 					args.provider,
 					args.providerKey,
 					selection.index,
 					args.blockScopes ?? args.blockScope,
+					args.options?.requestId,
 				);
 				let usage: UsageReport | null = null;
 				let usageChecked = false;
@@ -387,11 +445,12 @@ export class CredentialSelector {
 						timeoutMs: this.#deps.usage.requestTimeoutMs,
 					});
 					usageChecked = true;
-					blockedUntil = this.#deps.blocks.blockedUntil(
+					blockedUntil = this.#deps.coordination.blockedUntilForRequest(
 						args.provider,
 						args.providerKey,
 						selection.index,
 						args.blockScopes ?? args.blockScope,
+						args.options?.requestId,
 					);
 				}
 				if (blockedUntil !== undefined) return { selection, usage, usageChecked, blockedUntil };
@@ -584,7 +643,13 @@ export class CredentialSelector {
 		const sessionPreferredIsAvailable =
 			sessionPreferredIndex !== undefined &&
 			sessionPreferredCanRefreshOrUse &&
-			!this.#deps.blocks.isBlocked(provider, providerKey, sessionPreferredIndex, blockScopes);
+			!this.#deps.coordination.isBlockedForRequest(
+				provider,
+				providerKey,
+				sessionPreferredIndex,
+				blockScopes,
+				options?.requestId,
+			);
 		const sessionPinIsExplicit = sessionCredential?.type === "oauth" && sessionCredential.explicit === true;
 		const rankDespitePin =
 			!sessionPreferredIsAvailable ||
@@ -666,8 +731,13 @@ export class CredentialSelector {
 
 		const sessionPreferredCandidate = candidates.findIndex(
 			candidate =>
-				!this.#deps.blocks.isBlocked(provider, providerKey, candidate.selection.index, blockScopes) &&
-				candidate.selection.index === sessionPreferredIndex,
+				!this.#deps.coordination.isBlockedForRequest(
+					provider,
+					providerKey,
+					candidate.selection.index,
+					blockScopes,
+					options?.requestId,
+				) && candidate.selection.index === sessionPreferredIndex,
 		);
 		const preferredCandidate = sessionPreferredCandidate === -1 ? undefined : candidates[sessionPreferredCandidate];
 		// A warm automatic pin normally wins. Two policies may evict it, each only
@@ -881,6 +951,28 @@ export class CredentialSelector {
 		if (enforceAccounts) passes.push({ allowBlocked: true, enforcePlanRequirement: false, enforceAccounts: false });
 
 		for (const pass of passes) {
+			// Plan-fitting last resort: when every confirmed plan-eligible account
+			// is blocked, the allowBlocked pass yields one of them (authoritative
+			// upstream 429 semantics) rather than leaking an ineligible sibling.
+			const hasUnblockedEligibleCandidate = (eligible: (candidate: OAuthCandidate) => boolean): boolean =>
+				candidates.some(
+					candidate =>
+						eligible(candidate) &&
+						!this.#deps.coordination.isBlockedForRequest(
+							provider,
+							providerKey,
+							candidate.selection.index,
+							blockScopes ?? blockScope,
+							options?.requestId,
+						),
+				);
+			const yieldBlockedPlanEligible =
+				pass.enforcePlanRequirement &&
+				!hasUnblockedEligibleCandidate(candidate => planGate?.(candidate.usage) === true);
+			const yieldBlockedRestrictedSession =
+				this.#deps.affinity.isRestricted(provider, sessionId) && !hasUnblockedEligibleCandidate(() => true);
+			const yieldBlockedCredential =
+				pass.allowBlocked && (yieldBlockedPlanEligible || yieldBlockedRestrictedSession);
 			for (const candidate of candidates) {
 				if (preflightFailures.has(candidate)) continue;
 				const candidateAccountId = candidate.selection.credential.accountId;
@@ -898,6 +990,7 @@ export class CredentialSelector {
 					blockScope,
 					blockScopes,
 					onTransientRefreshFailure: recordTransientRefreshFailure,
+					yieldBlockedCredential,
 				});
 				if (resolved) return resolved;
 			}
@@ -979,104 +1072,126 @@ export class CredentialSelector {
 			blockScope,
 			blockScopes,
 			allowFallback = true,
+			yieldBlockedCredential = false,
 		} = usageOptions;
+		const coordination = this.#deps.coordination;
+		// Stable credential id for anonymous probe cleanup — retain the id used when
+		// the lease was acquired (and refreshed after prepare), never re-read by index.
+		let credentialId: number | undefined;
+		let acquiredProbeScope = blockScope ?? "";
+		// Targeted per-row access (`accessById`/`accessAll`, allowFallback: false)
+		// bypasses probe arbitration entirely: these calls name a specific account —
+		// e.g. redeeming a saved reset is precisely what clears its block — so pool
+		// probing rules must not gate them.
 		if (
-			!allowBlocked &&
-			this.#deps.blocks.isBlocked(provider, providerKey, selection.index, blockScopes ?? blockScope)
+			allowFallback &&
+			coordination.isBlockedForRequest(
+				provider,
+				providerKey,
+				selection.index,
+				blockScopes ?? blockScope,
+				options?.requestId,
+			)
 		) {
-			return undefined;
-		}
-
-		if (!(await this.#prepareOAuthCredentialForRequest(provider, selection, options))) {
-			return undefined;
-		}
-		// Capture the row id once, immediately after #prepareOAuthCredentialForRequest
-		// resynced selection.index from the store. A concurrent disable during the
-		// usage/refresh awaits below can shift positional indices, so every later
-		// refresh / persist / CAS-disable addresses the row by this stable id.
-		const credentialId = this.#deps.pool.entries(provider)[selection.index]?.id;
-
-		const planGate = providedPlanGate ?? this.#deps.strategies(provider)?.planGate?.({ modelId: options?.modelId });
-		const hasPlanRequirement = planGate !== undefined;
-		const applyPlanFilter = enforcePlanRequirement ?? hasPlanRequirement;
-		let usage: UsageReport | null = null;
-		let usageChecked = false;
-
-		if ((checkUsage && !allowBlocked) || hasPlanRequirement) {
-			if (usagePrechecked) {
-				usage = prefetchedUsage;
-				usageChecked = true;
-			} else {
-				usage = await this.#deps.usage.report(provider, selection.credential, {
-					...options,
-					timeoutMs: this.#deps.usage.requestTimeoutMs,
+			const entries = this.#deps.pool.entries(provider);
+			const blockedId = entries[selection.index]?.id;
+			if (blockedId === undefined) return undefined;
+			if (!yieldBlockedCredential) {
+				// Only probe OAuth cooldowns when every sibling is unusable: preferring a
+				// healthy credential preserves probe traffic for genuinely scarce pools.
+				const hasUsableSibling = entries.some(
+					(entry, index) =>
+						index !== selection.index &&
+						entry.credential.type === selection.credential.type &&
+						this.#deps.affinity.allows(provider, sessionId, entry.credential) &&
+						!coordination.isBlockedForRequest(
+							provider,
+							providerKey,
+							index,
+							blockScopes ?? blockScope,
+							options?.requestId,
+						),
+				);
+				if (hasUsableSibling) return undefined;
+			}
+			const held = coordination.activeTurnReservation(blockedId, coordination.getCredentialIncarnation(blockedId));
+			if (held && held.requestId !== options?.requestId) return undefined;
+			const probeScope = coordination.resolveBlockingProbeScope(
+				provider,
+				providerKey,
+				selection.index,
+				blockedId,
+				blockScope,
+				blockScopes,
+				options?.requestId,
+			);
+			const probeRequestKey = options?.requestId ?? anonymousProbeRequestKey(blockedId, probeScope);
+			if (!yieldBlockedCredential) {
+				if (!options?.requestId && coordination.hasInflightProbe(probeRequestKey)) return undefined;
+				if (!coordination.acquireOrReuseQuotaProbeLease(probeRequestKey, blockedId, probeScope)) return undefined;
+			}
+			credentialId = blockedId;
+			acquiredProbeScope = probeScope;
+			// Exclusive turn reservation only for cooldown probes — normal OAuth
+			// selections must remain concurrently usable across request ids.
+			if (options?.requestId) {
+				const acquired = coordination.tryAcquireTurnReservation({
+					credentialId: blockedId,
+					incarnation: coordination.getCredentialIncarnation(blockedId),
+					requestId: options.requestId,
 				});
-				usageChecked = true;
-			}
-			if (applyPlanFilter && planGate?.(usage) !== true) {
-				return undefined;
-			}
-			if (checkUsage && !allowBlocked && usage && strategy && rankingContext) {
-				const scopedLimits = scopedUsageLimits(strategy, usage, rankingContext);
-				if (isUsageLimitReached(scopedLimits)) {
-					const resetAtMs = usageResetAtMs(scopedLimits, Date.now());
-					this.#deps.blocks.mark(
-						provider,
-						providerKey,
-						selection.index,
-						resetAtMs ?? Date.now() + DEFAULT_BLOCK_MS,
-						blockScope,
-						resetAtMs !== undefined,
-					);
+				if (!acquired.ok) {
+					coordination.clearQuotaProbe(options.requestId);
 					return undefined;
 				}
 			}
 		}
 
+		// Hold the turn reservation (and any probe lease) until success, or release on
+		// every abandon path so a peer request / fallback credential is not starved.
+		let keepReservation = false;
 		try {
-			let result: { newCredentials: OAuthCredentials; apiKey: string } | null;
-			const customProvider = getOAuthProvider(provider);
-			if (customProvider) {
-				const refreshedCredentials = await this.#deps.refresher.refresh(
-					provider,
-					selection.credential,
-					credentialId,
-					options?.signal,
-				);
-				const apiKey = customProvider.getApiKey
-					? customProvider.getApiKey(refreshedCredentials)
-					: refreshedCredentials.access;
-				result = { newCredentials: refreshedCredentials, apiKey };
-			} else {
-				// Refresh first through the broker-aware single-flighted machinery
-				// so transient failures surface as network errors (5-min temp block)
-				// instead of `getOAuthApiKey`'s "expired" precondition error, which
-				// the definitive-failure regex below would otherwise classify as
-				// auth failure and soft-disable a still-valid credential.
-				const refreshedCredentials = await this.#deps.refresher.refresh(
-					provider,
-					selection.credential,
-					credentialId,
-					options?.signal,
-				);
-				const oauthCreds: Record<string, OAuthCredentials> = {
-					[provider]: refreshedCredentials,
-				};
-				result = await getOAuthApiKey(provider as OAuthProvider, oauthCreds);
+			if (!(await this.#prepareOAuthCredentialForRequest(provider, selection, options))) {
+				return undefined;
 			}
-			if (!result) return undefined;
-			const updated = mergeRefreshedCredential(selection.credential, result.newCredentials);
-			if (credentialId !== undefined) {
-				const idx = this.#deps.pool.replaceById(provider, credentialId, updated);
-				if (idx !== -1) selection.index = idx;
-			} else {
-				const rowId = this.#deps.pool.entries(provider)[selection.index]?.id;
-				if (rowId !== undefined) this.#deps.pool.replaceById(provider, rowId, updated);
+			// Capture / refresh the row id once, immediately after #prepareOAuthCredentialForRequest
+			// resynced selection.index from the store. A concurrent disable during the
+			// usage/refresh awaits below can shift positional indices, so every later
+			// refresh / persist / CAS-disable addresses the row by this stable id.
+			credentialId = this.#deps.pool.entries(provider)[selection.index]?.id;
+			// prepare/broker refresh may bump incarnation and purge the prior reservation;
+			// reacquire against the post-prepare incarnation before vending the bearer.
+			if (options?.requestId && credentialId !== undefined) {
+				const held = coordination.activeTurnReservation(
+					credentialId,
+					coordination.getCredentialIncarnation(credentialId),
+				);
+				if (!held || held.requestId !== options.requestId) {
+					const acquired = coordination.tryAcquireTurnReservation({
+						credentialId,
+						incarnation: coordination.getCredentialIncarnation(credentialId),
+						requestId: options.requestId,
+					});
+					if (!acquired.ok) {
+						coordination.clearQuotaProbe(options.requestId);
+						return undefined;
+					}
+				}
 			}
+
+			const planGate =
+				providedPlanGate ?? this.#deps.strategies(provider)?.planGate?.({ modelId: options?.modelId });
+			const hasPlanRequirement = planGate !== undefined;
+			const applyPlanFilter = enforcePlanRequirement ?? hasPlanRequirement;
+			let usage: UsageReport | null = null;
+			let usageChecked = false;
+
 			if ((checkUsage && !allowBlocked) || hasPlanRequirement) {
-				const sameAccount = selection.credential.accountId === updated.accountId;
-				if (!usageChecked || !sameAccount) {
-					usage = await this.#deps.usage.report(provider, updated, {
+				if (usagePrechecked) {
+					usage = prefetchedUsage;
+					usageChecked = true;
+				} else {
+					usage = await this.#deps.usage.report(provider, selection.credential, {
 						...options,
 						timeoutMs: this.#deps.usage.requestTimeoutMs,
 					});
@@ -1101,53 +1216,168 @@ export class CredentialSelector {
 					}
 				}
 			}
-			this.#deps.pool.noteBearer(provider, result.apiKey, credentialId);
-			if (options?.recordAffinity !== false) {
-				this.#deps.affinity.record(provider, sessionId, "oauth", selection.index);
+			try {
+				let result: { newCredentials: OAuthCredentials; apiKey: string } | null;
+				const customProvider = getOAuthProvider(provider);
+				if (customProvider) {
+					const refreshedCredentials = await this.#deps.refresher.refresh(
+						provider,
+						selection.credential,
+						credentialId,
+						options?.signal,
+					);
+					const apiKey = customProvider.getApiKey
+						? customProvider.getApiKey(refreshedCredentials)
+						: refreshedCredentials.access;
+					result = { newCredentials: refreshedCredentials, apiKey };
+				} else {
+					// Refresh first through the broker-aware single-flighted machinery
+					// so transient failures surface as network errors (5-min temp block)
+					// instead of `getOAuthApiKey`'s "expired" precondition error, which
+					// the definitive-failure regex below would otherwise classify as
+					// auth failure and soft-disable a still-valid credential.
+					const refreshedCredentials = await this.#deps.refresher.refresh(
+						provider,
+						selection.credential,
+						credentialId,
+						options?.signal,
+					);
+					const oauthCreds: Record<string, OAuthCredentials> = {
+						[provider]: refreshedCredentials,
+					};
+					result = await getOAuthApiKey(provider as OAuthProvider, oauthCreds);
+				}
+				if (!result) return undefined;
+				const updated = mergeRefreshedCredential(selection.credential, result.newCredentials);
+				if (credentialId !== undefined) {
+					const idx = this.#deps.pool.replaceById(provider, credentialId, updated);
+					if (idx !== -1) selection.index = idx;
+				} else {
+					const rowId = this.#deps.pool.entries(provider)[selection.index]?.id;
+					if (rowId !== undefined) this.#deps.pool.replaceById(provider, rowId, updated);
+				}
+				if ((checkUsage && !allowBlocked) || hasPlanRequirement) {
+					const sameAccount = selection.credential.accountId === updated.accountId;
+					if (!usageChecked || !sameAccount) {
+						usage = await this.#deps.usage.report(provider, updated, {
+							...options,
+							timeoutMs: this.#deps.usage.requestTimeoutMs,
+						});
+						usageChecked = true;
+					}
+					if (applyPlanFilter && planGate?.(usage) !== true) {
+						return undefined;
+					}
+					if (checkUsage && !allowBlocked && usage && strategy && rankingContext) {
+						const scopedLimits = scopedUsageLimits(strategy, usage, rankingContext);
+						if (isUsageLimitReached(scopedLimits)) {
+							const resetAtMs = usageResetAtMs(scopedLimits, Date.now());
+							this.#deps.blocks.mark(
+								provider,
+								providerKey,
+								selection.index,
+								resetAtMs ?? Date.now() + DEFAULT_BLOCK_MS,
+								blockScope,
+								resetAtMs !== undefined,
+							);
+							return undefined;
+						}
+					}
+				}
+				if (credentialId !== undefined) {
+					// Post-refresh re-sync: a peer process may have rotated the row between
+					// our persist and now. Keep the selection aligned to the live row so
+					// affinity/reservations bind the right index, but still vend the token
+					// we minted — it is a valid fresh credential for the same account, and
+					// dropping it would waste the refresh (the row now serves the peer's).
+					if (!this.#syncOAuthSelectionFromStore(provider, selection, credentialId)) return undefined;
+					// A peer *re-login* under the same row id is different: the row now
+					// names another account, so our minted token would be mis-attributed.
+					if (
+						selection.credential.access !== updated.access &&
+						(selection.credential.accountId ?? null) !== (updated.accountId ?? null)
+					)
+						return undefined;
+					if (
+						options?.requestId &&
+						!coordination.tryAcquireTurnReservation({
+							credentialId,
+							incarnation: coordination.getCredentialIncarnation(credentialId),
+							requestId: options.requestId,
+						}).ok
+					)
+						return undefined;
+				}
+				this.#deps.pool.noteBearer(provider, result.apiKey, credentialId);
+				if (options?.recordAffinity !== false) {
+					this.#deps.affinity.record(provider, sessionId, "oauth", selection.index);
+				}
+				keepReservation = true;
+				return { apiKey: result.apiKey, credential: updated, credentialId };
+			} catch (error) {
+				const errorMsg = String(error);
+				// Only remove credentials for definitive auth failures
+				// Keep credentials for transient errors (network, 5xx) and block temporarily
+				const isDefinitiveFailure = AIError.isDefinitiveOAuthFailure(errorMsg);
+
+				logger.warn("OAuth token refresh failed", {
+					provider,
+					index: selection.index,
+					error: errorMsg,
+					isDefinitiveFailure,
+				});
+
+				if (isDefinitiveFailure) {
+					const outcome = await this.#deps.refresher.disableDefinitiveFailure(
+						provider,
+						credentialId,
+						selection.credential,
+						selection.index,
+						errorMsg,
+					);
+					if (outcome === "peer-rotated") {
+						if (allowFallback) {
+							// Drop this credential's hold before peer selection so the
+							// nested attempt can reserve; skip the outer finally release.
+							if (options?.requestId) coordination.releaseTurnReservation(options.requestId);
+							keepReservation = true;
+							return this.resolveOAuth(provider, sessionId, options);
+						}
+						return undefined;
+					}
+					if (outcome === "cas-lost") return undefined;
+					if (this.#deps.pool.credentials(provider).some(credential => credential.type === "oauth")) {
+						if (allowFallback) {
+							if (options?.requestId) coordination.releaseTurnReservation(options.requestId);
+							keepReservation = true;
+							return this.resolveOAuth(provider, sessionId, options);
+						}
+					}
+				} else {
+					usageOptions.onTransientRefreshFailure?.(error);
+					// Block temporarily for transient failures (5 minutes)
+					this.#deps.blocks.mark(
+						provider,
+						providerKey,
+						selection.index,
+						Date.now() + OAUTH_REFRESH_FAILURE_BACKOFF_MS,
+						AUTH_BLOCK_SCOPE,
+					);
+				}
 			}
-			return { apiKey: result.apiKey, credential: updated, credentialId };
-		} catch (error) {
-			const errorMsg = String(error);
-			// Only remove credentials for definitive auth failures
-			// Keep credentials for transient errors (network, 5xx) and block temporarily
-			const isDefinitiveFailure = AIError.isDefinitiveOAuthFailure(errorMsg);
 
-			logger.warn("OAuth token refresh failed", {
-				provider,
-				index: selection.index,
-				error: errorMsg,
-				isDefinitiveFailure,
-			});
-
-			if (isDefinitiveFailure) {
-				const outcome = await this.#deps.refresher.disableDefinitiveFailure(
-					provider,
-					credentialId,
-					selection.credential,
-					selection.index,
-					errorMsg,
-				);
-				if (outcome === "peer-rotated") {
-					if (allowFallback) return this.resolveOAuth(provider, sessionId, options);
-					return undefined;
+			return undefined;
+		} finally {
+			const finishId = credentialId;
+			const finishScope = acquiredProbeScope;
+			if (!keepReservation) {
+				if (options?.requestId) {
+					coordination.releaseTurnReservation(options.requestId);
+					coordination.clearQuotaProbe(options.requestId);
+				} else if (finishId !== undefined) {
+					coordination.clearAnonymousQuotaProbe(finishId, finishScope);
 				}
-				if (outcome === "cas-lost") return undefined;
-				if (this.#deps.pool.credentials(provider).some(credential => credential.type === "oauth")) {
-					if (allowFallback) return this.resolveOAuth(provider, sessionId, options);
-				}
-			} else {
-				usageOptions.onTransientRefreshFailure?.(error);
-				// Block temporarily for transient failures (5 minutes)
-				this.#deps.blocks.mark(
-					provider,
-					providerKey,
-					selection.index,
-					Date.now() + OAUTH_REFRESH_FAILURE_BACKOFF_MS,
-					AUTH_BLOCK_SCOPE,
-				);
 			}
 		}
-
-		return undefined;
 	}
 }

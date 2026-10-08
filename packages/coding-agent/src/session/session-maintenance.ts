@@ -76,6 +76,7 @@ import type { MemoryBackendOperationContext } from "../memory-backend/types";
 import { computeNonMessageTokens, type NonMessageTokenSource } from "@oh-my-pi/pi-tui/status-line/context-usage";
 import { createPlanReadMatcher } from "../plan-mode/plan-protection";
 import { isCompleteReadResult } from "../tools/read-supersede";
+import incompleteTodosSnapshotTemplate from "../prompts/system/incomplete-todos-snapshot.md" with { type: "text" };
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import type { AgentSessionEvent } from "./agent-session-events";
 import type { ContextUsageBreakdown, HandoffResult, SessionHandoffOptions } from "./agent-session-types";
@@ -462,6 +463,10 @@ export interface SessionMaintenanceHost {
 	resetCodexProviderAfterCompaction(compaction: CodexCompactionContext): void;
 	resetPlanReference(): void;
 	syncTodoPhasesFromBranch(): void;
+	/** Live incomplete todo lines for the compaction summarizer input. Optional: hosts without a todo surface contribute nothing. */
+	incompleteTodosCompactionContext?(): string[];
+	/** Keep incomplete todos in the standing compaction summary text. Optional: hosts without it keep the summary unchanged. */
+	appendIncompleteTodosToCompactionSummary?(summary: string): string;
 	resetAdvisorRuntimes(reason?: string): void;
 	/** Re-aligns advisors after an in-place prune their own contexts already cover (no re-prime). */
 	rebaseAdvisorPrefix(reason: string): void;
@@ -2404,8 +2409,12 @@ export class SessionMaintenance {
 		advisorResetReason: string;
 		detachExtensionEmit?: boolean;
 	}): Promise<CompactionEntry | undefined> {
+		// Use the live todo cache (including RPC set_todos) for the standing
+		// Incomplete Todos section — do not reload from the branch first, which
+		// would overwrite an authoritative host clear/update with a stale toolResult.
+		const summary = this.#host.appendIncompleteTodosToCompactionSummary?.(args.summary) ?? args.summary;
 		const entryId = this.#host.sessionManager.appendCompaction(
-			args.summary,
+			summary,
 			args.shortSummary,
 			args.firstKeptEntryId,
 			args.tokensBefore,
@@ -2417,8 +2426,8 @@ export class SessionMaintenance {
 				providerReplayThroughEntryId: args.providerReplayThroughEntryId,
 				tokensAfter:
 					isRecord(args.details) && args.details.kind === "experimental-context-rollover"
-						? this.#projectExperimentalContextRolloverTokens(args)
-						: this.#projectCompactedContextTokens(args),
+						? this.#projectExperimentalContextRolloverTokens({ ...args, summary })
+						: this.#projectCompactedContextTokens({ ...args, summary }),
 			},
 		);
 		// A committed compaction starts a new cycle; native compaction gets a fresh try.
@@ -3540,6 +3549,9 @@ export class SessionMaintenance {
 				preserveData: Record<string, unknown> | undefined;
 		  }
 	> {
+		// Live cache is authoritative for leftover rows (RPC set_todos included).
+		this.#injectIncompleteTodoSnapshot(preparation);
+
 		let hookContext: string[] | undefined;
 		let hookPrompt: string | undefined;
 		let preserveData: Record<string, unknown> | undefined;
@@ -3577,7 +3589,31 @@ export class SessionMaintenance {
 			};
 		}
 
-		return { kind: "needsLlm", hookContext, hookPrompt, preserveData };
+		return {
+			kind: "needsLlm",
+			hookContext: this.#compactionExtraContext(hookContext),
+			hookPrompt,
+			preserveData,
+		};
+	}
+
+	#compactionExtraContext(hookContext: string[] | undefined): string[] | undefined {
+		const todoContext = this.#host.incompleteTodosCompactionContext?.() ?? [];
+		if (todoContext.length === 0) return hookContext;
+		return [...todoContext, ...(hookContext ?? [])];
+	}
+
+	#injectIncompleteTodoSnapshot(preparation: CompactionPreparation): void {
+		const todoContext = this.#host.incompleteTodosCompactionContext?.() ?? [];
+		const snapshot: AgentMessage = {
+			role: "custom",
+			customType: "incomplete-todos-snapshot",
+			content: prompt.render(incompleteTodosSnapshotTemplate, { rows: todoContext }).trim(),
+			display: false,
+			attribution: "agent",
+			timestamp: Date.now(),
+		};
+		preparation.messagesToSummarize = [snapshot, ...preparation.messagesToSummarize];
 	}
 
 	/**
@@ -4178,6 +4214,8 @@ export class SessionMaintenance {
 		const rebuilt = snapcompact.getPreservedArchive(result.preserveData);
 		if (!rebuilt || rebuilt.frames.length >= archive.frames.length) return undefined;
 
+		// Regular compact paths use the live todo cache for leftovers; rescue must too.
+		result.summary = this.#host.appendIncompleteTodosToCompactionSummary?.(result.summary) ?? result.summary;
 		const rebuiltEntryId = this.#host.sessionManager.appendCompaction(
 			result.summary,
 			result.shortSummary,

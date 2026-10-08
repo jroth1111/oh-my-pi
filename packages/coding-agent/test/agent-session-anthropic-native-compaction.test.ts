@@ -91,6 +91,53 @@ function withoutCacheControl(value: unknown): unknown {
 	return JSON.parse(JSON.stringify(value), (key, inner) => (key === "cache_control" ? undefined : inner));
 }
 
+/** The coding agent adds this out-of-band snapshot to the summarizer, not the live provider history. */
+function withoutIncompleteTodosSnapshot(messages: unknown[]): unknown[] {
+	return messages.filter(message => {
+		if (typeof message !== "object" || message === null || !("content" in message)) return true;
+		const content = message.content;
+		if (!Array.isArray(content)) return true;
+		return !content.some(
+			part =>
+				typeof part === "object" &&
+				part !== null &&
+				"type" in part &&
+				part.type === "text" &&
+				"text" in part &&
+				typeof part.text === "string" &&
+				part.text.startsWith("<incomplete-todos>"),
+		);
+	});
+}
+
+function isNativeCompactionMessage(message: unknown): boolean {
+	if (typeof message !== "object" || message === null || !("content" in message) || !Array.isArray(message.content))
+		return false;
+	return message.content.some(
+		part => typeof part === "object" && part !== null && "type" in part && part.type === "compaction",
+	);
+}
+
+function withoutNativeCompactionBlocks(messages: unknown[]): unknown[] {
+	const replayable: unknown[] = [];
+	for (const message of messages) {
+		if (
+			typeof message !== "object" ||
+			message === null ||
+			!("content" in message) ||
+			!Array.isArray(message.content)
+		) {
+			replayable.push(message);
+			continue;
+		}
+		const content = message.content.filter(
+			part => !(typeof part === "object" && part !== null && "type" in part && part.type === "compaction"),
+		);
+		if (content.length > 0) replayable.push({ ...message, content });
+	}
+	return replayable;
+}
+
 describe("AgentSession Anthropic native compaction", () => {
 	const previousProxy = Bun.env.PI_PROXY_ANTHROPIC;
 
@@ -180,7 +227,7 @@ describe("AgentSession Anthropic native compaction", () => {
 		expect(compaction.system).toEqual(live.system);
 		expect(compaction.tools).toEqual(live.tools);
 		expect(compaction.messages.length).toBeGreaterThan(0);
-		expect(withoutCacheControl(compaction.messages)).toEqual(
+		expect(withoutCacheControl(withoutIncompleteTodosSnapshot(compaction.messages))).toEqual(
 			withoutCacheControl(live.messages.slice(0, compaction.messages.length)),
 		);
 	});
@@ -214,7 +261,9 @@ describe("AgentSession Anthropic native compaction", () => {
 		// The cut keeps only the last answer: the request is exactly what the
 		// "third question" turn sent, the inserted control included.
 		expect(JSON.stringify(compaction.messages)).not.toContain("answer 4");
-		expect(withoutCacheControl(compaction.messages)).toEqual(withoutCacheControl(live.messages));
+		expect(withoutCacheControl(withoutIncompleteTodosSnapshot(compaction.messages))).toEqual(
+			withoutCacheControl(live.messages),
+		);
 	});
 
 	it("replays a later compaction's prefix as sent, without disturbing the live reminder state", async () => {
@@ -239,8 +288,13 @@ describe("AgentSession Anthropic native compaction", () => {
 		expect(requests).toHaveLength(7);
 		const live = requests[4]!;
 		const [compaction, next] = requests.slice(5);
-		expect(withoutCacheControl(compaction.messages)).toEqual(
-			withoutCacheControl(live.messages.slice(0, compaction.messages.length)),
+		const compactedHistory = withoutIncompleteTodosSnapshot(compaction.messages);
+		// The native summary block is the boundary from the previous compaction;
+		// a later compaction must carry it forward before the replayable live prefix.
+		expect(compactedHistory.some(isNativeCompactionMessage)).toBe(true);
+		const replayableHistory = withoutNativeCompactionBlocks(compactedHistory);
+		expect(withoutCacheControl(replayableHistory)).toEqual(
+			withoutCacheControl(withoutNativeCompactionBlocks(live.messages).slice(0, replayableHistory.length)),
 		);
 		// The next live turn still sends every earlier message unchanged.
 		expect(withoutCacheControl(next.messages.slice(0, live.messages.length))).toEqual(

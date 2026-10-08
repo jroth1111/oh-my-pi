@@ -92,6 +92,9 @@ describe("AgentSession concurrent prompt dispatch", () => {
 			createSession(manager);
 			const reached = Promise.withResolvers<void>();
 			const release = Promise.withResolvers<void>();
+			// The prompt path short-circuits getApiKey when hasAuth reports a
+			// configured credential; force the getApiKey leg so it stays the gate.
+			vi.spyOn(authStorage!, "hasAuth").mockReturnValue(false);
 			const getApiKey = modelRegistry.getApiKey.bind(modelRegistry);
 			vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (...args) => {
 				reached.resolve();
@@ -160,6 +163,7 @@ describe("AgentSession concurrent prompt dispatch", () => {
 		createSession(manager, new ExtensionRunner([extension], runtime, manager.getCwd(), manager, modelRegistry));
 		const reached = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
+		vi.spyOn(authStorage!, "hasAuth").mockReturnValue(false);
 		const getApiKey = modelRegistry.getApiKey.bind(modelRegistry);
 		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (...args) => {
 			reached.resolve();
@@ -229,6 +233,7 @@ describe("AgentSession concurrent prompt dispatch", () => {
 		const retained = manager.appendMessage({ role: "user", content: "Retained", timestamp: 1 });
 		manager.appendMessage({ role: "user", content: "Abandoned", timestamp: 2 });
 		createSession(manager);
+		vi.spyOn(authStorage!, "hasAuth").mockReturnValue(false);
 		const reached = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
 		const getApiKey = modelRegistry.getApiKey.bind(modelRegistry);

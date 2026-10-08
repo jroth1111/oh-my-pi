@@ -3513,7 +3513,8 @@ describe("ModelRegistry runtime discovery", () => {
 		await registry.hydrateCredentialScopedModelCaches();
 
 		const restored = registry.find("github-copilot", "gpt-5.6-sol-1m");
-		expect(restored?.headers).toEqual(bundledBase.headers);
+		const restoredHeaders = restored?.headers ?? (await restored?.resolveHeaders?.());
+		expect(restoredHeaders).toEqual(bundledBase.headers);
 	});
 
 	test("startup drops a current Copilot alias whose headers differ from its bundled base", () => {

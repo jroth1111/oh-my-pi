@@ -286,6 +286,14 @@ export function stopSharedSpinnerTicker(): void {
 	}
 }
 
+/** Test-only: whether the shared spinner ticker interval is currently armed.
+ *  Tests assert ticker release through this rather than `vi.getTimerCount()`,
+ *  which counts every pending timer — including unrelated ones armed by other
+ *  modules under test (cross-file pollution). */
+export function __sharedSpinnerTickerArmedForTests(): boolean {
+	return sharedSpinnerTimer !== undefined;
+}
+
 // Stable per-instance counter so each tool execution's inline images get a
 // graphics id that survives child re-creation (the image budget keys off it).
 let toolExecutionInstanceSeq = 0;

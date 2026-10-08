@@ -448,7 +448,10 @@ describe("AgentSession auto-compaction progress guard", () => {
 		// The hook-provided summary is reported to `session_compact` as extension-owned.
 		expect(compactEvents).toHaveLength(1);
 		expect(compactEvents[0]?.fromExtension).toBe(true);
-		expect(compactEvents[0]?.compactionEntry).toMatchObject({ summary: "compacted", fromExtension: true });
+		expect(compactEvents[0]?.compactionEntry).toMatchObject({
+			summary: expect.stringMatching(/^compacted(?:\n|$)/),
+			fromExtension: true,
+		});
 	});
 
 	it("auto-continues after compaction while an active goal still needs work", async () => {
@@ -961,7 +964,7 @@ describe("AgentSession auto-compaction progress guard", () => {
 		expect(continueSpy).toHaveBeenCalledTimes(1);
 		expect(sessionManager.getBranch().at(-1)).toMatchObject({
 			type: "compaction",
-			summary: "handoff document",
+			summary: expect.stringContaining("handoff document"),
 		});
 		expect(sessionManager.getBranch()).not.toContainEqual(
 			expect.objectContaining({
@@ -1254,7 +1257,7 @@ describe("AgentSession auto-compaction progress guard", () => {
 		expect(continueSpy).toHaveBeenCalledTimes(1);
 		expect(sessionManager.getBranch().at(-1)).toMatchObject({
 			type: "compaction",
-			summary: "speculative handoff",
+			summary: expect.stringContaining("speculative handoff"),
 		});
 		expect(sessionManager.getBranch()).not.toContainEqual(
 			expect.objectContaining({
@@ -1342,7 +1345,7 @@ describe("AgentSession auto-compaction progress guard", () => {
 		expect(continueSpy).toHaveBeenCalledTimes(1);
 		expect(sessionManager.getBranch().at(-1)).toMatchObject({
 			type: "compaction",
-			summary: "recovery handoff",
+			summary: expect.stringContaining("recovery handoff"),
 		});
 	});
 

@@ -334,7 +334,7 @@ export class SignInScene implements SetupSceneController {
 		this.#host.restoreFocus();
 		this.#host.requestRender();
 		try {
-			await this.#authStorage.oauth.login(providerId as OAuthProvider, {
+			const identity = await this.#authStorage.oauth.login(providerId as OAuthProvider, {
 				signal: this.#loginAbort.signal,
 				onBrowserSession: (request, signal) => this.#host.ctx.captureBrowserSession(request, signal),
 				onAuth: info => {
@@ -375,7 +375,7 @@ export class SignInScene implements SetupSceneController {
 			if (this.#disposed) return;
 			this.#statusLines = [
 				{ text: `${theme.status.success} Signed in to ${providerId}`, color: "success" },
-				{ text: `Credentials saved to ${getAgentDbPath()}`, color: "dim" },
+				...(identity ? [{ text: `Credentials saved to ${getAgentDbPath()}`, color: "dim" as const }] : []),
 			];
 			this.#authUrl = undefined;
 			this.#authLaunchUrl = undefined;

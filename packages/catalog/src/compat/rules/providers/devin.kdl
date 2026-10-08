@@ -1,6 +1,9 @@
 // Catalog entry for "devin"; no deployment-contract compat rules are needed.
 
 provider "devin" {
+	// Live roster is gated per account/team — gen:models must not bake it into
+	// the shared bundle, and previous-snapshot private rows must not resurrect.
+	credential-scoped-catalog #true
 	default-model "swe-1-6"
 	env "DEVIN_API_KEY"
 	dynamic-models-authoritative #true

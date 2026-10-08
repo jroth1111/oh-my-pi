@@ -135,6 +135,7 @@ export const eventDefs = {
 		todos: "TodoItem[]",
 		attempt: "number.integer",
 		maxAttempts: "number.integer",
+		"unverifiedMerge?": "boolean",
 	},
 	TodoAutoClearEvent: { type: "'todo_auto_clear'" },
 	IrcMessageEvent: { type: "'irc_message'", message: "CustomMessage" },
