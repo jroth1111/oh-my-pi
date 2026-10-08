@@ -1507,8 +1507,8 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 					await response.text().catch(() => "");
 					throw new Error(
 						`Grok Bot stream failed (HTTP ${response.status})${
-							response.status === 403 && !inferenceAuthenticationJwt
-								? "; no per-request inference attestation was supplied by the authorized runtime"
+							response.status === 403
+								? "; verify account/model entitlement and the account-advertised wire route"
 								: ""
 						}`,
 					);

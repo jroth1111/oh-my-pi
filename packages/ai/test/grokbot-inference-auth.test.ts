@@ -12,26 +12,26 @@ function fixtureJwt(exp = Math.floor(Date.now() / 1000) + 60): string {
 	return `${Buffer.from(JSON.stringify({ alg: "none" })).toString("base64url")}.${Buffer.from(JSON.stringify({ exp, jti: crypto.randomUUID() })).toString("base64url")}.fixture`;
 }
 
-describe("Grokbot single-use inference attestation", () => {
+describe("Grokbot optional workload authorization", () => {
 	test("workload header injection is rejected before transport", () => {
 		expect(() =>
 			grokbotInferenceContextHeaders({ workload: "bad\r\nheader", jobId: "fixture-job", user: "fixture-user" }),
 		).toThrow("Invalid Grok Bot inference workload context");
 	});
-	test("a per-request supplier provides distinct tokens and neither can be replayed", async () => {
+	test("a supplier is reevaluated without imposing an unsupported single-use rule", async () => {
 		const tokens = [fixtureJwt(), fixtureJwt()];
 		let index = 0;
 		const options = { grokbotInferenceAuthenticationJwt: () => tokens[index++]! };
 		expect(await takeGrokbotInferenceAuthenticationJwt(options, {}, {})).toBe(tokens[0]);
 		expect(await takeGrokbotInferenceAuthenticationJwt(options, {}, {})).toBe(tokens[1]);
-		await expect(
-			takeGrokbotInferenceAuthenticationJwt({ grokbotInferenceAuthenticationJwt: tokens[0] }, {}, {}),
-		).rejects.toThrow("already consumed");
+		expect(
+			await takeGrokbotInferenceAuthenticationJwt({ grokbotInferenceAuthenticationJwt: tokens[0] }, {}, {}),
+		).toBe(tokens[0]);
 	});
-	test("environment attestation is one-shot, not a reusable bearer token", async () => {
+	test("an issuer-provided environment token is not consumed or mutated by resolution", async () => {
 		const env = { INFERENCE_PROXY_JWT: fixtureJwt() };
 		expect(await takeGrokbotInferenceAuthenticationJwt({}, {}, env)).toBe(env.INFERENCE_PROXY_JWT);
-		await expect(takeGrokbotInferenceAuthenticationJwt({}, {}, env)).rejects.toThrow("already consumed");
+		expect(await takeGrokbotInferenceAuthenticationJwt({}, {}, env)).toBe(env.INFERENCE_PROXY_JWT);
 	});
 	test("explicit supplier wins over ambient launcher tokens without consuming the ambient token", async () => {
 		const ambient = fixtureJwt();

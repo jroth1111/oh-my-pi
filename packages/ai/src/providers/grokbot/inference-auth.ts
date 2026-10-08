@@ -9,7 +9,6 @@ export {
 	GROKBOT_INFERENCE_AUTHENTICATION_HEADER,
 	grokbotMetadataHeaders,
 } from "@oh-my-pi/pi-catalog/discovery/grokbot-auth";
-const consumedTokens = new Map<string, number>();
 
 export async function resolveGrokbotInferenceRequestContext(
 	options: StreamOptions,
@@ -57,7 +56,7 @@ async function consumeTokenFile(file: string): Promise<string> {
 	}
 }
 
-/** Obtain a caller/control-plane-issued token for exactly one outbound Stream attempt. */
+/** Resolve optional caller-issued workload authorization. Token reuse rules belong to its issuer. */
 export async function takeGrokbotInferenceAuthenticationJwt(
 	options: Pick<StreamOptions, "grokbotInferenceAuthenticationJwt" | "grokbotInferenceAuthenticationJwtFile">,
 	headers: Record<string, string>,
@@ -91,16 +90,5 @@ export async function takeGrokbotInferenceAuthenticationJwt(
 	const now = Date.now();
 	const expiry = getAccessTokenExpiryMs(token);
 	if (expiry !== null && expiry <= now) throw new ConfigurationError("Grok Bot inference attestation token expired");
-	for (const [key, until] of consumedTokens) if (until <= now) consumedTokens.delete(key);
-	const fingerprint = new Bun.CryptoHasher("sha256").update(token).digest("hex");
-	if (consumedTokens.has(fingerprint)) {
-		throw new ConfigurationError(
-			"Grok Bot inference attestation token was already consumed; supply a fresh token per request or retry",
-		);
-	}
-	if (consumedTokens.size >= 1024)
-		throw new ConfigurationError("Too many unexpired Grok Bot attestations; use expiring control-plane JWTs");
-	// Store fingerprints only, never raw secrets. Opaque tokens remain consumed.
-	consumedTokens.set(fingerprint, expiry ?? Number.POSITIVE_INFINITY);
 	return token;
 }

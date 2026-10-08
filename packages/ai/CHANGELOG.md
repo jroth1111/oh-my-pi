@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Grok Bot permission diagnostics no longer assume missing attestation, and runtime JWT reuse follows the issuer's rules.
 - Grok Bot accepts caller-provided inference attestation and workload context, and preserves server-native Claude content across effort variants.
 - Grok Bot requests omit the retired variant-string wire flag and support advertised `reasoning_effort` parameters.
 - Updated Grok Bot's default Sand client stamp while preserving explicit client-version overrides.

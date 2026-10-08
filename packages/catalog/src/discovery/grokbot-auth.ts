@@ -327,7 +327,7 @@ export function grokbotClientHeaders(cfg: Pick<GrokbotConfig, "clientVersion" | 
  */
 export const GROKBOT_INFERENCE_AUTHENTICATION_HEADER = "x-inference-authentication-jwt";
 
-/** Stream attestations are single-use; metadata requests must not consume them. */
+/** Workload authorization is Stream-specific; do not forward it to metadata endpoints. */
 export function grokbotMetadataHeaders(...sources: Array<Record<string, string> | undefined>): Record<string, string> {
 	const result: Record<string, string> = {};
 	for (const source of sources)

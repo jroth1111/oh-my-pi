@@ -536,7 +536,7 @@ export interface StreamOptions {
 	grokbotInferenceRequestContext?:
 		| GrokbotInferenceRequestContext
 		| (() => GrokbotInferenceRequestContext | Promise<GrokbotInferenceRequestContext>);
-	/** Control-plane-issued, one-shot Sand Stream attestation. A supplier must return a fresh token for every request/retry. Null disables environment sourcing. */
+	/** Optional runtime-issued Sand workload authorization. Supplier is called per attempt; issuer determines token lifetime/reuse. Null disables environment sourcing. */
 	grokbotInferenceAuthenticationJwt?: string | (() => string | Promise<string>) | null;
 	/** Explicit one-shot attestation file; atomically claimed, read, and deleted when used. */
 	grokbotInferenceAuthenticationJwtFile?: string;
