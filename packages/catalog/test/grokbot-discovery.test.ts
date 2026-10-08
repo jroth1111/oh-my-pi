@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as grokbotAuth from "../src/discovery/grokbot-auth";
 import { buildModel } from "../src/build";
+import { Effort } from "../src/effort";
 import { fetchGrokbotAvailableModels, normalizeGrokbotAvailableModels } from "../src/discovery/grokbot";
 import {
 	decodeGrokbotAvailableModelsResponse,
@@ -181,6 +182,43 @@ const FIXTURE = {
 };
 
 describe("grokbot AvailableModels normalize", () => {
+	test("reasoning_effort variants expose their advertised ladder without falling back to generic efforts", () => {
+		const models = normalizeGrokbotAvailableModels([
+			{
+				name: "claude-sonnet-5-5",
+				supportsThinking: true,
+				parameterDefinitions: [{ id: "reasoning_effort" }],
+				variants: [
+					{ parameterValues: [{ id: "reasoning_effort", value: "medium" }], isDefaultNonMaxConfig: true },
+					{ parameterValues: [{ id: "reasoning_effort", value: "max" }] },
+				],
+			},
+		]);
+		const model = buildModel(models.find(m => m.id === "claude-sonnet-5-5")!);
+		expect(model.thinking?.efforts).toEqual([Effort.Medium, Effort.Max]);
+		expect(model.sandParameterDefaults).toEqual({ reasoning_effort: "medium" });
+	});
+
+	test("preferred router keeps its own wire id and parent-chat tools in live and offline catalogs", () => {
+		for (const spec of [
+			normalizeGrokbotAvailableModels([{ name: "fixture-model" }], "https://proxy.example/sand").find(
+				m => m.id === "sand-default-preferred",
+			),
+			buildGrokbotStaticSeed("https://proxy.example/sand").find(m => m.id === "sand-default-preferred"),
+		]) {
+			const model = buildModel(spec!);
+			expect(model.baseUrl).toBe("https://proxy.example/sand");
+			expect(model.sandWireModelId).toBeUndefined();
+			expect(model.sandToolsWire).toBe("parent-chat");
+			expect(model.sandPromoteJsonTextTools).toBe(true);
+			expect(model.reasoning).toBe(true);
+			expect(model.contextWindow).toBeGreaterThanOrEqual(200_000);
+		}
+		const bundled = getBundledModels("grokbot").find(m => m.id === "sand-default-preferred");
+		expect(bundled?.sandToolsWire).toBe("parent-chat");
+		expect(bundled?.sandWireModelId).toBeUndefined();
+	});
+
 	test("encodes parameterized request body", () => {
 		expect(JSON.parse(encodeGrokbotAvailableModelsRequest())).toEqual({ useModelParameters: true });
 	});

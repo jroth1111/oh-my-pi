@@ -19,7 +19,9 @@ If `-p` exits with `No API key found for grokbot`, this checkout did not see a r
 
 ## Catalog (live AvailableModels)
 
-Do not rely on the six offline seeds (`sand-default`, `sand-cua`, `sand-automation`, `default`, `auto`, `grok-4.6`). With a valid renewer + machine id, discovery refreshes `POST /aiserver.v1.AiService/AvailableModels` and unions the sand routers.
+Offline fallback rows include the sand routers, Auto, Grok 4.6, and captured Claude selectors. Opus 5.5 (`claude-opus-5-5`) is the default selector. A fallback row does not establish account entitlement: with a valid renewer + machine id, discovery refreshes `POST /aiserver.v1.AiService/AvailableModels` and unions the sand routers.
+
+`sand-default-preferred` keeps its own router id and uses the same parent-chat tool wire as `sand-default`. The server selects the underlying model; this selector does not guarantee Opus 5.5. Inspect the response's `upstreamModel` to establish which backend served a request.
 
 ```sh
 omp models grokbot
@@ -38,7 +40,7 @@ omp tools are named `bash` / `read` / `write` (and `edit` / `grep` / `glob`). Sa
 | Anthropic (`claude-*`, fable/opus/sonnet/haiku) | **keep-model** | Product PascalCase `Shell` / `Read` / `Write` with `{ jsonSchema: … }` | Original Anthropic id (backend stays Claude/Fable) |
 | Grok / GPT / Gemini / Kimi / GLM / Composer | **native** (matrix `wire`, not `error`) | omp `bash` / `read` / `write` | Original id |
 | `gemini-3-flash`, `gemini-3-flash[]` | **native** with a `jsonSchema` parameter envelope | omp `bash` / `read` / `write` | Original Gemini 3 Flash model; no substitution |
-| `sand-default`, `sand-cua`, `default`, `default[]`, `auto` | catalog `sand-tools-wire=parent-chat` | Product tools + `SendToUser` | Bare `sand-default` (or `sand-cua`); Auto aliases rewrite off `default` so a Read/Write follow-up does not hang mid-tool |
+| `sand-default`, `sand-default-preferred`, `sand-cua`, `default`, `default[]`, `auto` | catalog `sand-tools-wire=parent-chat` | Product tools + `SendToUser` | Bare selected sand router; Auto aliases rewrite to `sand-default` so a Read/Write follow-up does not hang mid-tool |
 | `sand-automation` | catalog `sand-tools-wire=automation` | Product `Shell` / `Read` / `Write` | `sand-automation` (often routes to grok) |
 | `grok-4.5*` | **disabled** | none | Text-only. Any tools payload is upstream HTTP 422; catalog `supports-tools: false` |
 

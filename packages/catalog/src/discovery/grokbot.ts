@@ -370,9 +370,11 @@ function collectEffortValues(
 ): { efforts: Effort[]; unrecognizedEffortOnly: boolean } {
 	const effortParam = parameterIds.includes("effort")
 		? "effort"
-		: parameterIds.includes("reasoning")
-			? "reasoning"
-			: undefined;
+		: parameterIds.includes("reasoning_effort")
+			? "reasoning_effort"
+			: parameterIds.includes("reasoning")
+				? "reasoning"
+				: undefined;
 	if (!effortParam) return { efforts: [], unrecognizedEffortOnly: false };
 
 	const values = new Set<string>();

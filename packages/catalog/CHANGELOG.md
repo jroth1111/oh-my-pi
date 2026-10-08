@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added the `sand-default-preferred` Grok Bot router and captured Claude models to offline fallback catalogs, with Opus 5.5 as the default selector.
+
+### Fixed
+
+- Grok Bot now recognizes advertised `reasoning_effort` ladders for model selection.
+
 ## [18.8.3] - 2026-10-07
 
 ### Added
