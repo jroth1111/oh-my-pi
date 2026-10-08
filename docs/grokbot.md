@@ -1,8 +1,30 @@
-# Grok Bot (`grokbot` / `grokbot-sand`)
+# Grok Bot native inference and host-managed chat
 
 `grokbot` is a sand InferenceService provider. It is **not** Cursor AgentService (`cursor`) and **not** the public xAI API (`xai` / `xai-oauth`). Every grokbot catalog row uses wire API `grokbot-sand` against `https://api2.cursor.sh` (`POST /aiserver.v1.InferenceService/Stream`).
 
-Published npm/global `omp` **18.0.1 does not include this provider**. Run from this checkout (or a later release that ships `grokbot`).
+The separate `grokbot-chat` provider uses official GrokBotService chat. It is text-only and host-managed: no model id is sent, and it does not guarantee Opus. Existing compiled/global binaries need a rebuild to include new features; the examples below can run directly from this checkout.
+
+## Host-managed chat (explicit, not an Opus fallback)
+
+```sh
+bun packages/coding-agent/src/cli.ts --provider grokbot-chat --model host-managed --no-tools -p "Reply briefly: hello"
+```
+
+This uses the same installed Grok Bot renewal credential and machine id, but sends the session `accessToken` to GrokBotService rather than sending `grokBotToken` to Stream. `/login grokbot-chat` uses the same host-install workflow as `/login grokbot`.
+
+Each request creates a clearly named isolated temporary agent, sends the full textual conversation, watches only that agent's transcript, correlates its own user nonce, and independently reads back the reply. The temporary agent is deleted and its absence verified even after failures or graceful cancellation. This adapter never attaches to an existing bot, silently strips requested OMP tools, switches shared host settings, or resubmits an uncertain message delivery. If cleanup cannot be verified, the request reports an error and identifies its temporary agent for recovery.
+
+Replies retain the model label `host-managed`; an echoed requested name is not proof of the serving backend. This API exposes neither OMP tool execution, native thinking, server token usage, nor model/sampling/output-budget selection. It streams completed messages rather than individual model tokens. The catalog's 32k context floor is conservative local prompt budgeting, not an asserted hidden-backend limit. Signed thinking is not flattened and replayed to an unidentified model.
+
+Native model selection stays on `grokbot/<model>` or `cursor/<model>`. There is no automatic fallback from a denied explicit Opus request to host-managed chat.
+
+`bun scripts/grokbot-chat-smoke.ts [new-receipt-path]` tests the actual root SDK dispatch with a random reply challenge, independent transcript readback, and a separate original-roster/cleanup check. It uses existing credentials and may consume allowance; it never prints tokens or preserves raw transcripts.
+
+## Allowance diagnostics
+
+The usage reporter reads `DashboardService/GetSandUsageStatus` with session authentication. It reports the **used** percentage, remaining percentage, reset time, plan labels, availability flag, and banked-reset count when returned. It does not redeem resets or change spend limits.
+
+Sand allowance, Cursor's model-specific limits, advertised model routes, and successfully served models are distinct facts. A positive Sand allowance does not prove standalone Stream access or Opus entitlement. Failed usage refreshes do not reuse stale allowance as current evidence.
 
 ## Auth (no secret values)
 
@@ -15,7 +37,7 @@ Optional: `GROKBOT_NAMESPACE` (`prod` / `dev` / `lab`), `GROKBOT_CLIENT_VERSION`
 
 Process env beats the secrets file. Never print these values. `/login grokbot` only shows the host-install prompt; `/grokbot` reports status without secrets.
 
-If `-p` exits with `No API key found for grokbot`, this checkout did not see a renewer (missing `secrets/grokbot.env` or env vars). Published global `omp` 18.0.1 will also fail here because it does not register the provider at all.
+If `-p` exits with `No API key found for grokbot`, this checkout did not see a renewer (missing `secrets/grokbot.env` or env vars).
 
 ### Optional workload authorization and account entitlement
 
@@ -74,11 +96,18 @@ Identity comes from `classifyModel()` (taxonomy class), not `id.includes("claude
 | --- | --- | --- |
 | `GROKBOT_ANTHROPIC_TOOLS_WIRE` | `auto` (default) | Anthropic+tools → keep-model; routers follow catalog `sand-tools-wire`; everyone else native |
 | | `keep-model` / `keep-id` / `keep` | Product tools on the original Anthropic `requestedModel` |
+| | `text-tools` (experimental, opt-in) | Keep the selected Claude route; put schemas and tool history in text; omit field-2 declarations; use a fresh conversation id per replay |
 | | `automation` / `product` | Rewrite Anthropic ids to `sand-automation` + `generalPurpose` (often `cursor-grok-*`, **not** a verified Anthropic worker) |
 | | `parent-chat` / `parent` | Product parent-chat tools; Anthropic ids rewrite to `sand-default` |
 | | `sand-default-fallback` | Keep raw tools; rewrite Anthropic `requestedModel` to `sand-default` (model not guaranteed) |
 | | `native` | Raw omp `bash` / `read` / `write` (default for grok/gpt/gemini/…) |
 | | `error` | No rewrite. Explicit Anthropic id + raw omp field-2 tools → HTTP 400 |
+
+### Experimental text tools
+
+`GROKBOT_ANTHROPIC_TOOLS_WIRE=text-tools` (SDK: `anthropicToolsWire: "text-tools"`) is an explicit Claude-family compatibility experiment, not a permission workaround. OMP uses its existing JSON call parser and advertised-tool allowlist; it does not import the third-party XML parser. Only complete JSON calls in final text are promoted, never thinking-only calls, unadvertised names, or responses with truncated Connect streams. Native same-lineage thinking payloads and tool-result images remain intact. `toolChoice: "none"` disables declarations, prompt injection, and promotion.
+
+The default remains `keep-model`. Live explicit Opus text inference must work before a text-tool smoke can establish working Opus tool execution.
 
 ## Run from this checkout
 

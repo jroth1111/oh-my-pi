@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added incremental Connect envelope reading with early delivery, bounded frame sizes, cancellation, and truncated-stream rejection.
+
 ## [18.8.1] - 2026-10-07
 
 ### Added

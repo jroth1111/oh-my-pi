@@ -24,3 +24,13 @@ Fresh metadata returned 256 roster entries, including Opus 5.5 low/medium/high/x
 ## Version caveat
 
 The Luxciax helper writes RequestedModel flags at fields 7/8, while the supplied sand-host `3f90dc1` InferenceRequestedModel declares built-in-model at field 4 and no variant-string flag. Keep OMP's version-verified schema; do not copy incompatible field numbers. Cursor AgentService and Grokbot InferenceService remain separate adapters and credential/transport paths.
+
+## Combined fork integration
+
+The additive `grokbot-chat/host-managed` provider follows the GrokBotService session-authenticated path independently verified with a random reply challenge and a separate transcript readback. It never labels host-selected chat as Opus and never silently replaces native Stream or Cursor requests. Isolated temporary agents are cleaned up with ownership/identity checks and independent absence readback.
+
+Read-only Sand allowance reporting is integrated with OMP usage reporting. The new opt-in `text-tools` mode independently implements the protocol idea using OMP's JSON parser and tool-name allowlist, not copied AGPL code. The selected native model remains intact, native tool declarations are omitted, text history uses fresh conversation ids, and signed/native content is not globally sanitized away.
+
+Additional live trials covered canonical and packed Opus 5/5.5 routes with Max/built-in flags, the 5.5 low/medium/high/xhigh tiers, and a Fast variant. All nine Stream trials returned permission denial before model output. Separate native Cursor Opus 5 and 5.5 requests returned an Opus usage-limit error with an October 16 reset. These are transport/account outcomes, not proof of served Opus. No shared model setting, spend limit, or account was switched.
+
+Shared host model selection remains a guarded manual experiment: [the reconstructed settings service](https://github.com/river-li/brok-pot-harness/blob/ead2cf14dbf86ef30e17724e7e71b9b0566530a3/src/host/extensions/settings/settings-service.ts) changes account-wide `agentDefaultModel`. OMP does not automatically perform that write or expose it as an isolated model picker.

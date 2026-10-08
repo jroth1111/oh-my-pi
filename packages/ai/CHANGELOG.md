@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added explicit host-managed Grok Bot chat with isolated temporary conversations, independently verified replies, and automatic cleanup.
+- Added read-only Sand allowance and reset reporting, separate from model and transport access.
+- Added opt-in Claude text-tool transport that preserves selected model routes and native thinking while omitting protobuf tool declarations.
+
 ### Fixed
 
 - Grok Bot permission diagnostics no longer assume missing attestation, and runtime JWT reuse follows the issuer's rules.

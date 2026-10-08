@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added the text-only `grokbot-chat/host-managed` route without claiming a specific backend model.
 - Added explicit Grok Bot Opus 5.5 low, medium, high, and xhigh selectors backed by canonical Sand effort parameters.
 - Added the `sand-default-preferred` Grok Bot router and captured Claude models to offline fallback catalogs, with Opus 5.5 as the default selector.
 
