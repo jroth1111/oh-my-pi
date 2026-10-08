@@ -2413,6 +2413,9 @@ function mapOptionsForApi<TApi extends Api>(
 					: {};
 			return castApi<"grokbot-sand">({
 				...base,
+				grokbotInferenceAuthenticationJwt: options?.grokbotInferenceAuthenticationJwt,
+				grokbotInferenceAuthenticationJwtFile: options?.grokbotInferenceAuthenticationJwtFile,
+				grokbotInferenceRequestContext: options?.grokbotInferenceRequestContext,
 				conversationId: options?.sessionId,
 				stopSequences: options?.stopSequences,
 				effort,

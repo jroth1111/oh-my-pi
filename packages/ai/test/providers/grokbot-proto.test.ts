@@ -2709,6 +2709,54 @@ describe("grokbot incomplete tool calls", () => {
 });
 
 describe("grokbot request headers", () => {
+	test("supplies fresh Stream attestation after a bearer remint without sending it to renewal", async () => {
+		spyOn(grokbotAuth, "loadGrokbotConfig").mockResolvedValue({
+			renewal: "renew",
+			machineId: "machine",
+			namespace: "prod",
+			clientVersion: "0.69.0",
+		});
+		const mintSpy = spyOn(grokbotAuth, "mintGrokbotAccessToken").mockResolvedValue("fixture-bearer");
+		spyOn(grokbotAuth, "clearGrokbotTokenCache").mockImplementation(() => {});
+		const tokens = [crypto.randomUUID(), crypto.randomUUID()];
+		let calls = 0;
+		const seen: string[] = [];
+		const text = frameConnectProto(encodeInferenceStreamResponse({ textPart: { text: "ok", isFinal: true } }));
+		const trailer = frameConnectProto(Buffer.alloc(0), CONNECT_END_STREAM_FLAG);
+		const fetchImpl = (async (_url, init) => {
+			const headers = new Headers(init?.headers);
+			seen.push(headers.get("x-inference-authentication-jwt") ?? "");
+			expect(headers.get("x-cursor-workload")).toBe("authorized-fixture");
+			expect(headers.get("x-cursor-workload-job-id")).toBe("fixture-job");
+			expect(headers.get("x-cursor-workload-user")).toBe("fixture-user");
+			if (++calls === 1) return new Response("unauthorized", { status: 401 });
+			return new Response(Buffer.concat([text, trailer]), {
+				status: 200,
+				headers: { "content-type": "application/connect+proto" },
+			});
+		}) as FetchImpl;
+		let supplied = 0;
+		const result = await streamGrokBot(
+			conversionModel,
+			{ messages: [] },
+			{
+				apiKey: "renew",
+				fetch: fetchImpl,
+				headers: { "X-Inference-Authentication-Jwt": "unused-legacy-header" },
+				grokbotInferenceRequestContext: () => ({
+					workload: "authorized-fixture",
+					jobId: "fixture-job",
+					user: "fixture-user",
+					inferenceProxyJwt: tokens[supplied++]!,
+				}),
+			},
+		).result();
+		expect(result.stopReason).toBe("stop");
+		expect(seen).toEqual(tokens);
+		expect(mintSpy).toHaveBeenCalledTimes(2);
+		for (const call of mintSpy.mock.calls) expect(call[4]).not.toHaveProperty("X-Inference-Authentication-Jwt");
+	});
+
 	afterEach(() => {
 		vi.restoreAllMocks();
 	});
@@ -2801,7 +2849,13 @@ describe("grokbot request headers", () => {
 		});
 		spyOn(grokbotAuth, "mintGrokbotAccessToken").mockResolvedValue("fake-jwt");
 
+		const nativeContent = '[ { "type": "thinking", "thinking": "fixture", "signature": "fixture-signature" } ]';
 		const body = Buffer.concat([
+			frameConnectProto(
+				encodeInferenceStreamResponse({
+					providerMetadata: { metadata: { cursor: { anthropicNativeContent: nativeContent } } },
+				}),
+			),
 			frameConnectProto(encodeInferenceStreamResponse({ textPart: { text: "ok", isFinal: true } })),
 			frameConnectProto(
 				encodeInferenceStreamResponse({
@@ -2820,6 +2874,11 @@ describe("grokbot request headers", () => {
 		expect(result.stopReason).toBe("stop");
 		expect(result.upstreamModel).toBe("claude-4.6-sonnet");
 		expect(result.responseId).toBe("resp-1");
+		expect(result.providerPayload).toMatchObject({
+			type: "anthropicNativeContent",
+			nativeContent,
+			model: "claude-4.6-sonnet",
+		});
 	});
 
 	test("Gemini 3 Flash keeps its selected model and effort when tools are added", async () => {

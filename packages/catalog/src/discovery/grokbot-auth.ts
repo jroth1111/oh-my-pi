@@ -325,6 +325,18 @@ export function grokbotClientHeaders(cfg: Pick<GrokbotConfig, "clientVersion" | 
  * A plain Object.assign would let `authorization` and `Authorization` coexist,
  * and Bun's Headers constructor then joins both values comma-separated on the wire.
  */
+export const GROKBOT_INFERENCE_AUTHENTICATION_HEADER = "x-inference-authentication-jwt";
+
+/** Stream attestations are single-use; metadata requests must not consume them. */
+export function grokbotMetadataHeaders(...sources: Array<Record<string, string> | undefined>): Record<string, string> {
+	const result: Record<string, string> = {};
+	for (const source of sources)
+		for (const [key, value] of Object.entries(source ?? {})) {
+			if (key.toLowerCase() !== GROKBOT_INFERENCE_AUTHENTICATION_HEADER) result[key] = value;
+		}
+	return result;
+}
+
 export function mergeGrokbotHeaders(...headerSources: (Record<string, string> | undefined)[]): Record<string, string> {
 	const merged: Record<string, string> = {};
 	const keyByLower = new Map<string, string>();
@@ -383,6 +395,7 @@ export async function mintGrokbotAccessToken(
 	if (!cfg.renewal) {
 		throw new Error(`Grok Bot renewer missing. Set GROKBOT_RENEWAL_CREDENTIAL or write ${grokbotSecretsPath()}`);
 	}
+	requestHeaders = grokbotMetadataHeaders(requestHeaders);
 	const cacheKey = tokenCacheKey(cfg, backend, requestHeaders);
 	const cached = tokenCache.get(cacheKey);
 	if (cached?.accessToken && Date.now() < cached.expiresAtMs - 60_000) {

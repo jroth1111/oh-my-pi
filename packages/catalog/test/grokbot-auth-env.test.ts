@@ -600,12 +600,13 @@ describe("grokbot AvailableModels headers", () => {
 					apiKey: "renewer",
 					baseUrl: "https://proxy.example/grokbot",
 					fetch: fetchImpl,
-					headers: { "x-proxy-api-key": "proxy-secret" },
+					headers: { "x-proxy-api-key": "proxy-secret", "X-Inference-Authentication-Jwt": "one-shot-fixture" },
 				}),
 		);
 		expect(models).not.toBeNull();
 		expect(seen.length).toBe(2);
 		expect(seen.every(s => s.headers["x-proxy-api-key"] === "proxy-secret")).toBe(true);
+		expect(seen.every(s => s.headers["x-inference-authentication-jwt"] === undefined)).toBe(true);
 		expect(seen[1]?.url).toContain("/aiserver.v1.AiService/AvailableModels");
 		expect(seen[1]?.headers["connect-protocol-version"]).toBe("1");
 	});
