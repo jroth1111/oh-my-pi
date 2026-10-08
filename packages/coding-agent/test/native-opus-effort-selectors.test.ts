@@ -8,11 +8,45 @@ import { fromBinary } from "@oh-my-pi/pi-catalog/discovery/protobuf";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { getBundledModel, getBundledModels } from "@oh-my-pi/pi-catalog/models";
 import { buildGrokbotStaticSeed } from "@oh-my-pi/pi-catalog/provider-models/grokbot";
+import { normalizeGrokbotAvailableModels } from "@oh-my-pi/pi-catalog/discovery/grokbot";
 import { parseModelPattern } from "../src/config/model-resolver";
 
 describe("native Opus 5.5 effort selectors", () => {
 	const available = [...getBundledModels("cursor"), ...buildGrokbotStaticSeed().map(spec => buildModel(spec))];
 	for (const effort of [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh]) {
+		test(`Grokbot advertised packed -${effort} reaches the wire without duplicate parameters`, () => {
+			const id = `claude-opus-5-5-${effort}`;
+			const specs = normalizeGrokbotAvailableModels(
+				[
+					{
+						name: "claude-opus-5-5",
+						supportsThinking: true,
+						parameterDefinitions: [{ id: "effort" }, { id: "fast" }],
+						variants: [
+							{
+								legacySlug: id,
+								parameterValues: [
+									{ id: "effort", value: effort },
+									{ id: "fast", value: "false" },
+								],
+							},
+						],
+					},
+				],
+				undefined,
+				new Set([id]),
+			);
+			const models = specs.map(spec => buildModel(spec));
+			const selected = parseModelPattern(`grokbot/${id}`, models).model!;
+			const requestedModel = resolveGrokbotRequestedModel(selected.id, {
+				canonicalModelId: selected.requestModelId,
+				sandParameterIds: selected.sandParameterIds,
+				sandParameterDefaults: selected.sandParameterDefaults,
+			});
+			const decoded = decodeInferenceStreamRequest(encodeInferenceStreamRequest({ requestedModel }));
+			expect(decoded.requestedModel).toMatchObject({ modelId: id, parameters: [] });
+		});
+
 		test(`Grokbot -${effort} selects canonical Opus with the corresponding Sand parameter`, () => {
 			const selected = parseModelPattern(`grokbot/claude-opus-5-5-${effort}`, available);
 			expect(selected.model?.provider).toBe("grokbot");

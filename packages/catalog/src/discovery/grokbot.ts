@@ -28,6 +28,8 @@ import {
 } from "./grokbot-auth";
 import {
 	decodeGrokbotAvailableModelsResponse,
+	decodeGrokbotUsableModelIds,
+	GROKBOT_USABLE_MODELS_PATH,
 	encodeGrokbotAvailableModelsRequest,
 	GROKBOT_AVAILABLE_MODELS_PATH,
 	type GrokbotAvailableModel,
@@ -137,7 +139,27 @@ export async function fetchGrokbotAvailableModels(
 		// cached routers-only catalog — only a real `models: []` is empty-ok.
 		if (decoded === null) return null;
 		if (decoded.length === 0) return [];
-		return normalizeGrokbotAvailableModels(decoded, resolvedBaseUrl);
+		// A legacy slug is only a packed wire route when this account advertises
+		// it. Do not blindly turn old aliases into native IDs or claim entitlement.
+		let usableIds: Set<string> | undefined;
+		try {
+			const usable = await fetchImpl(joinGrokbotBackendUrl(resolvedBaseUrl, GROKBOT_USABLE_MODELS_PATH), {
+				method: "POST",
+				headers: mergeGrokbotHeaders(grokbotMetadataHeaders(options.headers), grokbotClientHeaders(cfg), {
+					authorization: `Bearer ${accessToken}`,
+					"x-cursor-checksum": createGrokbotChecksum(machineId),
+					"x-ghost-mode": "true",
+					"content-type": "application/json",
+					"connect-protocol-version": "1",
+				}),
+				body: "{}",
+				signal,
+			});
+			if (usable.ok) usableIds = decodeGrokbotUsableModelIds(await usable.json());
+		} catch {
+			/* Rich catalog remains usable when the optional roster RPC fails. */
+		}
+		return normalizeGrokbotAvailableModels(decoded, resolvedBaseUrl, usableIds);
 	} catch {
 		return null;
 	} finally {
@@ -149,25 +171,26 @@ export async function fetchGrokbotAvailableModels(
 export function normalizeGrokbotAvailableModels(
 	models: readonly GrokbotAvailableModel[],
 	baseUrl = GROKBOT_BACKEND,
+	usableIds?: ReadonlySet<string>,
 ): ModelSpec<"grokbot-sand">[] {
 	const byId = new Map<string, ModelSpec<"grokbot-sand">>();
+	const canonicalIds = new Set<string>();
 
 	for (const row of models) {
 		if (row.isHidden === true) continue;
 		const id = row.name?.trim();
 		if (!id) continue;
-		for (const spec of toGrokbotModelSpecs(row, baseUrl, id)) {
+		for (const spec of toGrokbotModelSpecs(row, baseUrl, id, usableIds)) {
 			const existing = byId.get(spec.id);
 			if (!existing) {
 				byId.set(spec.id, spec);
+				if (spec.id === id) canonicalIds.add(spec.id);
 				continue;
 			}
-			// Canonical live rows (no requestModelId) replace a prior variant alias
-			// that collided on the same selector id.
-			const existingIsVariant = Boolean(existing.requestModelId);
-			const incomingIsCanonical = !spec.requestModelId;
-			if (existingIsVariant && incomingIsCanonical) {
+			// Canonical catalog identity is independent of its server wire id.
+			if (!canonicalIds.has(spec.id) && spec.id === id) {
 				byId.set(spec.id, spec);
+				canonicalIds.add(spec.id);
 			}
 		}
 	}
@@ -231,7 +254,12 @@ function resolveGrokbotContextWindow(row: GrokbotAvailableModel, sandMaxMode: bo
 	return null;
 }
 
-function toGrokbotModelSpecs(row: GrokbotAvailableModel, baseUrl: string, id: string): ModelSpec<"grokbot-sand">[] {
+function toGrokbotModelSpecs(
+	row: GrokbotAvailableModel,
+	baseUrl: string,
+	id: string,
+	usableIds?: ReadonlySet<string>,
+): ModelSpec<"grokbot-sand">[] {
 	const base = toGrokbotModelSpec(row, baseUrl, id);
 	const out: ModelSpec<"grokbot-sand">[] = [base];
 	for (const variant of row.variants ?? []) {
@@ -239,12 +267,12 @@ function toGrokbotModelSpecs(row: GrokbotAvailableModel, baseUrl: string, id: st
 		const variantString = variant.variantStringRepresentation?.trim();
 		// Emit every distinct advertised selector — preferring legacy alone used
 		// to drop variantStringRepresentation when both were present.
-		const selectors: { id: string; isVariantString: boolean }[] = [];
+		const selectors: { id: string; isVariantString: boolean; packed: boolean }[] = [];
 		if (legacySlug && legacySlug !== id) {
-			selectors.push({ id: legacySlug, isVariantString: false });
+			selectors.push({ id: legacySlug, isVariantString: false, packed: usableIds?.has(legacySlug) === true });
 		}
 		if (variantString && variantString !== id && variantString !== legacySlug) {
-			selectors.push({ id: variantString, isVariantString: true });
+			selectors.push({ id: variantString, isVariantString: true, packed: false });
 		}
 		if (selectors.length === 0) continue;
 		const variantParams = collectVariantParameterIds(variant);
@@ -258,9 +286,11 @@ function toGrokbotModelSpecs(row: GrokbotAvailableModel, baseUrl: string, id: st
 				...base,
 				id: selector.id,
 				name: variant.displayName?.trim() || selector.id,
-				requestModelId: id,
-				sandParameterIds: parameterIds,
-				sandParameterDefaults,
+				// Preserve the server-advertised legacy wire slug. Its effort/fast
+				// selection is already packed; do not append conflicting parameters.
+				requestModelId: selector.packed ? selector.id : (base.requestModelId ?? id),
+				sandParameterIds: selector.packed ? [] : parameterIds,
+				sandParameterDefaults: selector.packed ? undefined : sandParameterDefaults,
 				sandMaxMode,
 				sandVariantStringRepresentation: selector.isVariantString,
 				contextWindow,
@@ -333,6 +363,9 @@ function toGrokbotModelSpec(row: GrokbotAvailableModel, baseUrl: string, id: str
 	return {
 		id,
 		name: row.clientDisplayName?.trim() || id,
+		...(row.serverModelName?.trim() && row.serverModelName.trim() !== id
+			? { requestModelId: row.serverModelName.trim() }
+			: {}),
 		api: GROKBOT_API,
 		provider: "grokbot",
 		baseUrl,

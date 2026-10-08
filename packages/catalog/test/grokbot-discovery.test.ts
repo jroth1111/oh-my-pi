@@ -182,6 +182,82 @@ const FIXTURE = {
 };
 
 describe("grokbot AvailableModels normalize", () => {
+	test("fresh discovery joins the roster and falls back to rich parameter routes if it is unavailable", async () => {
+		spyOn(grokbotAuth, "loadGrokbotConfig").mockResolvedValue({
+			renewal: "fixture-renewer",
+			machineId: "fixture-machine",
+			namespace: "prod",
+			clientVersion: "0.69.0",
+		});
+		spyOn(grokbotAuth, "mintGrokbotAccessToken").mockResolvedValue("fixture-session");
+		const rows = [
+			{
+				name: "claude-opus-5-5",
+				supportsThinking: true,
+				parameterDefinitions: [{ id: "effort" }],
+				variants: [{ legacySlug: "claude-opus-5-5-medium", parameterValues: [{ id: "effort", value: "medium" }] }],
+			},
+		];
+		for (const status of [200, 503]) {
+			let rosterCalls = 0;
+			const fetchImpl = Object.assign(
+				async (url: string | URL | Request) => {
+					if (String(url).endsWith("GetUsableModels")) {
+						rosterCalls++;
+						return Response.json({ models: [{ modelId: "claude-opus-5-5-medium" }] }, { status });
+					}
+					return Response.json({ models: rows });
+				},
+				{ preconnect: fetch.preconnect },
+			) as typeof fetch;
+			const models = await fetchGrokbotAvailableModels({ apiKey: "fixture-renewer", fetch: fetchImpl });
+			expect(rosterCalls).toBe(1);
+			const selected = models?.find(m => m.id === "claude-opus-5-5-medium");
+			expect(selected?.requestModelId).toBe(status === 200 ? "claude-opus-5-5-medium" : "claude-opus-5-5");
+			expect(selected?.sandParameterIds).toEqual(status === 200 ? [] : ["effort"]);
+		}
+	});
+
+	test("only account-advertised packed slugs become bare wire routes; parameter variants keep their canonical route", () => {
+		const rows = [
+			{
+				name: "claude-opus-5-5",
+				supportsThinking: true,
+				parameterDefinitions: [{ id: "effort" }, { id: "fast" }],
+				variants: [
+					{
+						legacySlug: "claude-opus-5-5-medium",
+						variantStringRepresentation: "claude-opus-5-5[effort=medium,fast=false]",
+						parameterValues: [
+							{ id: "effort", value: "medium" },
+							{ id: "fast", value: "false" },
+						],
+						isDefaultNonMaxConfig: true,
+					},
+				],
+			},
+		];
+		const unknown = normalizeGrokbotAvailableModels(rows).find(m => m.id === "claude-opus-5-5-medium");
+		expect(unknown?.requestModelId).toBe("claude-opus-5-5");
+		expect(unknown?.sandParameterIds).toEqual(["effort", "fast"]);
+		const advertised = normalizeGrokbotAvailableModels(rows, undefined, new Set(["claude-opus-5-5-medium"]));
+		const packed = advertised.find(m => m.id === "claude-opus-5-5-medium");
+		expect(packed?.requestModelId).toBe("claude-opus-5-5-medium");
+		expect(packed?.sandParameterIds).toEqual([]);
+		expect(packed?.sandParameterDefaults).toBeUndefined();
+		const parameterized = advertised.find(m => m.id === "claude-opus-5-5[effort=medium,fast=false]");
+		expect(parameterized?.requestModelId).toBe("claude-opus-5-5");
+		expect(parameterized?.sandParameterDefaults).toEqual({ effort: "medium", fast: "false" });
+	});
+
+	test("reported serverModelName is preserved when a catalog display identifier differs", () => {
+		const rows = normalizeGrokbotAvailableModels([
+			{ name: "prior-base", variants: [{ legacySlug: "display-selector" }] },
+			{ name: "display-selector", serverModelName: "server-wire-id" },
+		]);
+		expect(rows.find(m => m.id === "display-selector")?.requestModelId).toBe("server-wire-id");
+	});
+
 	test("reasoning_effort variants expose their advertised ladder without falling back to generic efforts", () => {
 		const models = normalizeGrokbotAvailableModels([
 			{

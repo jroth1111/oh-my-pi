@@ -1,10 +1,26 @@
 /**
- * Grok Bot `AiService/AvailableModels` request/response helpers.
+ * Grok Bot rich catalog and optional account wire-roster helpers.
  *
  * Transport is Connect JSON unary (sand client) — same host as InferenceService,
- * not Cursor `GetUsableModels` / CLI client-type.
+ * The roster uses GetUsableModels with the same Sand account/client metadata.
  */
 export const GROKBOT_AVAILABLE_MODELS_PATH = "/aiserver.v1.AiService/AvailableModels";
+export const GROKBOT_USABLE_MODELS_PATH = "/agent.v1.AgentService/GetUsableModels";
+
+/** Account-advertised wire identifiers, not evidence that a Stream request succeeded. */
+export function decodeGrokbotUsableModelIds(raw: unknown): Set<string> | undefined {
+	if (!raw || typeof raw !== "object") return undefined;
+	const rows = (raw as { models?: unknown }).models;
+	if (!Array.isArray(rows)) return undefined;
+	const ids = new Set<string>();
+	for (const row of rows) {
+		if (!row || typeof row !== "object") continue;
+		const record = row as { modelId?: unknown; model_id?: unknown };
+		const id = record.modelId ?? record.model_id;
+		if (typeof id === "string" && id.trim()) ids.add(id.trim());
+	}
+	return rows.length > 0 && ids.size === 0 ? undefined : ids;
+}
 
 /** Request body matching the live sand / Cursor IDE parameterized catalog. */
 export type GrokbotAvailableModelsRequest = {

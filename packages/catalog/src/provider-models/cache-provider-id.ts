@@ -255,7 +255,8 @@ export function resolveModelCacheProviderId(providerId: string, options: ModelCa
 					? options.cacheCredential
 					: resolveGrokbotCacheCredential(options.apiKey);
 			const scope = `${credential}\u0000${baseUrl}\u0000${identity.namespace}\u0000${identity.clientVersion}\u0000${headerScope}`;
-			return `grokbot:models-v4:${Bun.hash(scope).toString(36)}`;
+			// v5 preserves account-advertised packed routes; v4 cached canonical rewrites.
+			return `grokbot:models-v5:${Bun.hash(scope).toString(36)}`;
 		}
 		case "openrouter":
 			return "openrouter:pseudo-api";

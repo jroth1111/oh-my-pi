@@ -17,25 +17,25 @@ Process env beats the secrets file. Never print these values. `/login grokbot` o
 
 If `-p` exits with `No API key found for grokbot`, this checkout did not see a renewer (missing `secrets/grokbot.env` or env vars). Published global `omp` 18.0.1 will also fail here because it does not register the provider at all.
 
-### Per-request inference authorization
+### Optional workload authorization and account entitlement
 
-Renewal yields account authentication; it does not create the control-plane attestation required by a protected Sand Stream deployment. The Stream bearer is the host's `grokBotToken` when renewal returns one, not its metadata `accessToken`.
+Renewal yields account authentication, not a guarantee that the account can serve every catalog model. The Stream bearer is the host's `grokBotToken` when renewal returns one, not its metadata `accessToken`. Some managed workloads additionally provide `x-inference-authentication-jwt`; source reconstruction does not establish that this header is universally required. Bearer-only clients are documented, and the same permission error is reported for account restrictions and obsolete wire routes.
 
 An authorized launcher can supply `x-inference-authentication-jwt` through:
 
-- `INFERENCE_PROXY_JWT`, for one outbound Stream attempt.
+- `INFERENCE_PROXY_JWT`, when provided by the authorized runtime.
 - `GROKBOT_INFERENCE_AUTHENTICATION_JWT_FILE`, an OMP-specific handoff path. The exact configured file is atomically claimed, read, and deleted.
-- SDK option `grokbotInferenceAuthenticationJwt`, preferably a callback returning a fresh issuer-provided token for each Stream attempt; `grokbotInferenceAuthenticationJwtFile` supplies an explicit handoff file instead.
+- SDK option `grokbotInferenceAuthenticationJwt`, either a runtime-issued token or a callback evaluated for each attempt; `grokbotInferenceAuthenticationJwtFile` supplies an explicit handoff file instead.
 
 The host also forwards the authorized workload context (`x-cursor-workload`, `x-cursor-workload-job-id`, `x-cursor-workload-user`, and optional traffic/retry-policy headers). SDK option `grokbotInferenceRequestContext` accepts that issuer-provided context or a per-attempt supplier, including its `inferenceProxyJwt`. OMP does not invent these identities. The archive confirms this header contract, but does not include the launcher/issuer implementation or establish its native token-file environment variable.
 
-An environment token, file, or static header cannot serve a whole tool loop: retries and subsequent turns need fresh attestations. Reuse is rejected locally. The callback is invoked again after a bearer remint or internal retry. Attestation headers are never forwarded to renewal or model discovery, and token values are never logged. OMP does not forge or mint these tokens from renewal credentials, scrape another process, or attach to another agent's traffic.
+Token lifetime and reuse rules belong to the issuer; OMP does not invent a single-use-token restriction. The explicit handoff **file** is consumed once, independently of the token's lifetime. The callback is invoked again after a bearer remint or internal retry. Workload authorization is not forwarded to renewal or model discovery, and token values are never logged. OMP does not forge or mint these tokens, scrape another process, or attach to another agent's traffic.
 
 Successful catalog discovery or reaching Stream with `permission_denied` does not prove inference access. Confirm successful serving from `responseInfo.model` (stored as `upstreamModel`), then check native reasoning/tool response content. Self-reported model names are not verification.
 
 ### Explicit Opus 5.5 effort selectors
 
-`grokbot/claude-opus-5-5-low`, `-medium`, `-high`, and `-xhigh` select the corresponding effort explicitly. Sand receives its canonical `claude-opus-5-5` id plus the advertised `effort` parameter; these selectors do not fabricate new server-side model ids. Signed thinking is retained across native effort variants of the same model lineage.
+`grokbot/claude-opus-5-5-low`, `-medium`, `-high`, and `-xhigh` select the corresponding effort explicitly. Fresh discovery joins AvailableModels with the account's GetUsableModels roster: an advertised packed legacy slug is preserved without duplicate effort/fast parameters. Bracketed parameter variants and offline fallback selectors retain their canonical-id/parameter representation. Neither catalog visibility nor an advertised route proves a successful Stream response. Signed thinking is retained across native effort variants of the same model lineage.
 
 ## Catalog (live AvailableModels)
 

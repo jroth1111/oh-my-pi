@@ -9,6 +9,7 @@
 
 ### Fixed
 
+- Preserve account-advertised Grok Bot packed wire slugs instead of rewriting them to canonical IDs with duplicate parameters.
 - Grok Bot now recognizes advertised `reasoning_effort` ladders for model selection.
 
 ## [18.8.3] - 2026-10-07
