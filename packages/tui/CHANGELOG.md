@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added explicit connection-wait indicators for the main agent and subagents, without treating a zero retry limit as a network outage ([#14380](https://github.com/can1357/oh-my-pi/pull/14380) by [@jroth1111](https://github.com/jroth1111)).
+
 ### Changed
 
 - Agent Hub keeps existing agents in place while open; new agents appear first in the flat roster or within their tree sibling group ([#13066](https://github.com/can1357/oh-my-pi/pull/13066) by [@kmccleary3301](https://github.com/kmccleary3301))

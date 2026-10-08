@@ -2121,6 +2121,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 			publishServingModel();
 			if (event.type === "auto_retry_start") {
 				progress.retryState = {
+					connectivity: event.connectivity,
 					attempt: event.attempt,
 					maxAttempts: event.maxAttempts,
 					delayMs: event.delayMs,
