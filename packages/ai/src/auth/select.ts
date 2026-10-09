@@ -994,7 +994,8 @@ export class CredentialSelector {
 			const yieldBlockedRestrictedSession =
 				this.#deps.affinity.isRestricted(provider, sessionId) && !hasUnblockedEligibleCandidate(() => true);
 			const yieldBlockedCredential =
-				pass.allowBlocked && (yieldBlockedPlanEligible || yieldBlockedRestrictedSession);
+				pass.allowBlocked &&
+				(yieldBlockedPlanEligible || yieldBlockedRestrictedSession || explicitPin !== undefined);
 			for (const candidate of pass.allowBlocked ? lastResortCandidates : candidates) {
 				if (preflightFailures.has(candidate)) continue;
 				const candidateAccountKey = oauthAccountKey(candidate.selection.credential);

@@ -870,6 +870,7 @@ describe("AuthStorage codex oauth ranking", () => {
 	test("applies deterministic priority without a usage ranking strategy", async () => {
 		if (!store) throw new Error("test setup failed");
 		authStorage = new AuthStorage(store, {
+			usageProviderResolver: provider => (provider === "openai-codex" ? usageProvider : undefined),
 			rankingStrategyResolver: () => undefined,
 			accountPolicies: [
 				{ provider: "openai-codex", account: { accountId: "acct-preferred" }, priority: 10 },

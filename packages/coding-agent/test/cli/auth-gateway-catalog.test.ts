@@ -21,6 +21,7 @@ function stubAuthStorage(configKeys?: string[]): AuthStorage {
 		setConfigApiKey: (provider: string) => configKeys?.push(provider),
 		removeConfigApiKey: () => {},
 		hasAuth: () => true,
+		peekApiKeyOverrides: () => undefined,
 		getAll: () => ({ anthropic: {} }),
 		keys: {
 			setResolver: () => {},
