@@ -15,6 +15,60 @@
 - Grok Bot requests omit the retired variant-string wire flag and support advertised `reasoning_effort` parameters.
 - Updated Grok Bot's default Sand client stamp while preserving explicit client-version overrides.
 - Preserve nested connection-failure evidence when SDK errors are flattened into provider error messages ([#14380](https://github.com/can1357/oh-my-pi/pull/14380) by [@jroth1111](https://github.com/jroth1111)).
+- Added routing-session cleanup for OpenAI Responses and Codex while preserving shared provider fallbacks ([#14334](https://github.com/can1357/oh-my-pi/pull/14334) by [@iliaal](https://github.com/iliaal)).
+
+### Fixed
+
+- Fixed Claude Haiku 5.5 requests silently enabling adaptive thinking when reasoning is off, on native Bedrock (main and helper calls) and the Anthropic API; conversations whose earlier effort controls rule out disabled thinking fall back to lowest-effort adaptive thinking instead of failing ([#14996](https://github.com/can1357/oh-my-pi/pull/14996) by [@bse-ai](https://github.com/bse-ai)).
+
+## [18.8.6] - 2026-10-08
+
+### Fixed
+
+- Fixed Google Gemini and Cloud Code Assist (Antigravity) requests failing when tool schemas contain unsupported JSON Schema keywords or fields that allow multiple types.
+- Fixed auth broker account selection and usage-limit enforcement to consistently use the selected account’s quota when multiple accounts are present.
+- Fixed Anthropic-family model streaming so encoded marker tokens are decoded correctly in text, tool-call updates, partial messages, and completed tool calls.
+
+## [18.8.5] - 2026-10-08
+
+### Added
+
+- `oauth.refresh(id, signal, { reason: "auth-recovery" })` forwards provider-401 recovery intent to a delegated (auth broker) refresh, and `AuthStorageOptions.refreshOAuthCredentialMints` marks a `refreshOAuthCredential` hook that exchanges tokens itself so its tokens are reused for auth recovery ([#14752](https://github.com/can1357/oh-my-pi/pull/14752) by [@will-bogusz](https://github.com/will-bogusz))
+- `SessionsApi.inherit` accepts an optional filter, called with each provider and whether the source's affinity is an explicit user pin, to copy only the affinities it accepts ([#14749](https://github.com/can1357/oh-my-pi/pull/14749) by [@will-bogusz](https://github.com/will-bogusz))
+
+### Changed
+
+- `AuthApiKeyOptions.accountIds` also matches the login email, or else the project id, of credentials that carry no account id (see `oauthAccountKey`), so Antigravity requests prefer accounts that serve the requested model ([#14924](https://github.com/can1357/oh-my-pi/issues/14924)).
+
+### Fixed
+
+- Fixed accounts sitting exactly at their `reservePct` (e.g. 70% used with a 30% reserve) still being picked and reported healthy instead of being held in reserve ([#14765](https://github.com/can1357/oh-my-pi/pull/14765) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed `oauth.accessById` with `forceRefresh` returning the stored token unchanged while it was still valid; it now re-mints that one account (through the auth broker when configured) and returns that account's token even if another row is removed meanwhile ([#14752](https://github.com/can1357/oh-my-pi/pull/14752) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed `omp -p` and other short-lived auth-broker clients missing from `omp usage clients`: usage still waiting for the 10-second report batch is now sent to the broker before the process exits ([#14899](https://github.com/can1357/oh-my-pi/pull/14899) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed Cursor web fetches that were cut off by a dropped connection disappearing from resumed and rebuilt sessions; they now show as interrupted ([#14819](https://github.com/can1357/oh-my-pi/pull/14819) by [@jchanghong023](https://github.com/jchanghong023))
+- Anthropic hosted web search can honor custom providers' OAuth-style request shaping and configured headers consistently with conversations ([#14919](https://github.com/can1357/oh-my-pi/pull/14919) by [@farnoy](https://github.com/farnoy))
+
+## [18.8.4] - 2026-10-08
+
+### Breaking Changes
+
+- `AuthBrokerClient.notifyUsageStale` and `UsageLedgerStore.invalidateUsageCache` (including `RemoteAuthCredentialStore.invalidateUsageCache`) now take an optional leading `provider` argument: the signature is `(provider?: string, signal?: AbortSignal)` instead of `(signal?: AbortSignal)` ([#14761](https://github.com/can1357/oh-my-pi/pull/14761) by [@will-bogusz](https://github.com/will-bogusz))
+
+### Added
+
+- Auth gateway route option `excludeProviders` leaves those providers' accounts out of `/v1/usage` and `/v1/credentials/check` ([#14755](https://github.com/can1357/oh-my-pi/pull/14755) by [@will-bogusz](https://github.com/will-bogusz))
+
+### Fixed
+
+- Fixed a single-provider usage refresh from an auth broker client (`omp usage invalidate --provider`, Codex auto-redeem, a saved-reset redeem) wiping the broker's cached usage for every provider, so other accounts showed no usage on every client until their next successful probe ([#14761](https://github.com/can1357/oh-my-pi/pull/14761) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed Anthropic sessions missing the prompt cache a second time after the API dropped thinking blocks from a changed conversation ([#14748](https://github.com/can1357/oh-my-pi/pull/14748) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed Cursor logins never renewing: every refresh was rejected with "Invalid User API Key", so logins lapsed about 60 days after sign-in; a session Cursor has ended is now disabled with a re-login hint ([#14753](https://github.com/can1357/oh-my-pi/pull/14753) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed the auth broker logging caller-supplied `X-Forwarded-For` / `X-Real-IP` values and unknown request paths; peers come from the socket unless `trustProxyHeaders` is set ([#14762](https://github.com/can1357/oh-my-pi/pull/14762) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed false thinking-loop detections on Gemini, DeepSeek, and Grok when the model drafts or answers with repetitive code or markup (VRML, SVG, JSON); such output is no longer discarded and retried.
+- Fixed Cursor provider leaking conversation checkpoints, blob stores and abort listeners after requests end ([#14669](https://github.com/can1357/oh-my-pi/pull/14669) by [@H4vC](https://github.com/H4vC))
+- Fixed session-affinity pins growing without bound in long-lived gateways (now capped at 256 sessions per provider) ([#14672](https://github.com/can1357/oh-my-pi/pull/14672) by [@H4vC](https://github.com/H4vC))
+- Fixed completed Cursor turns failing with "Cursor stream ended before turnEnded" when the connection closed after the answer had fully arrived ([#14851](https://github.com/can1357/oh-my-pi/pull/14851) by [@kyle-elliott-asymptote](https://github.com/kyle-elliott-asymptote)).
+- Fixed Cursor provider errors that Cursor marks as not retryable being retried until the retry budget ran out ([#14851](https://github.com/can1357/oh-my-pi/pull/14851) by [@kyle-elliott-asymptote](https://github.com/kyle-elliott-asymptote)).
 
 ## [18.8.3] - 2026-10-07
 
@@ -3555,3 +3609,4 @@ Older entries are archived in [packages/ai/CHANGELOG.md@bac7e83b5b0e](https://gi
 Older entries are archived in [packages/ai/CHANGELOG.md@8a9097246135](https://github.com/can1357/oh-my-pi/blob/8a9097246135bd572ff96fb552121fe1194d2906/packages/ai/CHANGELOG.md).
 Older entries are archived in [packages/ai/CHANGELOG.md@1f7329fc2c7c](https://github.com/can1357/oh-my-pi/blob/1f7329fc2c7c366b38731738e0db9c170f9bb348/packages/ai/CHANGELOG.md).
 Older entries are archived in [packages/ai/CHANGELOG.md@d58593a30902](https://github.com/can1357/oh-my-pi/blob/d58593a3090258473304608d68ffd1f620e6b695/packages/ai/CHANGELOG.md).
+Older entries are archived in [packages/ai/CHANGELOG.md@0dd6aff5f282](https://github.com/can1357/oh-my-pi/blob/0dd6aff5f2821aec1e5b54c6a458e323667a949b/packages/ai/CHANGELOG.md).

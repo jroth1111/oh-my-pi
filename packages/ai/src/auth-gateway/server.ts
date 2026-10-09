@@ -65,6 +65,7 @@ import { completeSimple, streamSimple } from "../stream";
 import type { Api, AssistantMessage, AssistantMessageEventStream, Context, Model, SimpleStreamOptions } from "../types";
 import { deterministicUuid } from "../utils/deterministic-id";
 import { parseBind } from "../utils/parse-bind";
+import { resolvePeer } from "../utils/resolve-peer";
 import { candidateAllowed } from "./affinity";
 import {
 	type RouteDecisionTrace,
@@ -90,7 +91,6 @@ import {
 	isAuthorized,
 	json,
 	resolveClientIdentity,
-	resolvePeer,
 	resolvePromptCacheKey,
 	withCors,
 } from "./http";
@@ -2046,12 +2046,14 @@ async function handlePiNative(
  * failure) inside `AuthStorage`, so this handler is a thin wrapper that
  * surfaces the same data to HTTP callers (notably the macOS usage widget).
  */
-async function handleUsage(storage: AuthStorage, signal: AbortSignal): Promise<Response> {
-	const reports = (await storage.usage.reports?.({ signal })) ?? [];
+async function handleUsage(opts: AuthGatewayRouteOptions, signal: AbortSignal): Promise<Response> {
+	const reports = (await opts.storage.usage.reports?.({ signal })) ?? [];
 	// Drop the heavy provider-specific `raw` payload — UI consumers only need
 	// `limits` + `metadata`. Match the broker's `/v1/usage` shape so a single
 	// client struct (Swift widget, llm-git, ...) works against either endpoint.
-	const trimmed = reports.map(({ raw: _raw, ...rest }) => rest);
+	const trimmed = reports
+		.filter(report => !opts.excludeProviders?.has(report.provider))
+		.map(({ raw: _raw, ...rest }) => rest);
 	return json(200, { generatedAt: Date.now(), reports: trimmed });
 }
 
@@ -2066,8 +2068,8 @@ async function handleUsage(storage: AuthStorage, signal: AbortSignal): Promise<R
  * endpoints. For multi-account pools that's the difference between getting
  * a clean diagnosis and getting a 429 storm.
  */
-async function handleCredentialsCheck(storage: AuthStorage, signal: AbortSignal): Promise<Response> {
-	const credentials = await storage.health.check({ signal });
+async function handleCredentialsCheck(opts: AuthGatewayRouteOptions, signal: AbortSignal): Promise<Response> {
+	const credentials = await opts.storage.health.check({ signal, excludeProviders: opts.excludeProviders });
 	return json(200, { generatedAt: Date.now(), credentials });
 }
 
@@ -2325,14 +2327,14 @@ export function createAuthGatewayRouter(opts: AuthGatewayRouteOptions): AuthGate
 			// Same shape as the broker's `/v1/usage`, so widget/llm-git speak to either with the
 			// same client struct.
 			if (req.method === "GET" && pathname === "/v1/usage") {
-				return await handleUsage(boot.storage, req.signal);
+				return await handleUsage(boot, req.signal);
 			}
 
 			// Per-credential auth probe — diagnoses which row in a multi-account
 			// pool is producing 401s. Aggregated `/v1/usage` silently drops failed
 			// credentials, so we need a separate endpoint that captures errors.
 			if (req.method === "GET" && pathname === "/v1/credentials/check") {
-				return await handleCredentialsCheck(boot.storage, req.signal);
+				return await handleCredentialsCheck(boot, req.signal);
 			}
 
 			if (req.method === "GET" && pathname === "/v1/credentials") return handleCredentialsList(boot.storage);

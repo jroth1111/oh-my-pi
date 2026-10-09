@@ -227,7 +227,13 @@ export class AuthStorage {
 			onCredentialIdentityChanged: (provider, credentialId, previous, next) =>
 				coordination.maybeBumpIncarnation(provider, credentialId, previous, next),
 		});
-		const refresher = new OAuthRefresher({ store, pool, policies, override: options.refreshOAuthCredential });
+		const refresher = new OAuthRefresher({
+			store,
+			pool,
+			policies,
+			override: options.refreshOAuthCredential,
+			overrideMints: options.refreshOAuthCredentialMints,
+		});
 		const usageProviders = options.usageProviderResolver ?? defaultUsageProvider;
 		// Key reports by the effective provider (runtime extension override first), so an
 		// override's `cacheVersion` separates its rows from other processes sharing the store.

@@ -56,6 +56,7 @@ import {
 import { compactGrammarDefinition } from "./grammar";
 import {
 	getOpenAIEffortControlState,
+	releaseOpenAIEffortControlSession,
 	type OpenAIEffortControlState,
 	planStableOpenAIEffort,
 } from "./openai-configuration-update";
@@ -96,6 +97,7 @@ import {
 	getJuiceValue,
 	getOpenAIPromptCacheKey,
 	getOpenAIResponsesRoutingSessionId,
+	normalizeOpenAIPromptCacheKey,
 	getOpenAIStrictToolsScope,
 	getOpenRouterResponsesSessionId,
 	isCompiledGrammarTooLargeStrictError,
@@ -407,6 +409,7 @@ interface OpenAIResponsesProviderSessionState
 type ResponsesStableEffort = Exclude<ReasoningEffort, "none" | null>;
 
 interface OpenAIResponsesChainState {
+	sessionId: string;
 	/**
 	 * Wire params of the last successful turn; never carries
 	 * `previous_response_id`.
@@ -432,6 +435,14 @@ function createOpenAIResponsesProviderSessionState(): OpenAIResponsesProviderSes
 		nativeHistoryReplayWarmed: false,
 		chains: new Map(),
 		effortControls: new Map(),
+		releaseSession: sessionId => {
+			const normalizedSessionId = normalizeOpenAIPromptCacheKey(sessionId);
+			if (!normalizedSessionId) return;
+			for (const [key, chain] of state.chains) {
+				if (chain.sessionId === normalizedSessionId) state.chains.delete(key);
+			}
+			releaseOpenAIEffortControlSession(state.effortControls, normalizedSessionId);
+		},
 		close: () => {
 			state.nativeHistoryReplayWarmed = false;
 			state.chains.clear();
@@ -514,7 +525,7 @@ function getOpenAIResponsesChainState(
 	const key = `${resolvedBaseUrl ?? model.baseUrl ?? ""}\u0000${model.id}\u0000${sessionId}`;
 	const existing = providerSessionState.chains.get(key);
 	if (existing) return existing;
-	const created: OpenAIResponsesChainState = { canAppend: false, staleFailures: 0, disabled: false };
+	const created: OpenAIResponsesChainState = { sessionId, canAppend: false, staleFailures: 0, disabled: false };
 	providerSessionState.chains.set(key, created);
 	return created;
 }
@@ -1796,6 +1807,7 @@ function applyResponsesStableEffort(
 	const state = getOpenAIEffortControlState(
 		providerSessionState.effortControls,
 		`${model.baseUrl ?? ""}\u0000${model.id}\u0000${sessionId}`,
+		sessionId,
 	);
 	params.reasoning = { ...reasoning, effort: planStableOpenAIEffort(state, input, effort) };
 }
