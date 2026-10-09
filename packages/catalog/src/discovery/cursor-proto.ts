@@ -8973,3 +8973,4 @@ export const WriteSuccessSchema: MessageCodec<WriteSuccess> = pb<WriteSuccess>("
 	{ no: 3, name: "fileSize", kind: "int32" },
 	{ no: 4, name: "fileContentAfterWrite", kind: "string", optional: true },
 ]);
+

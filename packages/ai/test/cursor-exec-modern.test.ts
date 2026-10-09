@@ -69,9 +69,9 @@ import {
 	WebFetchAllowlistPrecheckArgsSchema,
 	WriteShellStdinArgsSchema,
 } from "@oh-my-pi/pi-catalog/discovery/cursor-proto";
-import { RoutedModelUpdateSchema } from "@oh-my-pi/pi-catalog/discovery/cursor-gen/agent_pb";
+import { RoutedModelUpdateSchema } from "@oh-my-pi/pi-catalog/discovery/cursor-proto";
 import { create, fromBinary, toBinary } from "@oh-my-pi/pi-catalog/discovery/protobuf";
-import { create as createProtoMessage } from "@bufbuild/protobuf";
+import { create as createProtoMessage } from "@oh-my-pi/pi-catalog/discovery/protobuf";
 
 /**
  * Drive one `ExecServerMessage` through the real dispatcher and decode every
@@ -2368,8 +2368,11 @@ describe("Cursor InteractionUpdate.routedModel", () => {
 			stream,
 			newBlockState(),
 			{ sawTokenDelta: false },
+			false,
+			true,
 		);
 		expect(output.model).toBe("cursor-grok-4.5-high");
+		expect(output.upstreamModel).toBe("cursor-grok-4.5-high");
 		expect(stream.queue.some(e => e.type === "routed_model" && e.model === "cursor-grok-4.5-high")).toBe(true);
 	});
 

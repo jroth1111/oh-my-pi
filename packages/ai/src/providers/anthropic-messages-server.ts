@@ -660,7 +660,6 @@ export function encodeStream(
 		}
 	};
 	let effectiveModelId = requestedModelId;
-	let lastPartial: AssistantMessage | undefined;
 	// Cursor auto may start as catalog `auto`, discovered `default`, or a concrete
 	// id with `x-cursor-auto-mode: true`. Defer message_start until an explicit
 	// `routed_model` event lands (or content/done forces emit).
@@ -944,6 +943,7 @@ export function encodeStream(
 				};
 				for await (const ev of events) {
 					if (cancelled) return;
+
 					if (ev.type === "routed_model") {
 						// Explicit InteractionUpdate.routedModel / checkpoint signal —
 						// never treat repeated partial.model observations as proof.

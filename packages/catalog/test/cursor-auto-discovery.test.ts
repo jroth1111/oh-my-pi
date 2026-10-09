@@ -2,6 +2,9 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import * as http2 from "node:http2";
 import { fetchCursorUsableModels } from "../src/discovery/cursor";
 import { buildModel } from "../src/build";
+import { collapseBuiltVariants } from "../src/compat/collapse";
+import { Effort } from "../src/effort";
+import { resolveWireModelId } from "../src/model-thinking";
 import { GetUsableModelsResponseSchema, ModelDetailsSchema } from "../src/discovery/cursor-proto";
 import { create, toBinary } from "../src/discovery/protobuf";
 import type { ModelSpec } from "../src/types";
@@ -14,6 +17,12 @@ beforeAll(async () => {
 		models: [
 			create(ModelDetailsSchema, { modelId: "auto", displayName: "auto" }),
 			create(ModelDetailsSchema, { modelId: "composer-2.5" }),
+			create(ModelDetailsSchema, { modelId: "novel-low" }),
+			create(ModelDetailsSchema, { modelId: "novel-high" }),
+			create(ModelDetailsSchema, { modelId: "grok-4.8" }),
+			...["low", "medium", "high", "xhigh"].map(effort =>
+				create(ModelDetailsSchema, { modelId: `grok-4.8-${effort}` }),
+			),
 		],
 	});
 	const payload = Buffer.from(toBinary(GetUsableModelsResponseSchema, response));
@@ -57,13 +66,29 @@ describe("cursor discovery auto sentinel", () => {
 		expect(byId.get("auto")?.requestModelId).toBe("auto");
 	});
 
-	it("keeps live and cached roster wire identities ahead of the synthetic default policy", async () => {
+	it("preserves concrete roster wire identity without a model-specific mapper exception", async () => {
 		const byId = await discover();
-		const auto = byId.get("auto")!;
-		const cached = JSON.parse(JSON.stringify(auto)) as ModelSpec<"cursor-agent">;
-		expect(buildModel(auto).requestModelId).toBe("auto");
-		expect(buildModel(cached).requestModelId).toBe("auto");
-		expect(buildModel({ ...auto, requestModelId: undefined }).requestModelId).toBe("default");
-		expect(buildModel(byId.get("composer-2.5")!).requestModelId).toBe("composer-2.5");
+		expect(byId.get("composer-2.5")?.requestModelId).toBe("composer-2.5");
+	});
+
+	it("same-ID roster identity does not disable dynamic effort-family collapsing", async () => {
+		const byId = await discover();
+		const members = [byId.get("novel-low")!, byId.get("novel-high")!].map(buildModel);
+		const collapsed = collapseBuiltVariants(members);
+		expect(collapsed).toHaveLength(1);
+		expect(collapsed[0]?.id).toBe("novel");
+		expect(collapsed[0]?.thinking?.effortRouting).toEqual({ low: "novel-low", high: "novel-high" });
+	});
+
+	it("routes efforts to reviewed tier siblings when the roster also contains a same-ID logical base", async () => {
+		const byId = await discover();
+		const members = ["grok-4.8", "grok-4.8-low", "grok-4.8-medium", "grok-4.8-high", "grok-4.8-xhigh"].map(id =>
+			buildModel(byId.get(id)!),
+		);
+		const collapsed = collapseBuiltVariants(members);
+		expect(collapsed).toHaveLength(1);
+		const model = collapsed[0];
+		expect(resolveWireModelId(model, Effort.Low)).toBe("grok-4.8-low");
+		expect(resolveWireModelId(model, Effort.XHigh)).toBe("grok-4.8-xhigh");
 	});
 });

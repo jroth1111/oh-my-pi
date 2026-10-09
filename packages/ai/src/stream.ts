@@ -1867,7 +1867,6 @@ function mapOptionsForApi<TApi extends Api>(
 		fetch: options?.fetch,
 		fallbacks: options?.fallbacks,
 		acceptEmptyResponse: options?.acceptEmptyResponse,
-		anthropicPrefixMismatchBehavior: options?.anthropicPrefixMismatchBehavior,
 		cursorExcludeTools: options?.cursorExcludeTools,
 		cursorLocalCliMode: options?.cursorLocalCliMode,
 		cursorDevExperimentOverrides: options?.cursorDevExperimentOverrides,
@@ -1876,6 +1875,7 @@ function mapOptionsForApi<TApi extends Api>(
 		cursorClientSupportsPromptContextUsageRpc: options?.cursorClientSupportsPromptContextUsageRpc,
 		cursorRunId: options?.cursorRunId,
 		cursorAgentSessionId: options?.cursorAgentSessionId,
+		anthropicPrefixMismatchBehavior: options?.anthropicPrefixMismatchBehavior,
 		previousResponseId: options?.previousResponseId,
 		parallelToolCalls: options?.parallelToolCalls,
 		seed: options?.seed,
@@ -2337,18 +2337,7 @@ function mapOptionsForApi<TApi extends Api>(
 				cursorClientSupportsPromptContextUsageRpc: options?.cursorClientSupportsPromptContextUsageRpc,
 				cursorRunId: options?.cursorRunId,
 				cursorAgentSessionId: options?.cursorAgentSessionId,
-				// A roster-resolved `requestModelId` of "auto" echoes the roster
-				// verbatim (what the CLI sends); otherwise auto mode sends the
-				// "default" wire id, and non-auto resolves from the model's own
-				// requestModelId. Also pin synthetic catalog `auto` so
-				// streamSimple without the gateway header still hits the Cursor
-				// router contract.
-				wireModelId:
-					model.requestModelId === "auto"
-						? "auto"
-						: options?.cursorAutoMode || model.id === "auto"
-							? "default"
-							: resolveWireModelId(cursorModel, effort),
+				wireModelId: options?.cursorAutoMode ? "default" : resolveWireModelId(cursorModel, effort),
 			});
 		}
 

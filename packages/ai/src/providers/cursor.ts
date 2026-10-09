@@ -325,6 +325,10 @@ const CURSOR_PASSTHROUGH_SERVER_ONLY_TOOLS: ReadonlySet<string> = new Set([
 	"todo",
 	"update_todos",
 	"read_todos",
+	// Hosted web tools are also executed by Cursor rather than a deferrable
+	// client exec frame. Do not advertise them as client-owned passthrough tools.
+	"web_fetch",
+	"web_search",
 ]);
 
 /**
@@ -427,11 +431,9 @@ export interface CursorOptions extends StreamOptions {
 	externalToolExecutor?: boolean;
 	/** Wire model id selected after thinking-effort routing (`resolveWireModelId`). */
 	wireModelId?: string;
-	/** Run transport. `auto` starts with HTTP/2 and falls back on failed ALPN negotiation. */
-	transport?: "auto" | "http2" | "http1";
 	/**
-	 * Restricts `x-cursor-agent-allowed-tools` under tool passthrough
-	 * (`"none"` → `__none__`, named force → that name alone).
+	 * Restricts the declared MCP tool catalog under passthrough; `none` disables
+	 * tools and a named choice must refer to a caller-declared tool.
 	 */
 	toolChoice?: ToolChoice;
 	/** Comma-separated tool names to exclude (`x-cursor-agent-exclude-tools`). */
@@ -440,6 +442,8 @@ export interface CursorOptions extends StreamOptions {
 	cursorLocalCliMode?: boolean;
 	/** Statsig experiment overrides (`x-dev-experiment-overrides`). */
 	cursorDevExperimentOverrides?: string;
+	/** Run transport. `auto` starts with HTTP/2 and falls back on failed ALPN negotiation. */
+	transport?: "auto" | "http2" | "http1";
 }
 
 type CursorWireMode = "normalized" | "discovered";
@@ -480,10 +484,10 @@ interface CursorGrpcRequest {
 }
 
 interface CursorTransportRequest extends CursorGrpcRequest {
+	/** Final serialized run ID, including a caller's onPayload replacement. */
+	runId: string;
 	/** Exact discovery id eligible for a retry because the normalized effort payload was serialized unchanged. */
 	fallbackWireModelId?: string;
-	/** Final run id serialized on the request (links x-request-id, like the CLI). */
-	runId: string;
 }
 
 interface CursorLogEntry {
@@ -1249,9 +1253,37 @@ function streamCursorWithWireMode(
 			const { requestBytes, conversationState } = builtRequest;
 			serializedFallbackWireModelId = builtRequest.fallbackWireModelId;
 			conversationEntry.state = conversationState;
+			let clientTools = context.tools;
+			if (options?.externalToolExecutor) {
+				if (options.toolChoice === "required" || options.toolChoice === "any") {
+					throw new AIError.ValidationError(
+						`Cursor passthrough does not support toolChoice "${options.toolChoice}"`,
+					);
+				}
+				const forcedName = getNamedToolChoiceName(options.toolChoice);
+				if (forcedName && CURSOR_PASSTHROUGH_SERVER_ONLY_TOOLS.has(forcedName)) {
+					throw new AIError.ValidationError(
+						`Cursor passthrough does not support forcing server-only tool "${forcedName}"`,
+					);
+				}
+				if (forcedName && !(context.tools ?? []).some(tool => tool.name === forcedName)) {
+					throw new AIError.ValidationError(
+						`Cursor passthrough tool "${forcedName}" is not declared by the client`,
+					);
+				}
+				clientTools =
+					options.toolChoice === "none"
+						? []
+						: (context.tools ?? []).filter(
+								tool =>
+									!CURSOR_PASSTHROUGH_SERVER_ONLY_TOOLS.has(tool.name) &&
+									(!forcedName || tool.name === forcedName),
+							);
+			}
 			const requestContextTools = buildMcpToolDefinitions(
-				context.tools,
+				clientTools,
 				model.requiresCursorToolSchemaProjection === true,
+				options?.externalToolExecutor === true,
 			);
 			const requestContextRules = buildCursorRequestContextRules(context.systemPrompt);
 			// Auto mode may request wire id "default" while output.model stays the
@@ -1273,7 +1305,6 @@ function streamCursorWithWireMode(
 			const sharedRequestHeaders = {
 				...callerHeaders,
 				...cursorClientHeaders(apiKey, {
-					clientVersion: CURSOR_CLIENT_VERSION,
 					contentType: "application/connect+proto",
 				}),
 				"connect-protocol-version": "1",
@@ -1304,37 +1335,13 @@ function streamCursorWithWireMode(
 			if (options?.cursorDevExperimentOverrides !== undefined) {
 				requestHeaders["x-dev-experiment-overrides"] = options.cursorDevExperimentOverrides;
 			}
-			// In passthrough mode, restrict the model's tool view to exactly the
-			// caller-declared tools (including native names like bash/read/write).
-			// Always send the header: omitting it leaves Cursor's unrestricted native
-			// set enabled (including when tools is empty / text-only passthrough).
-			// toolChoice "none" disables tools; a named forced choice advertises that
-			// name alone (even when absent from context.tools — Cursor decides).
-			// Cursor has no required-call signal, so `toolChoice: "required"` would
-			// silently weaken to auto — reject it instead of advertising the full list.
+			// The CLI filter uses ToolCall oneof field names, not OMP function names.
+			// All client-owned definitions (including bash/read/write) use MCP in
+			// passthrough, disabling native hosted tools. Empty means no tools.
 			if (options?.externalToolExecutor) {
-				if (options.toolChoice === "required" || options.toolChoice === "any") {
-					throw new AIError.ValidationError(
-						`Cursor passthrough does not support toolChoice "${options.toolChoice}"; use a named tool choice or omit toolChoice`,
-					);
-				}
-				const forcedName = getNamedToolChoiceName(options.toolChoice);
-				// Interaction-only tools (e.g. connect_scm / native todos) are resolved
-				// entirely server-side with no deferrable exec frame — advertising them
-				// lets Cursor finish the work while an OpenAI client would still try to
-				// re-run the surfaced call. Exclude them from the allowlist, and reject
-				// a forced choice that names one rather than weakening to the remaining
-				// declared tools / `__none__`.
-				if (forcedName && CURSOR_PASSTHROUGH_SERVER_ONLY_TOOLS.has(forcedName)) {
-					throw new AIError.ValidationError(
-						`Cursor passthrough does not support forcing server-only tool "${forcedName}"`,
-					);
-				}
-				const declared = (context.tools ?? [])
-					.map(tool => tool.name)
-					.filter(name => name.length > 0 && !CURSOR_PASSTHROUGH_SERVER_ONLY_TOOLS.has(name));
-				const allowedTools = options.toolChoice === "none" ? "" : forcedName ? forcedName : declared.join(",");
-				requestHeaders["x-cursor-agent-allowed-tools"] = allowedTools || "__none__";
+				requestHeaders["x-cursor-agent-allowed-tools"] = requestContextTools.length
+					? "get_mcp_tools_tool_call,mcp_tool_call"
+					: "";
 			}
 			const debugSession = isRequestDebugEnabled()
 				? await createRequestDebugSession({
@@ -1995,7 +2002,15 @@ export async function handleServerMessage(
 	log("serverMessage", msgCase, msg.message.value);
 
 	if (msgCase === "interactionUpdate") {
-		processInteractionUpdate(msg.message.value, output, stream, state, usageState, externalToolExecutor);
+		processInteractionUpdate(
+			msg.message.value,
+			output,
+			stream,
+			state,
+			usageState,
+			externalToolExecutor,
+			autoModeActive,
+		);
 	} else if (msgCase === "kvServerMessage") {
 		handleKvServerMessage(msg.message.value as KvServerMessage, blobStore, runTransport);
 	} else if (msgCase === "execServerMessage") {
@@ -2962,12 +2977,8 @@ async function handleExecServerMessage(
 				// Probe only — do not end passthrough; the real mcpArgs follows.
 				return false;
 			}
-			// Synthesize whenever a local MCP handler exists OR passthrough is on.
-			// Passthrough (e.g. auth-gateway) has no execHandlers: mcpArgs can still
-			// arrive before toolCallStarted, and without a ToolCall the caller never
-			// receives the custom tool invocation. Without either path, leave the
-			// streamed announcement unpaired so agent-loop executes it locally.
-			const synthesizeMcp = !!execHandlers?.mcp || !!externalToolExecutor;
+			// Surface unhandled MCP calls to the caller without marking them executed.
+			const synthesizeMcp = !!execHandlers?.mcp || externalHandoff;
 			if (synthesizeMcp) {
 				const existingBlock = output.content.find(
 					(block): block is ToolCallState => block.type === "toolCall" && block.id === mcpCall.toolCallId,
@@ -2993,6 +3004,7 @@ async function handleExecServerMessage(
 					);
 					markDeferredToCaller(externalHandoff);
 					if (!externalHandoff) state.resolvedMcpToolCallIds.add(mcpCall.toolCallId);
+					markDeferredToCaller(externalHandoff);
 				}
 			}
 			const { execResult } = await (externalHandoff ? deferExec : resolveExecHandler)(
@@ -5427,6 +5439,7 @@ export function processInteractionUpdate(
 	state: BlockState,
 	usageState: UsageState,
 	externalToolExecutor?: boolean,
+	autoModeActive = false,
 ): void {
 	const updateCase = update.message?.case;
 
@@ -5810,16 +5823,14 @@ export function processInteractionUpdate(
 			);
 		}
 	} else if (updateCase === "routedModel") {
-		// Consume InteractionUpdate.routedModel when the backend sends it
-		// (capability advertised via cursorClientSupportsRoutedModelUpdate).
-		// Checkpoint JSON extraction remains the fallback for older servers.
 		const routed = update.message.value;
 		const modelId = typeof routed?.modelId === "string" ? routed.modelId.trim() : "";
 		if (modelId) {
-			output.model = modelId;
-			// Explicit signal for auth-gateway SSE: do not treat repeated
-			// `partial.model` observations as proof routing completed.
-			stream.push({ type: "routed_model", model: modelId, partial: output });
+			output.upstreamModel = modelId;
+			if (autoModeActive) {
+				output.model = modelId;
+				stream.push({ type: "routed_model", model: modelId, partial: output });
+			}
 		}
 	} else if (updateCase === "tokenDelta") {
 		const tokenDelta = update.message.value;
@@ -5889,6 +5900,7 @@ function handleConversationCheckpointUpdate(
 			const modelName = parsed.content?.find(c => c.providerOptions?.cursor?.modelName)?.providerOptions?.cursor
 				?.modelName;
 			if (modelName) {
+				output.upstreamModel = modelName;
 				output.model = modelName;
 				stream?.push({ type: "routed_model", model: modelName, partial: output });
 				break;
@@ -5973,12 +5985,13 @@ function isJsonValue(value: unknown): value is JsonValue {
 export function buildMcpToolDefinitions(
 	tools: Tool[] | undefined,
 	requiresCursorToolSchemaProjection = false,
+	includeNativeNames = false,
 ): McpToolDefinition[] {
 	if (!tools || tools.length === 0) {
 		return [];
 	}
 
-	const advertisedTools = tools.filter(tool => !CURSOR_NATIVE_TOOL_NAMES.has(tool.name));
+	const advertisedTools = includeNativeNames ? tools : tools.filter(tool => !CURSOR_NATIVE_TOOL_NAMES.has(tool.name));
 	if (advertisedTools.length === 0) {
 		return [];
 	}
@@ -5990,7 +6003,7 @@ export function buildMcpToolDefinitions(
 	// devices are advertised — otherwise a staged preview can never be resolved
 	// and the SoftToolRequirement('write') escalation aborts the turn.
 	const writeTool = tools.find(tool => tool.name === "write");
-	const forwarded = writeTool ? [...advertisedTools, writeTool] : advertisedTools;
+	const forwarded = writeTool && !includeNativeNames ? [...advertisedTools, writeTool] : advertisedTools;
 
 	return forwarded.map(tool => {
 		const wireSchema = toolWireSchema(tool);
@@ -6812,6 +6825,7 @@ async function buildGrpcRequestForWireMode(
 		modelDetails,
 		requestedModel,
 		conversationId: state.conversationId,
+		conversationGroupId: state.conversationId,
 	});
 
 	// Apply customSystemPrompt BEFORE the hook so the onPayload replacement is the
@@ -6829,7 +6843,6 @@ async function buildGrpcRequestForWireMode(
 	// group stably. Both stay overridable via options/onPayload replacement.
 	runRequest.runId = options?.cursorRunId ?? crypto.randomUUID();
 	runRequest.agentSessionId = options?.cursorAgentSessionId ?? "";
-	runRequest.conversationGroupId = state.conversationId;
 
 	// Tools are sent later via requestContext (exec handshake)
 	const replacementRequest = await options?.onPayload?.(runRequest, model);

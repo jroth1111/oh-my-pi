@@ -15,9 +15,16 @@
 - Grok Bot requests omit the retired variant-string wire flag and support advertised `reasoning_effort` parameters.
 - Updated Grok Bot's default Sand client stamp while preserving explicit client-version overrides.
 - Preserve nested connection-failure evidence when SDK errors are flattened into provider error messages ([#14380](https://github.com/can1357/oh-my-pi/pull/14380) by [@jroth1111](https://github.com/jroth1111)).
+- Added Cursor Auto routing and client-owned tool passthrough with routing-aware gateway model labels ([#10099](https://github.com/can1357/oh-my-pi/pull/10099) by [@jroth1111](https://github.com/jroth1111)).
+
 - Added routing-session cleanup for OpenAI Responses and Codex while preserving shared provider fallbacks ([#14334](https://github.com/can1357/oh-my-pi/pull/14334) by [@iliaal](https://github.com/iliaal)).
 
 ### Fixed
+
+- Fixed Cursor passthrough allowlists to use protocol tool cases and restrict advertised client MCP definitions instead of disabling live tools ([#10099](https://github.com/can1357/oh-my-pi/pull/10099) by [@jroth1111](https://github.com/jroth1111)).
+
+- Fixed Cursor routed-model updates being discarded despite advertising support, while preserving explicit requested model labels ([#11324](https://github.com/can1357/oh-my-pi/pull/11324) by [@jroth1111](https://github.com/jroth1111)).
+- Fixed Cursor capability/session controls and agent-mode user messages on the serialized request, with HTTP/1 streaming using the CLI's Bidi request contract ([#11324](https://github.com/can1357/oh-my-pi/pull/11324) by [@jroth1111](https://github.com/jroth1111)).
 
 - Fixed Claude Haiku 5.5 requests silently enabling adaptive thinking when reasoning is off, on native Bedrock (main and helper calls) and the Anthropic API; conversations whose earlier effort controls rule out disabled thinking fall back to lowest-effort adaptive thinking instead of failing ([#14996](https://github.com/can1357/oh-my-pi/pull/14996) by [@bse-ai](https://github.com/bse-ai)).
 

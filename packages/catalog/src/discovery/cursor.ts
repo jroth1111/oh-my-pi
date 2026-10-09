@@ -180,6 +180,15 @@ export async function fetchCursorUsableModels(
 		legacyModels.sort((a, b) => a.id.localeCompare(b.id));
 	}
 	const usableModelIds = usable === null ? undefined : new Set(legacyModels.map(model => model.id));
+	if (
+		legacyModels.length > 0 &&
+		defaultModel?.modelId &&
+		!legacyModels.some(model => model.id === defaultModel.modelId)
+	) {
+		legacyModels.push(...normalizeCursorModels([defaultModel], options.baseUrl, references));
+		legacyModels.sort((a, b) => a.id.localeCompare(b.id));
+		usableModelIds?.add(defaultModel.modelId);
+	}
 	if (!available || available.models.length === 0) return legacyModels;
 	const richModels = normalizeRichCursorModels(
 		available.models,
@@ -1091,6 +1100,8 @@ function normalizeCursorModel(
 
 	const name = pickModelDisplayName(details, id);
 	const reference = references.get(id);
+	// Preserve every authoritative roster wire identity. Synthetic catalog
+	// routing is supplied by KDL, not special-cased in this mapper.
 	// Versioned Cursor Grok ids (`cursor-grok-4.5`, `cursor-grok-4.6-high`)
 	// are reasoning models whose effort rides the per-tier sibling id;
 	// `GetUsableModels` ships no `thinkingDetails` for them and the bundled

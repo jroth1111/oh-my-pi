@@ -2,28 +2,18 @@
 // WebFetch field 9; other unknown length-delimited variants stay unanswered.
 import { describe, expect, it } from "bun:test";
 import type * as http2 from "node:http2";
-import { create, fromBinary } from "@bufbuild/protobuf";
+import { create, fromBinary } from "@oh-my-pi/pi-catalog/discovery/protobuf";
 import { handleInteractionQuery } from "@oh-my-pi/pi-ai/providers/cursor/interaction-query";
 import {
 	type AgentClientMessage,
 	AgentClientMessageSchema,
 	type InteractionQuery,
 	InteractionQuerySchema,
-} from "@oh-my-pi/pi-catalog/discovery/cursor-gen/agent_pb";
+} from "@oh-my-pi/pi-catalog/discovery/cursor-proto";
 
-type ProtoUnknownField = { no: number; wireType: number; data: Uint8Array };
+import type { ProtoUnknownField } from "@oh-my-pi/pi-catalog/discovery/protobuf";
+
 type ProtoUnknownBag = { $unknown?: ProtoUnknownField[] };
-
-function isProtoUnknownField(value: unknown): value is ProtoUnknownField {
-	if (!value || typeof value !== "object") return false;
-	if (!("no" in value) || !("wireType" in value) || !("data" in value)) return false;
-	return typeof value.no === "number" && typeof value.wireType === "number" && value.data instanceof Uint8Array;
-}
-
-function protoUnknownFields(message: object): ProtoUnknownField[] {
-	if (!("$unknown" in message) || !Array.isArray(message.$unknown)) return [];
-	return message.$unknown.filter(isProtoUnknownField);
-}
 
 function decodeConnectFrame(frame: Buffer): AgentClientMessage {
 	const flags = frame[0]!;
@@ -57,12 +47,12 @@ describe("cursor interaction query unknown-field fallback", () => {
 			throw new Error("expected interactionResponse");
 		}
 		expect(client.message.value.id).toBe(18);
-		// Field 9 is still unnamed on this generated schema, so the approved
-		// reply round-trips as the same unknown LEN field rather than a named
-		// webFetchRequestResponse case.
-		expect(client.message.value.result.case).toBeUndefined();
-		const responseUnknown = protoUnknownFields(client.message.value);
-		expect(responseUnknown.some(field => field.no === 9 && field.wireType === 2)).toBe(true);
+		// A legacy unnamed query still receives a wire reply the current codec
+		// decodes as the verified WebFetch approval, not a fabricated variant.
+		const result = client.message.value.result;
+		expect(result.case).toBe("webFetchRequestResponse");
+		if (result.case !== "webFetchRequestResponse") throw new Error("expected WebFetch response");
+		expect(result.value.result.case).toBe("approved");
 	});
 
 	it("leaves unknown non-WebFetch interaction query fields unanswered", async () => {

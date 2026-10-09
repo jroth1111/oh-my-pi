@@ -7,9 +7,10 @@ provider "cursor" {
 		env "CURSOR_API_KEY"
 	}
 
-	// Synthetic auto uses default; authoritative discovery request ids take precedence.
+	// Synthetic Auto uses default; authoritative discovery wire IDs take precedence.
 	models "auto" {
 		request-model-id "default"
+		pricing-status "variable"
 	}
 
 	thinking-mode "effort"
