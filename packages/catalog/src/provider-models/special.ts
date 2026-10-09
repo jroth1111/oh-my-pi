@@ -415,7 +415,7 @@ export function factoryDroidModelManagerOptions(
 }
 
 // ---------------------------------------------------------------------------
-// Grok Bot provider (InferenceService Stream)
+// Grok Bot native Sand inference
 // ---------------------------------------------------------------------------
 
 export function grokbotChatModelManagerOptions(config: { baseUrl?: string } = {}): ModelManagerOptions<"grokbot-chat"> {

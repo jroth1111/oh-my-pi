@@ -800,7 +800,7 @@ describe("streamGrokBot JSON-as-text promotion", () => {
 			frameConnectProto(Buffer.alloc(0), CONNECT_END_STREAM_FLAG),
 		]);
 		let advertised: unknown;
-		const fetchImpl = (async () => connectBody(...[text])) as FetchImpl;
+		const fetchImpl = (async () => connectBody(text)) as FetchImpl;
 		const model = buildModel({
 			id: "grok-4.6",
 			name: "grok-4.6",
@@ -892,7 +892,7 @@ describe("streamGrokBot JSON-as-text promotion", () => {
 			frameConnectProto(Buffer.alloc(0), CONNECT_END_STREAM_FLAG),
 		]);
 		let advertised: unknown;
-		const fetchImpl = (async () => connectBody(...[text])) as FetchImpl;
+		const fetchImpl = (async () => connectBody(text)) as FetchImpl;
 		const model = buildModel({
 			id: "grok-4.6",
 			name: "grok-4.6",

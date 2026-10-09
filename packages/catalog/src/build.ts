@@ -70,10 +70,9 @@ function isInputModalities(value: unknown): value is ("text" | "image")[] {
  * `context-window-floor`) overwrite upstream values; selection metadata
  * (`priority`, `apply-patch-tool-type`, `service-tier-cost`,
  * `requires-cursor-tool-schema-projection`, `requires-tool-result-image-hoisting`,
- * `supports-assistant-prefill`, `sand-parameter-ids`) is
- * rule-owned; `context-promotion-target` and `sand-parameter-ids` fill
- * only when the spec left them unset (live AvailableModels wins for
- * sand params).
+ * `supports-assistant-prefill`) is rule-owned. `context-promotion-target`,
+ * `request-model-id`, and `sand-parameter-ids` fill only when unset;
+ * live AvailableModels parameter metadata wins over offline seed defaults.
  */
 function applyCatalogAssignments<TApi extends Api>(model: Model<TApi>, catalog: Record<string, unknown>): void {
 	const requestModelId = catalog.requestModelId;

@@ -2389,7 +2389,8 @@ function mapOptionsForApi<TApi extends Api>(
 		case "grokbot-sand": {
 			const grokbotModel = model as Model<"grokbot-sand">;
 			const allowed = grokbotModel.sandParameterIds ?? [];
-			const acceptsEffort = allowed.includes("effort") || allowed.includes("reasoning");
+			const acceptsEffort =
+				allowed.includes("effort") || allowed.includes("reasoning_effort") || allowed.includes("reasoning");
 			const disableThinking = Boolean(options?.disableReasoning || options?.forceReasoningOff);
 			let effort: Effort | undefined;
 			if (acceptsEffort && grokbotModel.reasoning && grokbotModel.thinking) {

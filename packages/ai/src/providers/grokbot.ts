@@ -25,6 +25,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream";
 import { notifyProviderResponse } from "../utils/provider-response";
 import { toolWireSchema } from "../utils/schema/wire";
 import { normalizeSystemPrompts } from "../utils";
+import { ConnectFrameDecoder } from "./connect-frame";
 import { redactSensitiveCredentials, sharesNativeThinkingLineage, transformMessages } from "./transform-messages";
 import {
 	clearGrokbotTokenCache,
@@ -1862,215 +1863,213 @@ export const streamGrokBot: StreamFunction<"grokbot-sand"> = (
 					if (isComplete) finishTool(state);
 				};
 
-				let pending = Buffer.alloc(0);
+				const frameDecoder = new ConnectFrameDecoder({
+					limit: {
+						maxPayloadBytes: MAX_CONNECT_FRAME_PAYLOAD,
+						error: length => new Error(`Grok Bot connect frame too large (${length} bytes)`),
+					},
+				});
 				let sawEndStream = false;
 				const reader = (response.body as ReadableStream<Uint8Array>).getReader();
-				while (true) {
-					const { done, value } = await reader.read();
-					if (done) {
-						if (pending.length > 0 || !sawEndStream) {
-							throw new AIError.ProviderResponseError(
-								pending.length > 0
-									? "Grok Bot stream ended with a truncated connect frame"
-									: "Grok Bot stream ended without a connect end-stream trailer",
-								{ provider: model.provider, kind: "incomplete-stream" },
-							);
-						}
-						break;
-					}
-					pending = Buffer.concat([pending, Buffer.from(value)]);
-					const frames: Array<{ flags: number; bytes: Buffer }> = [];
-					let offset = 0;
-					while (offset + 5 <= pending.length) {
-						const flags = pending[offset]!;
-						const len = pending.readUInt32BE(offset + 1);
-						if (len > MAX_CONNECT_FRAME_PAYLOAD) {
-							throw new Error(`Grok Bot connect frame too large (${len} bytes)`);
-						}
-						if (offset + 5 + len > pending.length) break;
-						frames.push({ flags, bytes: pending.subarray(offset + 5, offset + 5 + len) });
-						offset += 5 + len;
-					}
-					pending = pending.subarray(offset);
-
-					for (const frame of frames) {
-						if (sawEndStream) {
-							throw new AIError.ProviderResponseError(
-								"Grok Bot stream continued after the connect end-stream trailer",
-								{ provider: model.provider, kind: "incomplete-stream" },
-							);
-						}
-						if (frame.flags & CONNECT_END_STREAM_FLAG) {
-							sawEndStream = true;
-							const jsonText = Buffer.from(frame.bytes).toString("utf8").trim();
-							let parsedEnd: Record<string, unknown> = {};
-							if (jsonText) {
-								try {
-									parsedEnd = JSON.parse(jsonText) as Record<string, unknown>;
-								} catch {
-									throw new AIError.ProviderResponseError(
-										"Grok Bot connect end-stream trailer is not valid JSON",
-										{ provider: model.provider, kind: "envelope" },
-									);
-								}
-							}
-							const errObj = parsedEnd.error as Record<string, unknown> | undefined;
-							const code = errObj ? String(errObj.code ?? "").toLowerCase() : "";
-							if (errObj) {
-								// Connect often reports revoked JWTs as end-stream
-								// `unauthenticated` on HTTP 200; treat like HTTP 401.
-								if (code === "unauthenticated") {
-									if (await remintAfterUnauthorized()) continue attempt;
-									clearGrokbotTokenCache();
-									throw new Error(`${formatGrokbotConnectTrailerError(parsedEnd)} (HTTP 401)`);
-								}
-								throw new Error(formatGrokbotConnectTrailerError(parsedEnd));
-							}
-							continue;
-						}
-
-						let parsed: Record<string, unknown>;
-						try {
-							parsed = decodeInferenceStreamResponse(frame.bytes) as Record<string, unknown>;
-						} catch (err) {
-							if (frame.bytes.length === 0) continue;
-							throw new AIError.ProviderResponseError(
-								`Grok Bot stream frame decode failed: ${err instanceof Error ? err.message : String(err)}`,
-								{ provider: model.provider, kind: "envelope" },
-							);
-						}
-
-						const providerMetadata = parsed.providerMetadata as
-							| { metadata?: { cursor?: { anthropicNativeContent?: unknown } } }
-							| undefined;
-						const nativeContent = providerMetadata?.metadata?.cursor?.anthropicNativeContent;
-						if (typeof nativeContent === "string" && nativeContent.length > 0)
-							nativeAnthropicContent = nativeContent;
-						const errObj = firstPresent(parsed, ["error"]);
-						if (errObj && typeof errObj === "object") {
-							const e = errObj as Record<string, unknown>;
-							if (e.isOutputTokenLimitError || e.is_output_token_limit_error) {
-								output.stopReason = "length";
-								continue;
-							}
-							if (e.isInputTokenLimitError || e.is_input_token_limit_error) {
+				try {
+					while (true) {
+						const { done, value } = await reader.read();
+						if (done) {
+							if (frameDecoder.bufferedBytes > 0 || !sawEndStream) {
 								throw new AIError.ProviderResponseError(
-									"Grok Bot input token count exceeds the maximum context length",
-									{ provider: model.provider, kind: "output" },
+									frameDecoder.bufferedBytes > 0
+										? "Grok Bot stream ended with a truncated connect frame"
+										: "Grok Bot stream ended without a connect end-stream trailer",
+									{ provider: model.provider, kind: "incomplete-stream" },
 								);
 							}
-							const diagnostic =
-								(typeof e.message === "string" && e.message) ||
-								(typeof e.code === "string" && e.code) ||
-								(e.errorType != null ? `errorType=${e.errorType}` : undefined) ||
-								(e.error_type != null ? `errorType=${e.error_type}` : undefined) ||
-								"unknown";
-							throw new Error(`Grok Bot stream error: ${diagnostic}`);
+							break;
 						}
-						if (typeof errObj === "string" && errObj) throw new Error(errObj);
-
-						const thinkingPart = firstPresent(parsed, ["thinkingPart", "thinking_part"]) as
-							| Record<string, unknown>
-							| undefined;
-						if (thinkingPart) {
-							const delta = String(thinkingPart.text || "");
-							const signature =
-								typeof thinkingPart.signature === "string" && thinkingPart.signature
-									? thinkingPart.signature
-									: undefined;
-							if (delta || signature) {
-								const idx = ensureThinking();
-								const block = output.content[idx] as ThinkingContent;
-								if (delta) {
-									block.thinking += delta;
-									emitAttemptEvent({ type: "thinking_delta", contentIndex: idx, delta, partial: output });
+						for (const frame of frameDecoder.decode(value)) {
+							if (sawEndStream) {
+								throw new AIError.ProviderResponseError(
+									"Grok Bot stream continued after the connect end-stream trailer",
+									{ provider: model.provider, kind: "incomplete-stream" },
+								);
+							}
+							if (frame.flags & CONNECT_END_STREAM_FLAG) {
+								sawEndStream = true;
+								const jsonText = frame.payload.toString("utf8").trim();
+								let parsedEnd: Record<string, unknown> = {};
+								if (jsonText) {
+									try {
+										parsedEnd = JSON.parse(jsonText) as Record<string, unknown>;
+									} catch {
+										throw new AIError.ProviderResponseError(
+											"Grok Bot connect end-stream trailer is not valid JSON",
+											{ provider: model.provider, kind: "envelope" },
+										);
+									}
 								}
-								if (signature) block.thinkingSignature = signature;
+								const errObj = parsedEnd.error as Record<string, unknown> | undefined;
+								const code = errObj ? String(errObj.code ?? "").toLowerCase() : "";
+								if (errObj) {
+									// Connect often reports revoked JWTs as end-stream
+									// `unauthenticated` on HTTP 200; treat like HTTP 401.
+									if (code === "unauthenticated") {
+										if (await remintAfterUnauthorized()) continue attempt;
+										clearGrokbotTokenCache();
+										throw new Error(`${formatGrokbotConnectTrailerError(parsedEnd)} (HTTP 401)`);
+									}
+									throw new Error(formatGrokbotConnectTrailerError(parsedEnd));
+								}
+								continue;
 							}
-							if (thinkingPart.isFinal || thinkingPart.is_final) closeOpen();
-						}
 
-						const textPart = firstPresent(parsed, ["textPart", "text_part"]) as
-							| Record<string, unknown>
-							| undefined;
-						const textDelta =
-							(textPart ? String(textPart.text || "") : "") ||
-							(typeof parsed.text === "string" && !textPart && !thinkingPart ? parsed.text : "");
-						if (textDelta) {
-							const idx = ensureText();
-							(output.content[idx] as TextContent).text += textDelta;
-							emitAttemptEvent({ type: "text_delta", contentIndex: idx, delta: textDelta, partial: output });
-						}
-						if (textPart && (textPart.isFinal || textPart.is_final)) closeOpen();
+							let parsed: Record<string, unknown>;
+							try {
+								parsed = decodeInferenceStreamResponse(frame.payload) as Record<string, unknown>;
+							} catch (err) {
+								if (frame.payload.length === 0) continue;
+								throw new AIError.ProviderResponseError(
+									`Grok Bot stream frame decode failed: ${err instanceof Error ? err.message : String(err)}`,
+									{ provider: model.provider, kind: "envelope" },
+								);
+							}
 
-						const toolPart = firstPresent(parsed, ["toolCallPart", "tool_call_part"]);
-						if (toolPart && typeof toolPart === "object") {
-							const wireToolName = String(
-								(toolPart as Record<string, unknown>).toolName ||
-									(toolPart as Record<string, unknown>).tool_name ||
-									"",
+							const providerMetadata = parsed.providerMetadata as
+								| { metadata?: { cursor?: { anthropicNativeContent?: unknown } } }
+								| undefined;
+							const nativeContent = providerMetadata?.metadata?.cursor?.anthropicNativeContent;
+							if (typeof nativeContent === "string" && nativeContent.length > 0)
+								nativeAnthropicContent = nativeContent;
+							const errObj = firstPresent(parsed, ["error"]);
+							if (errObj && typeof errObj === "object") {
+								const e = errObj as Record<string, unknown>;
+								if (e.isOutputTokenLimitError || e.is_output_token_limit_error) {
+									output.stopReason = "length";
+									continue;
+								}
+								if (e.isInputTokenLimitError || e.is_input_token_limit_error) {
+									throw new AIError.ProviderResponseError(
+										"Grok Bot input token count exceeds the maximum context length",
+										{ provider: model.provider, kind: "output" },
+									);
+								}
+								const diagnostic =
+									(typeof e.message === "string" && e.message) ||
+									(typeof e.code === "string" && e.code) ||
+									(e.errorType != null ? `errorType=${e.errorType}` : undefined) ||
+									(e.error_type != null ? `errorType=${e.error_type}` : undefined) ||
+									"unknown";
+								throw new Error(`Grok Bot stream error: ${diagnostic}`);
+							}
+							if (typeof errObj === "string" && errObj) throw new Error(errObj);
+
+							const thinkingPart = firstPresent(parsed, ["thinkingPart", "thinking_part"]) as
+								| Record<string, unknown>
+								| undefined;
+							if (thinkingPart) {
+								const delta = String(thinkingPart.text || "");
+								const signature =
+									typeof thinkingPart.signature === "string" && thinkingPart.signature
+										? thinkingPart.signature
+										: undefined;
+								if (delta || signature) {
+									const idx = ensureThinking();
+									const block = output.content[idx] as ThinkingContent;
+									if (delta) {
+										block.thinking += delta;
+										emitAttemptEvent({ type: "thinking_delta", contentIndex: idx, delta, partial: output });
+									}
+									if (signature) block.thinkingSignature = signature;
+								}
+								if (thinkingPart.isFinal || thinkingPart.is_final) closeOpen();
+							}
+
+							const textPart = firstPresent(parsed, ["textPart", "text_part"]) as
+								| Record<string, unknown>
+								| undefined;
+							const textDelta =
+								(textPart ? String(textPart.text || "") : "") ||
+								(typeof parsed.text === "string" && !textPart && !thinkingPart ? parsed.text : "");
+							if (textDelta) {
+								const idx = ensureText();
+								(output.content[idx] as TextContent).text += textDelta;
+								emitAttemptEvent({ type: "text_delta", contentIndex: idx, delta: textDelta, partial: output });
+							}
+							if (textPart && (textPart.isFinal || textPart.is_final)) closeOpen();
+
+							const toolPart = firstPresent(parsed, ["toolCallPart", "tool_call_part"]);
+							if (toolPart && typeof toolPart === "object") {
+								const wireToolName = String(
+									(toolPart as Record<string, unknown>).toolName ||
+										(toolPart as Record<string, unknown>).tool_name ||
+										"",
+								);
+								// Only intercept the synthetic parent-chat helper. When an
+								// extension owns the SendToUser wire name, dispatch it.
+								// Name-less continuation frames (id/index only) stay on this
+								// path via openSendToUserByKey — same correlation as upsertTool.
+								const ompOwnsSendToUser =
+									Array.isArray(context.tools) &&
+									context.tools.some(tool => {
+										if (!tool || typeof tool !== "object") return false;
+										const name = typeof tool.name === "string" ? tool.name.trim() : "";
+										const custom = typeof tool.customWireName === "string" ? tool.customWireName.trim() : "";
+										// Ownership follows the advertised wire name (custom alias
+										// wins). An internal `SendToUser` that maps to `Other` does
+										// not occupy the synthetic slot the parent-chat mapper injects.
+										const advertised = custom || name;
+										return advertised === SEND_TO_USER_WIRE_NAME;
+									});
+								const isSyntheticSendToUser =
+									!ompOwnsSendToUser &&
+									(wireToolName === SEND_TO_USER_WIRE_NAME ||
+										isOpenSendToUserPart(toolPart as Record<string, unknown>));
+								if (isSyntheticSendToUser) {
+									handleSendToUser(toolPart as Record<string, unknown>);
+								} else {
+									upsertTool(toolPart as Record<string, unknown>);
+								}
+							}
+
+							const usage = firstPresent(parsed, ["usage", "extendedUsage", "extended_usage"]);
+							if (usage && typeof usage === "object") applyUsage(output, usage as Record<string, unknown>);
+
+							const info = firstPresent(parsed, ["responseInfo", "response_info"]) as
+								| Record<string, unknown>
+								| undefined;
+							if (info) {
+								const errorMessage =
+									(typeof info.errorMessage === "string" && info.errorMessage) ||
+									(typeof info.error_message === "string" && info.error_message) ||
+									"";
+								if (errorMessage) {
+									throw new Error(errorMessage);
+								}
+								if (typeof info.id === "string" && info.id) output.responseId = info.id;
+								const routedModel =
+									(typeof info.model === "string" && info.model) ||
+									(typeof (info as { modelId?: string }).modelId === "string" &&
+										(info as { modelId?: string }).modelId) ||
+									"";
+								if (routedModel) {
+									routedResponseModel = routedModel;
+									output.upstreamModel = routedModel;
+								}
+							}
+						}
+						if (sawEndStream && frameDecoder.bufferedBytes > 0) {
+							throw new AIError.ProviderResponseError(
+								"Grok Bot stream retained bytes after the connect end-stream trailer",
+								{ provider: model.provider, kind: "incomplete-stream" },
 							);
-							// Only intercept the synthetic parent-chat helper. When an
-							// extension owns the SendToUser wire name, dispatch it.
-							// Name-less continuation frames (id/index only) stay on this
-							// path via openSendToUserByKey — same correlation as upsertTool.
-							const ompOwnsSendToUser =
-								Array.isArray(context.tools) &&
-								context.tools.some(tool => {
-									if (!tool || typeof tool !== "object") return false;
-									const name = typeof tool.name === "string" ? tool.name.trim() : "";
-									const custom = typeof tool.customWireName === "string" ? tool.customWireName.trim() : "";
-									// Ownership follows the advertised wire name (custom alias
-									// wins). An internal `SendToUser` that maps to `Other` does
-									// not occupy the synthetic slot the parent-chat mapper injects.
-									const advertised = custom || name;
-									return advertised === SEND_TO_USER_WIRE_NAME;
-								});
-							const isSyntheticSendToUser =
-								!ompOwnsSendToUser &&
-								(wireToolName === SEND_TO_USER_WIRE_NAME ||
-									isOpenSendToUserPart(toolPart as Record<string, unknown>));
-							if (isSyntheticSendToUser) {
-								handleSendToUser(toolPart as Record<string, unknown>);
-							} else {
-								upsertTool(toolPart as Record<string, unknown>);
-							}
-						}
-
-						const usage = firstPresent(parsed, ["usage", "extendedUsage", "extended_usage"]);
-						if (usage && typeof usage === "object") applyUsage(output, usage as Record<string, unknown>);
-
-						const info = firstPresent(parsed, ["responseInfo", "response_info"]) as
-							| Record<string, unknown>
-							| undefined;
-						if (info) {
-							const errorMessage =
-								(typeof info.errorMessage === "string" && info.errorMessage) ||
-								(typeof info.error_message === "string" && info.error_message) ||
-								"";
-							if (errorMessage) {
-								throw new Error(errorMessage);
-							}
-							if (typeof info.id === "string" && info.id) output.responseId = info.id;
-							const routedModel =
-								(typeof info.model === "string" && info.model) ||
-								(typeof (info as { modelId?: string }).modelId === "string" &&
-									(info as { modelId?: string }).modelId) ||
-								"";
-							if (routedModel) {
-								routedResponseModel = routedModel;
-								output.upstreamModel = routedModel;
-							}
 						}
 					}
-					if (sawEndStream && pending.length > 0) {
-						throw new AIError.ProviderResponseError(
-							"Grok Bot stream retained bytes after the connect end-stream trailer",
-							{ provider: model.provider, kind: "incomplete-stream" },
-						);
+				} finally {
+					try {
+						await reader.cancel();
+					} catch {
+						// The original stream error remains authoritative.
 					}
+					reader.releaseLock();
 				}
-
 				closeOpen();
 				// Finalize incomplete ToolCallParts that already have a complete JSON
 				// object (stream ended before isComplete). Skip this salvage after an

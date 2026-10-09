@@ -1,9 +1,9 @@
 /**
  * Live Grok Bot model discovery via `aiserver.v1.AiService/AvailableModels`.
  *
- * Uses sand client headers + minted JWT (not Cursor CLI `GetUsableModels`).
- * Returns parameterized catalog rows; always unions sand router slugs that are
- * absent from the live list (`sand-default`, `sand-cua`, `sand-automation`).
+ * Uses Sand client headers and minted metadata JWT. GetUsableModels confirms
+ * account-advertised packed wire IDs; rich AvailableModels metadata owns params.
+ * The authored Sand router roster is unioned into successful catalogs.
  */
 import { Effort, THINKING_EFFORTS } from "../effort";
 import {

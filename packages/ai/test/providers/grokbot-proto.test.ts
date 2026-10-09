@@ -3200,6 +3200,60 @@ describe("grokbot disableReasoning effort floor", () => {
 		vi.restoreAllMocks();
 	});
 
+	test("streamSimple forwards an explicit effort through the advertised reasoning_effort field", async () => {
+		spyOn(grokbotAuth, "loadGrokbotConfig").mockResolvedValue({
+			renewal: "renew",
+			machineId: "machine",
+			namespace: "prod",
+			clientVersion: "0.69.0",
+		});
+		spyOn(grokbotAuth, "mintGrokbotAccessToken").mockResolvedValue("fixture-jwt");
+		const model = buildModel({
+			id: "claude-sonnet-5-5",
+			name: "Sonnet fixture",
+			api: "grokbot-sand",
+			provider: "grokbot",
+			baseUrl: "https://example.invalid",
+			reasoning: true,
+			thinking: { mode: "effort", efforts: [Effort.Low, Effort.Medium, Effort.High] },
+			sandParameterIds: ["context", "reasoning_effort"],
+			sandParameterDefaults: { context: "300k", reasoning_effort: "high" },
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 300_000,
+			maxTokens: null,
+		});
+		let request: Record<string, unknown> | undefined;
+		const fetchImpl: FetchImpl = async (_url, init) => {
+			const frame = Buffer.from(init?.body as Uint8Array);
+			request = decodeInferenceStreamRequest(frame.subarray(5));
+			return new Response(
+				Buffer.concat([
+					frameConnectProto(encodeInferenceStreamResponse({ textPart: { text: "fixture", isFinal: true } })),
+					frameConnectProto(Buffer.alloc(0), CONNECT_END_STREAM_FLAG),
+				]),
+				{ headers: { "content-type": "application/connect+proto" } },
+			);
+		};
+		const result = await streamSimple(
+			model,
+			{ messages: [{ role: "user", content: "fixture", timestamp: 1 }] },
+			{
+				apiKey: "renew",
+				reasoning: Effort.Medium,
+				fetch: fetchImpl,
+			},
+		).result();
+		expect(result.stopReason).toBe("stop");
+		expect(request?.requestedModel).toMatchObject({
+			modelId: "claude-sonnet-5-5",
+			parameters: [
+				{ id: "context", value: "300k" },
+				{ id: "reasoning_effort", value: "medium" },
+			],
+		});
+	});
+
 	test("disableReasoning floors effort to the model's minimum supported tier", async () => {
 		spyOn(grokbotAuth, "loadGrokbotConfig").mockResolvedValue({
 			renewal: "renew",

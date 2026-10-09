@@ -371,7 +371,7 @@ describe("product wire helpers", () => {
 		);
 		expect(tools[0]?.name).toBe("Read");
 		const schema = (
-			tools[0]?.parameters as {
+			tools[0]!.parameters as {
 				jsonSchema?: {
 					properties?: Record<string, unknown>;
 					required?: string[];
@@ -403,7 +403,7 @@ describe("product wire helpers", () => {
 		);
 		expect(tools[0]?.name).toBe("Write");
 		const schema = (
-			tools[0]?.parameters as {
+			tools[0]!.parameters as {
 				jsonSchema?: {
 					properties?: Record<string, unknown>;
 					required?: string[];
@@ -437,7 +437,7 @@ describe("product wire helpers", () => {
 			"automation",
 		);
 		const schema = (
-			tools[0]?.parameters as {
+			tools[0]!.parameters as {
 				jsonSchema?: {
 					properties?: Record<string, unknown>;
 					required?: string[];
@@ -472,7 +472,7 @@ describe("product wire helpers", () => {
 			"automation",
 		);
 		const schema = (
-			tools[0]?.parameters as {
+			tools[0]!.parameters as {
 				jsonSchema?: {
 					properties?: Record<string, unknown>;
 					oneOf?: Array<{ required?: string[]; anyOf?: Array<{ required?: string[] }> }>;
@@ -505,7 +505,7 @@ describe("product wire helpers", () => {
 			"automation",
 		);
 		const schema = (
-			tools[0]?.parameters as {
+			tools[0]!.parameters as {
 				jsonSchema?: { properties?: Record<string, Record<string, unknown>> };
 			}
 		).jsonSchema;
@@ -537,7 +537,7 @@ describe("product wire helpers", () => {
 			"automation",
 		);
 		const schema = (
-			tools[0]?.parameters as {
+			tools[0]!.parameters as {
 				jsonSchema?: {
 					properties?: Record<string, unknown>;
 					required?: string[];
@@ -577,7 +577,7 @@ describe("product wire helpers", () => {
 			"automation",
 		);
 		const schema = (
-			tools[0]?.parameters as {
+			tools[0]!.parameters as {
 				jsonSchema?: {
 					anyOf?: unknown;
 					allOf?: unknown[];
@@ -596,7 +596,7 @@ describe("product wire helpers", () => {
 		const tools = toProductField2Tools([], "parent-chat");
 		expect(tools[0]?.name).toBe("SendToUser");
 		const schema = (
-			tools[0]?.parameters as {
+			tools[0]!.parameters as {
 				jsonSchema?: {
 					properties?: Record<string, { type?: string; enum?: string[] }>;
 					required?: string[];
@@ -646,7 +646,7 @@ describe("product wire helpers", () => {
 		const writes = product.filter(t => t.name === "Write");
 		expect(writes).toHaveLength(1);
 		expect(writes[0]?.description).toBe("write file");
-		const schema = (writes[0]?.parameters as { jsonSchema?: { properties?: Record<string, unknown> } }).jsonSchema;
+		const schema = (writes[0]!.parameters as { jsonSchema?: { properties?: Record<string, unknown> } }).jsonSchema;
 		expect(schema?.properties).toHaveProperty("content");
 		expect(schema?.properties).toHaveProperty("contents");
 		// Original tool schema must stay unmutated for later native-wire reuse.

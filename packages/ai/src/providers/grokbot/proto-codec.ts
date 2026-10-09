@@ -8,9 +8,9 @@
  * Typed exports also re-exported from `./proto.ts`. Prefer importing via
  * `./proto.ts` from outside this folder.
  */
-import { frameConnectPayload } from "@oh-my-pi/pi-utils";
+import { CONNECT_END_STREAM_FLAG, frameConnectMessage } from "../connect-frame";
 
-export const CONNECT_END_STREAM_FLAG = 0b00000010;
+export { CONNECT_END_STREAM_FLAG };
 
 type BytesLike = Buffer | Uint8Array;
 /** Loose protobuf JSON-shaped records used at the encode/decode boundary. */
@@ -25,7 +25,7 @@ type DecodedField = {
 };
 
 export function frameConnectProto(protoBytes: BytesLike, flags = 0): Buffer {
-	return frameConnectPayload(protoBytes, flags);
+	return frameConnectMessage(protoBytes, flags);
 }
 
 const WIRE_VARINT = 0;

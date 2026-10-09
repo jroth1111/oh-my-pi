@@ -293,7 +293,7 @@ export const streamDevin = createProviderStream<"devin-agent">((model, context, 
 	DevinProvider.streamDevin(model, context, options),
 );
 
-/** Stream Grok Bot (InferenceService Stream) through the shared watchdog. */
+/** Stream Grok Bot's native Sand inference through the shared watchdog. */
 export const streamGrokBot = createProviderStream<"grokbot-sand">((model, context, options) =>
 	GrokbotProvider.streamGrokBot(model, context, options),
 );

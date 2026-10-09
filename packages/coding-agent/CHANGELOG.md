@@ -10,6 +10,7 @@
 
 - Explicit native Opus effort-tier selectors retain their selected reasoning level, including the low tier.
 - Added Cursor Auto gateway precedence and routed-model RPC events across generated SDKs ([#10099](https://github.com/can1357/oh-my-pi/pull/10099) by [@jroth1111](https://github.com/jroth1111)).
+- Added Grok Bot login and model selection, including advertised aliases and literal bracketed selectors ([#10175](https://github.com/can1357/oh-my-pi/pull/10175) by [@jroth1111](https://github.com/jroth1111)).
 
 ### Changed
 
