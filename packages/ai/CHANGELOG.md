@@ -12,6 +12,7 @@
 
 ### Fixed
 
+- Fixed Cursor replies losing their first text chunk when it arrives alongside decimal timing metadata ([#11324](https://github.com/can1357/oh-my-pi/pull/11324) by [@jroth1111](https://github.com/jroth1111)).
 - Grok Bot permission diagnostics no longer assume missing attestation, and runtime JWT reuse follows the issuer's rules.
 - Grok Bot accepts caller-provided inference attestation and workload context, and preserves server-native Claude content across effort variants.
 - Grok Bot requests omit the retired variant-string wire flag and support advertised `reasoning_effort` parameters.
