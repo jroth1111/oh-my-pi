@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, spyOn, test, vi } from "bun:test";
 import * as grokbotCatalogAuth from "@oh-my-pi/pi-catalog/discovery/grokbot-auth";
-import { TRUNCATE_LENGTHS } from "@oh-my-pi/pi-tui";
+import { TRUNCATE_LENGTHS } from "@oh-my-pi/pi-tui/render/render-utils";
 import { formatGrokbotStatus } from "../src/utils/grokbot-status";
 
 afterEach(() => vi.restoreAllMocks());

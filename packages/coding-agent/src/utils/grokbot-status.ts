@@ -1,6 +1,6 @@
 import { GROKBOT_BACKEND, grokbotSecretsPath, loadGrokbotConfig } from "@oh-my-pi/pi-catalog/discovery/grokbot-auth";
-import { replaceTabs, TRUNCATE_LENGTHS, truncateToWidth } from "@oh-my-pi/pi-tui/utils";
-import { sanitizeText, shortenPath } from "@oh-my-pi/pi-utils";
+import { replaceTabs, shortenPath, TRUNCATE_LENGTHS, truncateToWidth } from "@oh-my-pi/pi-tui/render/render-utils";
+import { sanitizeText } from "@oh-my-pi/pi-utils";
 
 /** Sanitize a status field: strip controls/ANSI, expand tabs, single-line, width-cap. */
 function formatGrokbotStatusValue(value: string): string {
