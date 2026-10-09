@@ -412,10 +412,6 @@ export const AXES: Readonly<Record<string, AxisDef>> = {
 	"limits-patch": { key: "limitsPatch", set: "catalog", shape: "object" },
 	"long-context-cost": { key: "longContext", set: "catalog", shape: "object" },
 	"prompt-cache": { key: "promptCache", set: "catalog", shape: "object" },
-	/** Preserve discovery-owned effort vocabularies instead of inventing fallback tiers. */
-	"preserve-authored-thinking": { key: "preserveAuthoredThinking", set: "catalog", shape: "scalar" },
-	/** Account-scoped discovery owns capabilities and must not be bundled as shared entitlement. */
-	"credential-scoped-catalog": { key: "credentialScopedCatalog", set: "catalog", shape: "scalar" },
 	/**
 	 * Generator must not clear/re-derive thinking (AvailableModels / seed-owned
 	 * ladders). Consumed by `rebakeModelThinking`.
