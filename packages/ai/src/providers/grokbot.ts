@@ -78,7 +78,6 @@ import {
 } from "./grokbot/proto";
 
 export {
-	formatGrokbotStatus,
 	GROKBOT_BACKEND,
 	getAccessTokenExpiryMs,
 	mergeGrokbotHeaders,

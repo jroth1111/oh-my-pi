@@ -1,7 +1,7 @@
 import { clearSubmittedText } from "./helpers/draft";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { journalJudgmentUsage, resolveJudge, sharedJudgmentCache } from "../judgment";
-import { formatGrokbotStatus } from "@oh-my-pi/pi-ai/providers/grokbot";
+import { formatGrokbotStatus } from "../utils/grokbot-status";
 import type { AgentSession } from "../session/agent-session";
 import type { SessionOAuthAccountList } from "../session/agent-session-types";
 import {
