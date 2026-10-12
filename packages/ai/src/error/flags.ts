@@ -375,10 +375,11 @@ const ERROR_KIND_LABELS: readonly [Flag, string][] = [
 ];
 
 const STATUS_MESSAGE_PATTERNS = [
+	/\bAPI error\s*[:=]?\s*\(?(\d{3})\b/i,
 	/\bstatus(?:_code)?[:=]\s*(\d{3})\b/i,
 	/\bstatus\s+(\d{3})\b/i,
 	/\bHTTP\s+(\d{3})\b/i,
-	/\b(?:error|failed)\s*[:=]?\s*(\d{3})\b/i,
+	/\b(?:error|failed)\s*[:=]?\s*\(?(\d{3})\b/i,
 	/(?:^|\s)(\d{3})\s+(?:[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)/,
 ] as const;
 

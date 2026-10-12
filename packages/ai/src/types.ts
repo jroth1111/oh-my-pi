@@ -1365,6 +1365,8 @@ export interface AssistantMessage {
 	toolCallAbortMessages?: Record<string, string>;
 	/** HTTP status surfaced by the provider when the request failed. Populated by every provider's catch block alongside `errorMessage` so consumers (auth retry, telemetry, UI) can branch without regex-scraping the message. */
 	errorStatus?: number;
+	/** Explicit provider retry directive preserved through finalization and transport. */
+	errorRetryable?: boolean;
 	/** Structured machine-readable error classifier; see `utils/error-id.ts` for bit layout and helpers. */
 	errorId?: number;
 	/**

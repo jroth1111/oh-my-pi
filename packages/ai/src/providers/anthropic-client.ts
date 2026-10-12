@@ -99,13 +99,7 @@ function createAbortError(): Error {
 
 /** `x-should-retry` override, then 408/409/429/5xx. */
 function shouldRetryResponse(response: Response): boolean {
-	const shouldRetryHeader = response.headers.get("x-should-retry");
-	if (shouldRetryHeader === "true") return true;
-	if (shouldRetryHeader === "false") return false;
-	const status = response.status;
-	// Canonical transient set (408/429/5xx) plus 409, which Anthropic's client
-	// also retries.
-	return AIError.isTransientStatus(status) || status === 409;
+	return AIError.shouldRetryAnthropicResponse(response);
 }
 
 /** Server-suggested delay (`retry-after-ms`, then `retry-after` seconds or HTTP date). */

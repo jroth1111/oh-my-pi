@@ -3,6 +3,7 @@ import type { AbortSourceTracker } from "../utils/abort";
 import type { CapturedHttpErrorResponse, RawHttpRequestDump } from "../utils/http-inspector";
 import { classify, classifyMessage, status } from "./flags";
 import { formatMessage } from "./format";
+import { providerRetryDirective } from "./retryable";
 
 /** Context a provider catch block hands to {@link finalize}. */
 export interface FinalizeOptions {
@@ -32,6 +33,8 @@ export interface FinalizeResult {
 	stopReason: "aborted" | "error";
 	/** User-facing message from {@link formatMessage}, or a local abort reason. */
 	message: string;
+	/** Explicit provider retry intent, rather than a status/message inference. */
+	retryable?: boolean;
 }
 
 /**
@@ -71,10 +74,12 @@ export async function finalize(error: unknown, opts: FinalizeOptions = {}): Prom
 		errorStatus: currentStatus,
 	});
 
+	const retryable = aborted ? undefined : providerRetryDirective(error);
 	return {
 		id,
 		status: currentStatus,
 		stopReason: aborted ? "aborted" : "error",
 		message,
+		...(retryable === undefined ? {} : { retryable }),
 	};
 }

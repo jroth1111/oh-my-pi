@@ -642,12 +642,7 @@ function recordProviderHealthFailure(
 }
 
 function classifyAssistantFailure(message: AssistantMessage): GatewayErrorClassification {
-	return classifyGatewayError(
-		Object.assign(
-			new Error(message.errorClassificationMessage ?? message.errorMessage ?? "Upstream request failed"),
-			{ status: message.errorStatus, errorId: message.errorId, kind: "kind" in message ? message.kind : undefined },
-		),
-	);
+	return classifyGatewayError(message);
 }
 
 async function settleGatewayStream(
@@ -894,8 +889,12 @@ async function handleFormatEndpoint(
 			commitGate.state,
 		);
 
-	const classifiedError = (classified: GatewayErrorClassification): Response =>
-		formatError(classified.status, classified.type, classified.message);
+	const classifiedError = (classified: GatewayErrorClassification, message = classified.message): Response => {
+		const response = formatError(classified.status, classified.type, message);
+		if (classified.errorRetryable !== undefined)
+			response.headers.set("x-should-retry", String(classified.errorRetryable));
+		return response;
+	};
 
 	// Per-session provider learning (sticky strict-tools / fast-mode / thinking
 	// fallbacks, Codex transport sessions). Owned by this gateway instance: the
@@ -1213,7 +1212,7 @@ async function handleFormatEndpoint(
 						if (messageHasBillableUsage(message)) {
 							recordProviderHealthFailure(health, model, classified);
 							await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
-							return formatError(classified.status, classified.type, errorMessage);
+							return classifiedError(classified, errorMessage);
 						}
 						if (considerFallback(classified)) {
 							await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
@@ -1222,7 +1221,7 @@ async function handleFormatEndpoint(
 							continue;
 						}
 						await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
-						return formatError(classified.status, classified.type, errorMessage);
+						return classifiedError(classified, errorMessage);
 					}
 					bootOpts.storage.settleQuotaProbeSuccess(requestId);
 					health.recordSuccess(model.provider, model.id);
@@ -1365,7 +1364,7 @@ async function handleFormatEndpoint(
 				await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
 				releaseAttemptLease();
 				bootOpts.storage.releaseTurnReservation(requestId);
-				return formatError(classified.status, classified.type, errorMessage);
+				return classifiedError(classified, errorMessage);
 			}
 			const classified = held.message ? classifyAssistantFailure(held.message) : classifyGatewayError(held.error);
 			logger.warn("auth-gateway stream attempt failed before commit", {
@@ -1539,8 +1538,12 @@ async function handlePiNative(
 			commitGate.state,
 		);
 
-	const classifiedError = (classified: GatewayErrorClassification): Response =>
-		formatError(classified.status, classified.type, classified.message);
+	const classifiedError = (classified: GatewayErrorClassification, message = classified.message): Response => {
+		const response = formatError(classified.status, classified.type, message);
+		if (classified.errorRetryable !== undefined)
+			response.headers.set("x-should-retry", String(classified.errorRetryable));
+		return response;
+	};
 
 	// Per-session provider learning, owned by this gateway instance. The map is
 	// non-serializable, so `parseRequest` cannot accept one from the wire and
@@ -1874,7 +1877,7 @@ async function handlePiNative(
 						if (messageHasBillableUsage(message)) {
 							recordProviderHealthFailure(health, model, classified);
 							await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
-							return formatError(classified.status, classified.type, errorMessage);
+							return classifiedError(classified, errorMessage);
 						}
 						if (considerFallback(classified)) {
 							await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
@@ -1883,7 +1886,7 @@ async function handlePiNative(
 							continue;
 						}
 						await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
-						return formatError(classified.status, classified.type, errorMessage);
+						return classifiedError(classified, errorMessage);
 					}
 					bootOpts.storage.settleQuotaProbeSuccess(requestId);
 					health.recordSuccess(model.provider, model.id);
@@ -2010,7 +2013,7 @@ async function handlePiNative(
 				await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
 				releaseAttemptLease();
 				bootOpts.storage.releaseTurnReservation(requestId);
-				return formatError(classified.status, classified.type, errorMessage);
+				return classifiedError(classified, errorMessage);
 			}
 			const classified = held.message ? classifyAssistantFailure(held.message) : classifyGatewayError(held.error);
 			logger.warn("auth-gateway stream attempt failed before commit", {
