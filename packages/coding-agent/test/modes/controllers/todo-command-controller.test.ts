@@ -5,7 +5,8 @@ import * as path from "node:path";
 import { TodoCommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/todo-command-controller";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { type TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
-import { USER_TODO_EDIT_CUSTOM_TYPE } from "@oh-my-pi/pi-coding-agent/tools";
+import { USER_TODO_EDIT_CUSTOM_TYPE } from "@oh-my-pi/pi-coding-agent/tools/todo";
+import * as editors from "@oh-my-pi/pi-coding-agent/utils/external-editor";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
 
 function createContext(cwd: string, phases: TodoPhase[]): InteractiveModeContext {
@@ -15,7 +16,9 @@ function createContext(cwd: string, phases: TodoPhase[]): InteractiveModeContext
 		},
 		session: {
 			getTodoPhases: () => phases,
-			setTodoPhases: vi.fn(),
+			setTodoPhases: vi.fn((next: TodoPhase[]) => {
+				phases = next;
+			}),
 		},
 		sessionManager: {
 			appendCustomEntry: vi.fn(),
@@ -27,6 +30,7 @@ function createContext(cwd: string, phases: TodoPhase[]): InteractiveModeContext
 		showError: vi.fn(),
 		showStatus: vi.fn(),
 		showWarning: vi.fn(),
+		ui: { stop: vi.fn(), start: vi.fn(), requestRender: vi.fn() },
 	} as unknown as InteractiveModeContext;
 }
 
@@ -34,8 +38,53 @@ describe("TodoCommandController", () => {
 	let tempRoot = "";
 
 	afterEach(async () => {
+		vi.restoreAllMocks();
 		if (tempRoot) await removeWithRetries(tempRoot);
 		tempRoot = "";
+	});
+
+	for (const args of ["drop", "drop Ship it", "drop Work"]) {
+		it(`persists ${args} as a user cancellation`, async () => {
+			const ctx = createContext("/tmp", [{ name: "Work", tasks: [{ content: "Ship it", status: "pending" }] }]);
+			await new TodoCommandController(ctx).handleTodoCommand(args);
+			expect(ctx.session.getTodoPhases()[0].tasks[0]).toMatchObject({ status: "abandoned", droppedBy: "user" });
+		});
+	}
+	for (const args of ["rm Ship it", "rm Work"]) {
+		it(`physically removes the user-selected ${args} rather than abandoning it`, async () => {
+			const ctx = createContext("/tmp", [{ name: "Work", tasks: [{ content: "Ship it", status: "pending" }] }]);
+			await new TodoCommandController(ctx).handleTodoCommand(args);
+			expect(ctx.session.getTodoPhases().flatMap(phase => phase.tasks)).toEqual([]);
+		});
+	}
+	it("does not resurrect a branch snapshot after the live RPC host cleared todos", async () => {
+		const ctx = createContext("/tmp", []);
+		vi.spyOn(ctx.sessionManager, "getBranch").mockReturnValue([
+			{
+				type: "custom",
+				id: "old",
+				parentId: null,
+				timestamp: "2026-10-12T00:00:00Z",
+				customType: USER_TODO_EDIT_CUSTOM_TYPE,
+				data: { phases: [{ name: "Work", tasks: [{ content: "stale", status: "pending" }] }] },
+			},
+		]);
+		await new TodoCommandController(ctx).handleTodoCommand("drop stale");
+		expect(ctx.session.getTodoPhases()).toEqual([]);
+	});
+	it("marks a newly cancelled editor row as user-authored", async () => {
+		const ctx = createContext("/tmp", [{ name: "Work", tasks: [{ content: "Ship it", status: "pending" }] }]);
+		vi.spyOn(editors, "getEditorCommand").mockReturnValue("fixture-editor");
+		vi.spyOn(editors, "openInEditor").mockResolvedValue("# Work\n- [-] Ship it\n");
+		await new TodoCommandController(ctx).handleTodoCommand("edit");
+		expect(ctx.session.getTodoPhases()[0].tasks[0]).toMatchObject({ status: "abandoned", droppedBy: "user" });
+	});
+	it("marks imported cancellation rows as user-authored even over an old model drop", async () => {
+		tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "pi-todo-import-cancel-"));
+		await Bun.write(path.join(tempRoot, "TODO.md"), "# Work\n- [-] Ship it\n");
+		const ctx = createContext(tempRoot, [{ name: "Work", tasks: [{ content: "Ship it", status: "abandoned" }] }]);
+		await new TodoCommandController(ctx).handleTodoCommand("import");
+		expect(ctx.session.getTodoPhases()[0].tasks[0]).toMatchObject({ status: "abandoned", droppedBy: "user" });
 	});
 
 	it("exports the default TODO.md under the active session cwd", async () => {

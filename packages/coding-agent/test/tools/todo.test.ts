@@ -20,7 +20,7 @@ import {
 	todoHudCounts,
 	TodoTool,
 	unescapeTodoMarkdownContent,
-} from "@oh-my-pi/pi-coding-agent/tools";
+} from "@oh-my-pi/pi-coding-agent/tools/todo";
 import {
 	isClosedTodo,
 	selectCollapsedTodos,
@@ -1250,6 +1250,28 @@ describe("abandoned todos in tool summary and compact HUD contracts", () => {
 		const text = result.content.find(part => part.type === "text")?.text ?? "";
 		expect(text).toContain("0/2 done, 2 dropped, 0 open");
 		expect(text).toContain("Remaining items (0 open + 2 dropped):");
+	});
+
+	it("does not ask the model to resume user-cancelled tasks in Remaining", async () => {
+		const tool = new TodoTool(
+			createSession([
+				{
+					name: "Work",
+					tasks: [
+						{ content: "user cancelled", status: "abandoned", droppedBy: "user" },
+						{ content: "model dropped", status: "abandoned" },
+						{ content: "keep working", status: "pending" },
+					],
+				},
+			]),
+		);
+		const result = await tool.execute("view-cancelled", { op: "view" });
+		const block = result.content[0];
+		if (block.type !== "text") throw new Error("expected text summary");
+		const remaining = block.text.split("Active phase")[0];
+		expect(remaining).not.toContain("user cancelled");
+		expect(remaining).toContain("model dropped");
+		expect(remaining).toContain("keep working");
 	});
 
 	it("treats user-dropped todos as HUD-settled for auto-clear, not progress", () => {

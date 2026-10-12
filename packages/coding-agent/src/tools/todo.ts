@@ -935,9 +935,7 @@ function formatSummary(phases: TodoPhase[], errors: string[], readOnly = false):
 	const remainingByPhase = phases
 		.map(phase => ({
 			name: phase.name,
-			tasks: phase.tasks.filter(
-				task => task.status === "pending" || task.status === "in_progress" || task.status === "abandoned",
-			),
+			tasks: phase.tasks.filter(task => !isHudSettledTodo(task) && task.status !== "blocked"),
 		}))
 		.filter(phase => phase.tasks.length > 0);
 	const remainingTasks = remainingByPhase.flatMap(phase => phase.tasks.map(task => ({ ...task, phase: phase.name })));
