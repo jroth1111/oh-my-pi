@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import { gunzipSync } from "node:zlib";
 import { streamDevin } from "@oh-my-pi/pi-ai/providers/devin";
 import type { Context, Model, ToolCall } from "@oh-my-pi/pi-ai/types";
@@ -11,6 +11,9 @@ import {
 	StopReason,
 } from "@oh-my-pi/pi-catalog/discovery/devin-proto";
 import { create, fromBinary, toBinary } from "@oh-my-pi/pi-catalog/discovery/protobuf";
+import * as utils from "@oh-my-pi/pi-utils";
+
+afterEach(() => vi.restoreAllMocks());
 
 const AUTH_PAYLOAD = toBinary(GetUserJwtResponseSchema, create(GetUserJwtResponseSchema, { userJwt: "user-jwt" }));
 
@@ -58,6 +61,21 @@ async function captureRequest(context: Context, tools?: Context["tools"]) {
 }
 
 describe("streamDevin tool calling", () => {
+	it("omits an unknown device field unless the caller explicitly provides it", async () => {
+		const previous = Bun.env.DEVIN_F_FIELD;
+		vi.spyOn(utils, "getInstallId").mockReturnValue("fixture-install-id");
+		try {
+			delete Bun.env.DEVIN_F_FIELD;
+			const omitted = await captureRequest({ messages: [] });
+			expect(omitted.metadata?.f).toBe("");
+			Bun.env.DEVIN_F_FIELD = "opaque-fixture-value";
+			const explicit = await captureRequest({ messages: [] });
+			expect(explicit.metadata?.f).toBe("opaque-fixture-value");
+		} finally {
+			if (previous === undefined) delete Bun.env.DEVIN_F_FIELD;
+			else Bun.env.DEVIN_F_FIELD = previous;
+		}
+	});
 	it("encodes tool definitions in the request", async () => {
 		const request = await captureRequest({ messages: [{ role: "user", content: "run ls", timestamp: 0 }] }, [
 			{
