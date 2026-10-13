@@ -20,7 +20,12 @@ function compiledRoute(): CompiledRoute {
 	});
 	const route = new RouteRegistry(id => (id === "primary" ? targetModel : undefined)).resolve("primary");
 	if (!route) throw new Error("Expected RouteRegistry to compile the primary target");
-	return { ...route, targets: ["primary"], fallbacks: { credential_permanent: ["backup"] } } as CompiledRoute;
+	return {
+		...route,
+		targets: ["primary", "backup"],
+		fallbacks: { credential_permanent: ["backup"] },
+		fallbackByTarget: { primary: { credential_permanent: ["backup"] } },
+	};
 }
 
 function state(
@@ -33,7 +38,6 @@ function state(
 		routeId: "primary",
 		generation: 1,
 		attemptedTargets: new Set(["primary"]),
-		attemptedCredentials: attemptedCredentials ?? new Set(),
 		retryCount: 0,
 		fallbackCount: 0,
 		committed: false,

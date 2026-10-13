@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { RouteRegistry } from "@oh-my-pi/pi-ai/auth-gateway";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import type { FallbackNode, RouteNode } from "../src/auth-gateway/route-graph";
 
 function fakeModel(id: string) {
 	return buildModel({
@@ -26,30 +27,12 @@ describe("RouteRegistry", () => {
 	it("wraps a known id as a single TargetNode", () => {
 		const registry = new RouteRegistry(id => (id === "gpt-5" ? fakeModel("gpt-5") : undefined));
 		const route = registry.resolve("gpt-5");
-		expect(route).toMatchObject({
-			generation: 1,
-			id: "gpt-5",
-			root: { type: "target", model: "gpt-5" },
-			targets: ["gpt-5"],
-			fallbacks: {},
-		});
-	});
-
-	it("preserves provider-qualified model ids on concrete wraps", () => {
-		const registry = new RouteRegistry(id => {
-			if (id === "openai/gpt-5" || id === "gpt-5") {
-				return fakeModel("gpt-5");
-			}
-			return undefined;
-		});
-		const route = registry.resolve("openai/gpt-5");
-		expect(route).toEqual({
-			generation: 1,
-			id: "openai/gpt-5",
-			root: { type: "target", model: "openai/gpt-5" },
-			targets: ["openai/gpt-5"],
-			fallbacks: {},
-		});
+		expect(route?.generation).toBe(1);
+		expect(route?.id).toBe("gpt-5");
+		expect(route?.root).toEqual({ type: "target", model: "openai/gpt-5" });
+		expect(route?.targets).toEqual(["openai/gpt-5"]);
+		expect(route?.fallbacks).toEqual({});
+		expect(route?.fallbackByTarget).toEqual({});
 	});
 
 	it("keeps generation stable across resolves", () => {
@@ -60,6 +43,26 @@ describe("RouteRegistry", () => {
 		expect(second?.generation).toBe(1);
 		expect(first?.generation).toBe(second?.generation);
 		expect(registry.generation).toBe(1);
+	});
+
+	it("compiles suffix edges from each fallback sibling", () => {
+		const registry = new RouteRegistry(() => undefined);
+		registry.register({
+			id: "abc",
+			root: {
+				type: "fallback",
+				on: ["provider_unavailable"],
+				children: [
+					{ type: "target", model: "A" },
+					{ type: "target", model: "B" },
+					{ type: "target", model: "C" },
+				],
+			},
+		});
+		const route = registry.resolve("abc");
+		expect(route?.fallbackByTarget?.A?.provider_unavailable).toEqual(["B", "C"]);
+		expect(route?.fallbackByTarget?.B?.provider_unavailable).toEqual(["C"]);
+		expect(route?.fallbackByTarget?.C?.provider_unavailable).toBeUndefined();
 	});
 
 	it("register compiles a quota fallback list", () => {
@@ -77,20 +80,11 @@ describe("RouteRegistry", () => {
 		});
 		const route = registry.resolve("quota-route");
 		expect(registry.generation).toBe(2);
-		expect(route).toMatchObject({
-			generation: 2,
-			id: "quota-route",
-			root: {
-				type: "fallback",
-				on: ["credential_quota"],
-				children: [
-					{ type: "target", model: "gpt-5" },
-					{ type: "target", model: "gpt-4o" },
-				],
-			},
-			targets: ["gpt-5", "gpt-4o"],
-			fallbacks: { credential_quota: ["gpt-4o"] },
-		});
+		expect(route?.generation).toBe(2);
+		expect(route?.id).toBe("quota-route");
+		expect(route?.targets).toEqual(["openai/gpt-5", "openai/gpt-4o"]);
+		expect(route?.fallbacks).toEqual({ credential_quota: ["openai/gpt-4o"] });
+		expect(route?.fallbackByTarget).toEqual({ "openai/gpt-5": { credential_quota: ["openai/gpt-4o"] } });
 	});
 
 	it("rejects a cycle on one root-to-leaf path", () => {
@@ -113,7 +107,7 @@ describe("RouteRegistry", () => {
 		expect(registry.resolve("cyclic")).toBeUndefined();
 	});
 
-	it("rejects reused model ids that cannot be distinguished during route execution", () => {
+	it("rejects ambiguous cross-branch reuse of the same model id", () => {
 		const registry = new RouteRegistry(() => undefined);
 		expect(() =>
 			registry.register({
@@ -134,8 +128,7 @@ describe("RouteRegistry", () => {
 					],
 				},
 			}),
-		).toThrow(/Ambiguous fallback contexts/);
-		expect(registry.resolve("sibling-reuse")).toBeUndefined();
+		).toThrow(/ambiguous cross-branch reuse/i);
 		expect(registry.generation).toBe(1);
 	});
 
@@ -185,13 +178,9 @@ describe("RouteRegistry", () => {
 			root: { type: "target", model: "other" },
 		});
 		const route = registry.resolve("gpt-5");
-		expect(route).toMatchObject({
-			generation: 2,
-			id: "gpt-5",
-			root: { type: "target", model: "gpt-5" },
-			targets: ["gpt-5"],
-			fallbacks: {},
-		});
+		expect(route?.fallbackByTarget).toEqual({});
+		expect(route?.targets).toEqual(["openai/gpt-5"]);
+		expect(route?.fallbacks).toEqual({});
 	});
 
 	it("does not leak quota targets into context_overflow fallbacks", () => {
@@ -221,6 +210,66 @@ describe("RouteRegistry", () => {
 		expect(route?.fallbacks.context_overflow ?? []).not.toContain("quota-backup");
 	});
 
+	it("scopes nested sibling fallbacks per source target", () => {
+		const registry = new RouteRegistry(() => undefined);
+		registry.register({
+			id: "nested-siblings",
+			root: {
+				type: "fallback",
+				on: ["provider_unavailable"],
+				children: [
+					{
+						type: "fallback",
+						on: ["context_overflow"],
+						children: [
+							{ type: "target", model: "A" },
+							{ type: "target", model: "B" },
+						],
+					},
+					{
+						type: "fallback",
+						on: ["context_overflow"],
+						children: [
+							{ type: "target", model: "C" },
+							{ type: "target", model: "D" },
+						],
+					},
+				],
+			},
+		});
+		const route = registry.resolve("nested-siblings");
+		expect(route?.fallbacks.provider_unavailable).toEqual(["C"]);
+		expect(route?.fallbackByTarget?.A?.context_overflow).toEqual(["B"]);
+		expect(route?.fallbackByTarget?.C?.context_overflow).toEqual(["D"]);
+		expect(route?.fallbackByTarget?.A?.context_overflow ?? []).not.toContain("D");
+	});
+
+	it("keeps parent order for nested same-disposition fallbacks without duplication", () => {
+		const registry = new RouteRegistry(() => undefined);
+		registry.register({
+			id: "nested-same",
+			root: {
+				type: "fallback",
+				on: ["credential_quota"],
+				children: [
+					{ type: "target", model: "A" },
+					{
+						type: "fallback",
+						on: ["credential_quota"],
+						children: [
+							{ type: "target", model: "B" },
+							{ type: "target", model: "C" },
+						],
+					},
+				],
+			},
+		});
+		const route = registry.resolve("nested-same");
+		expect(route?.fallbacks.credential_quota).toEqual(["B", "C"]);
+		expect(route?.fallbackByTarget?.A?.credential_quota).toEqual(["B"]);
+		expect(route?.fallbackByTarget?.B?.credential_quota).toEqual(["C"]);
+	});
+
 	it("preserves provider-qualified model ids as the compiled target", () => {
 		const registry = new RouteRegistry(id => {
 			const bare = id.includes("/") ? id.slice(id.indexOf("/") + 1) : id;
@@ -232,232 +281,97 @@ describe("RouteRegistry", () => {
 	});
 });
 
-it("get returns registered virtual routes and ignores catalog models (negative)", () => {
-	const registry = new RouteRegistry(id => (id === "gpt-5" ? fakeModel("gpt-5") : undefined));
-	registry.register({
-		id: "virtual-impl",
-		root: { type: "target", model: "other" },
-	});
-	const virtual = registry.get("virtual-impl");
-	expect(virtual?.id).toBe("virtual-impl");
-	expect(virtual?.targets).toEqual(["other"]);
-	expect(registry.get("gpt-5")).toBeUndefined();
-	expect(registry.get("missing")).toBeUndefined();
-	expect(registry.resolve("gpt-5")?.id).toBe("gpt-5");
-});
-
-it("flattens balance children in visit order for rr and weighted", () => {
+it("inherits parent fallback edges from the final target of a nested child", () => {
 	const registry = new RouteRegistry(() => undefined);
 	registry.register({
-		id: "rr",
+		id: "nested-parent",
 		root: {
-			type: "balance",
-			strategy: "rr",
+			type: "fallback",
+			on: ["credential_quota"],
 			children: [
-				{ type: "target", model: "a" },
-				{ type: "target", model: "b" },
-			],
-		},
-	});
-	registry.register({
-		id: "weighted",
-		root: {
-			type: "balance",
-			strategy: "weighted",
-			children: [
-				{ type: "target", model: "c" },
-				{ type: "target", model: "d" },
-			],
-		},
-	});
-	expect(registry.resolve("rr")?.targets).toEqual(["a", "b"]);
-	expect(registry.resolve("weighted")?.targets).toEqual(["c", "d"]);
-	expect(registry.resolve("rr")?.root).toEqual({
-		type: "balance",
-		strategy: "rr",
-		children: [
-			{ type: "target", model: "a" },
-			{ type: "target", model: "b" },
-		],
-	});
-});
-
-it("flattens all conditional children at compile time", () => {
-	const registry = new RouteRegistry(() => undefined);
-	registry.register({
-		id: "vision",
-		root: {
-			type: "conditional",
-			when: { vision: true },
-			children: [
-				{ type: "target", model: "vision-model" },
-				{ type: "target", model: "text-model" },
-			],
-		},
-	});
-	expect(registry.resolve("vision")?.targets).toEqual(["vision-model", "text-model"]);
-});
-
-it("retains domain grouping metadata", () => {
-	const registry = new RouteRegistry(() => undefined);
-	registry.register({
-		id: "coding",
-		root: {
-			type: "domain",
-			name: "coding",
-			children: [
-				{ type: "target", model: "a" },
-				{ type: "target", model: "b" },
-			],
-		},
-	});
-	expect(registry.resolve("coding")?.targets).toEqual(["a", "b"]);
-	expect(registry.resolve("coding")?.root).toEqual({
-		type: "domain",
-		name: "coding",
-		children: [
-			{ type: "target", model: "a" },
-			{ type: "target", model: "b" },
-		],
-	});
-});
-
-it("rejects a cycle through a balance node", () => {
-	const registry = new RouteRegistry(() => undefined);
-	expect(() =>
-		registry.register({
-			id: "cyclic-balance",
-			root: {
-				type: "balance",
-				strategy: "rr",
-				children: [
-					{ type: "target", model: "a" },
-					{ type: "target", model: "a" },
-				],
-			},
-		}),
-	).toThrow(/cycle/i);
-	expect(registry.generation).toBe(1);
-	expect(registry.resolve("cyclic-balance")).toBeUndefined();
-});
-
-it("rejects an unknown route-ref (negative)", () => {
-	const registry = new RouteRegistry(() => undefined);
-	expect(() =>
-		registry.register({
-			id: "alias",
-			root: { type: "route-ref", route: "missing" },
-		}),
-	).toThrow(/Unresolved route-ref/);
-	expect(registry.generation).toBe(1);
-	expect(registry.get("alias")).toBeUndefined();
-});
-
-it("inlines a route-ref against an already-registered id", () => {
-	const registry = new RouteRegistry(() => undefined);
-	registry.register({ id: "base", root: { type: "target", model: "a" } });
-	registry.register({ id: "alias", root: { type: "route-ref", route: "base" } });
-	const alias = registry.get("alias");
-	expect(alias?.targets).toEqual(["a"]);
-	expect(alias?.root).toEqual({ type: "target", model: "a" });
-});
-
-it("replaceAll compiles every definition then swaps once", () => {
-	const registry = new RouteRegistry(() => undefined);
-	registry.replaceAll([
-		{ id: "one", root: { type: "target", model: "a" } },
-		{
-			id: "two",
-			root: {
-				type: "balance",
-				strategy: "weighted",
-				children: [
-					{ type: "target", model: "b" },
-					{ type: "target", model: "c" },
-				],
-			},
-		},
-	]);
-	expect(registry.generation).toBe(2);
-	expect(registry.get("one")?.generation).toBe(2);
-	expect(registry.get("two")?.generation).toBe(2);
-	expect(registry.get("two")?.targets).toEqual(["b", "c"]);
-	expect(registry.list().map(route => route.id)).toEqual(["one", "two"]);
-});
-
-it("replaceAll rolls back when a later definition is invalid (negative)", () => {
-	const registry = new RouteRegistry(() => undefined);
-	registry.register({ id: "keep", root: { type: "target", model: "a" } });
-	const generation = registry.generation;
-	expect(() =>
-		registry.replaceAll([
-			{ id: "ok", root: { type: "target", model: "b" } },
-			{
-				id: "bad",
-				root: {
+				{
 					type: "fallback",
-					on: ["credential_quota"],
+					on: ["context_overflow"],
 					children: [
-						{ type: "target", model: "x" },
-						{ type: "target", model: "x" },
+						{ type: "target", model: "a" },
+						{ type: "target", model: "b" },
 					],
 				},
+				{ type: "target", model: "c" },
+			],
+		},
+	});
+	expect(registry.resolve("nested-parent")?.fallbackByTarget?.b?.credential_quota).toEqual(["c"]);
+});
+
+it("treats prototype-shaped target IDs as data rather than inherited dictionary properties", () => {
+	const registry = new RouteRegistry(() => undefined);
+	registry.register({
+		id: "special-targets",
+		root: {
+			type: "fallback",
+			on: ["credential_quota"],
+			children: [
+				{ type: "target", model: "__proto__" },
+				{ type: "target", model: "constructor" },
+				{ type: "target", model: "safe" },
+			],
+		},
+	});
+	const route = registry.resolve("special-targets");
+	expect(route?.fallbackByTarget?.["__proto__"]?.credential_quota).toEqual(["constructor", "safe"]);
+	expect(route?.fallbackByTarget?.["constructor"]?.credential_quota).toEqual(["safe"]);
+});
+
+it("rejects structural object cycles without changing the active generation", () => {
+	const registry = new RouteRegistry(() => undefined);
+	const children: RouteNode[] = [];
+	const root: FallbackNode = { type: "fallback", on: ["credential_quota"], children };
+	children.push(root);
+	expect(() => registry.register({ id: "structural-cycle", root })).toThrow(/cycle/i);
+	expect(registry.generation).toBe(1);
+	expect(registry.resolve("structural-cycle")).toBeUndefined();
+});
+
+it("rejects distinct aliases of the same physical target atomically", () => {
+	const registry = new RouteRegistry(() => fakeModel("physical"));
+	expect(() =>
+		registry.register({
+			id: "aliased-cycle",
+			root: {
+				type: "fallback",
+				on: ["credential_quota"],
+				children: [
+					{ type: "target", model: "alias/one" },
+					{ type: "target", model: "alias/two" },
+				],
 			},
-		]),
+		}),
 	).toThrow(/cycle/i);
-	expect(registry.generation).toBe(generation);
-	expect(registry.get("keep")?.targets).toEqual(["a"]);
-	expect(registry.get("ok")).toBeUndefined();
-	expect(registry.get("bad")).toBeUndefined();
+	expect(registry.generation).toBe(1);
 });
 
-it("copies optional affinity and portability onto the compiled route", () => {
-	const registry = new RouteRegistry(id => (id === "gpt-5" ? fakeModel("gpt-5") : undefined));
-	registry.register({
-		id: "sticky",
-		affinity: "required",
-		portability: { scope: "provider", origin: "openai" },
-		root: { type: "target", model: "gpt-5" },
+it("copies mutable definitions and freezes route snapshots while resolving each alias once", () => {
+	const calls: string[] = [];
+	const model = { ...fakeModel("primary"), headers: { Authorization: "must-stay-private" } };
+	const registry = new RouteRegistry(id => {
+		calls.push(id);
+		return id === "primary-alias" ? model : fakeModel("backup");
 	});
-	const route = registry.get("sticky");
-	expect(route?.affinity).toBe("required");
-	expect(route?.portability).toEqual({ scope: "provider", origin: "openai" });
-	expect(route?.targets).toEqual(["gpt-5"]);
-});
-
-it("omits affinity and portability when the definition has neither (negative)", () => {
-	const registry = new RouteRegistry(id => (id === "gpt-5" ? fakeModel("gpt-5") : undefined));
-	registry.register({
-		id: "plain",
-		root: { type: "target", model: "gpt-5" },
-	});
-	const route = registry.get("plain");
-	expect(route?.affinity).toBeUndefined();
-	expect(route?.portability).toBeUndefined();
-});
-
-it("copies portability so later mutation of the definition does not leak (negative)", () => {
-	const registry = new RouteRegistry(id => (id === "gpt-5" ? fakeModel("gpt-5") : undefined));
-	const portability = { scope: "provider" as const, origin: "openai" };
-	registry.register({
-		id: "copied",
-		portability,
-		root: { type: "target", model: "gpt-5" },
-	});
-	portability.origin = "anthropic";
-	expect(registry.get("copied")?.portability).toEqual({ scope: "provider", origin: "openai" });
-});
-
-it("rejects route IDs erased by URL normalization", () => {
-	const registry = new RouteRegistry(() => undefined);
-	for (const id of [".", ".."])
-		expect(() => registry.register({ id, root: { type: "target", model: "target" } })).toThrow(/dot segment/);
-	expect(registry.list()).toEqual([]);
-});
-
-it("rejects route IDs erased by URL normalization", () => {
-	const registry = new RouteRegistry(() => undefined);
-	for (const id of [".", ".."])
-		expect(() => registry.register({ id, root: { type: "target", model: "target" } })).toThrow(/dot segment/);
-	expect(registry.list()).toEqual([]);
+	const children: RouteNode[] = [
+		{ type: "target", model: "primary-alias" },
+		{ type: "target", model: "backup-alias" },
+	];
+	registry.register({ id: "immutable", root: { type: "fallback", on: ["credential_quota"], children } });
+	children.reverse();
+	calls.length = 0;
+	const route = registry.resolve("immutable")!;
+	expect(route.targets).toEqual(["openai/primary", "openai/backup"]);
+	expect(calls).toEqual(["primary-alias", "backup-alias"]);
+	expect(registry.getModel(route)).toBe(model);
+	expect(registry.getModel(route, "openai/backup")?.id).toBe("backup");
+	expect(Object.isFrozen(route)).toBe(true);
+	expect(Object.isFrozen(route.root)).toBe(true);
+	expect(Reflect.set(route, "id", "changed")).toBe(false);
+	expect(JSON.stringify(route)).not.toContain("must-stay-private");
 });

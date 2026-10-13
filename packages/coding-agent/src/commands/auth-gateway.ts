@@ -23,6 +23,7 @@ export default class AuthGateway extends Command {
 	};
 
 	static flags = {
+		routes: Flags.string({ description: "JSON/JSON5 route-definition file for serve" }),
 		json: Flags.boolean({ description: "Output JSON (token/status/check)" }),
 		bind: Flags.string({ description: "Bind address for `serve` (host:port)", char: "b" }),
 		regenerate: Flags.boolean({ description: "Regenerate the gateway bearer token (token)" }),
@@ -40,6 +41,7 @@ export default class AuthGateway extends Command {
 	};
 
 	static examples = [
+		"# Load virtual routes from a JSON/JSON5 file\n  omp auth-gateway serve --routes=routes.json5",
 		"# Boot the gateway against the configured broker\n  omp auth-gateway serve",
 		'# Serve the same routes as JSON lines on stdin/stdout with your own credentials\n  echo \'{"id":1,"path":"/v1/chat/completions","body":{"model":"@smol","messages":[{"role":"user","content":"hi"}]}}\' | omp auth-gateway stdio',
 		"# Boot on a non-default port\n  omp auth-gateway serve --bind=127.0.0.1:4000",
@@ -66,6 +68,7 @@ export default class AuthGateway extends Command {
 				bind: flags.bind,
 				regenerate: flags.regenerate,
 				noAuth: flags["no-auth"],
+				routes: flags.routes,
 				trustProxyHeaders: flags["trust-proxy-headers"],
 				strict: flags.strict,
 			},

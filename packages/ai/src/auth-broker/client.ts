@@ -30,7 +30,12 @@ import type {
 	UsageResponse,
 	UsageStaleResponse,
 } from "./types";
-import { AUTH_BROKER_CAPABILITIES_HEADER, AUTH_BROKER_CLIENT_CAPABILITIES } from "./types";
+import {
+	AUTH_BROKER_CAPABILITIES_HEADER,
+	AUTH_BROKER_CAPABILITY_BLOCK_PROVENANCE,
+	AUTH_BROKER_CAPABILITY_RETRY_AFTER_BLOCKS,
+	AUTH_BROKER_CLIENT_CAPABILITIES,
+} from "./types";
 import { parseGenerationTag } from "./protocol";
 import {
 	clientUsageReportResponseSchema,
@@ -122,6 +127,8 @@ export class AuthBrokerClient {
 	readonly #timeoutMs: number;
 	readonly #maxRetries: number;
 	readonly #fetch: typeof fetch;
+	#supportsBlockProvenance = false;
+	#supportsRetryAfterBlocks = false;
 
 	constructor(opts: AuthBrokerClientOptions) {
 		this.#baseUrl = opts.url.replace(/\/+$/, "");
@@ -197,6 +204,7 @@ export class AuthBrokerClient {
 		// No timeout: this connection is intentionally long-lived. Caller's signal
 		// is the only cancel path.
 		const response = await this.#fetch(url, { method: "GET", headers, signal: opts.signal });
+		this.#noteServerCapabilities(response);
 		if (response.status === 404) {
 			// Drain the body so the socket can be reused; tiny payload.
 			await response.text().catch(() => {});
@@ -379,31 +387,35 @@ export class AuthBrokerClient {
 		block: CredentialBlockRequest,
 		signal?: AbortSignal,
 	): Promise<CredentialBlockResponse> {
-		const body: CredentialBlockRequest = block;
-		try {
-			return await this.#request<CredentialBlockResponse>("POST", `/v1/credential/${id}/block`, {
-				body,
-				schema: "credentialBlockResponseSchema",
-				signal,
-			});
-		} catch (error) {
-			// Older strict brokers predate this optional hint. Preserve the actual
-			// cooldown while retrying only an explicit unknown-field rejection once.
-			if (
-				!(error instanceof AuthBrokerError) ||
-				error.status !== 400 ||
-				block.retryAfter === undefined ||
-				!/retryAfter/.test(error.body ?? "") ||
-				!/unknown|unexpected|unrecognized|must be removed|not allowed/i.test(error.body ?? "")
-			)
-				throw error;
-			const { retryAfter: _retryAfter, ...legacy } = block;
-			return this.#request<CredentialBlockResponse>("POST", `/v1/credential/${id}/block`, {
-				body: legacy,
-				schema: "credentialBlockResponseSchema",
-				signal,
-			});
-		}
+		// Never send new fields to an older strict broker. Missing provenance
+		// remains conservative on readers: the cooldown applies but is not probeable.
+		const body: CredentialBlockRequest = this.#supportsBlockProvenance
+			? block
+			: {
+					providerKey: block.providerKey,
+					blockScope: block.blockScope,
+					blockedUntilMs: block.blockedUntilMs,
+					...(block.updatedAtMs !== undefined ? { updatedAtMs: block.updatedAtMs } : {}),
+					...(this.#supportsRetryAfterBlocks && block.retryAfter !== undefined
+						? { retryAfter: block.retryAfter }
+						: {}),
+				};
+		return this.#request<CredentialBlockResponse>("POST", `/v1/credential/${id}/block`, {
+			body,
+			schema: "credentialBlockResponseSchema",
+			signal,
+		});
+	}
+
+	#noteServerCapabilities(response: Response): void {
+		const capabilities =
+			response.headers
+				.get(AUTH_BROKER_CAPABILITIES_HEADER)
+				?.split(",")
+				.map(value => value.trim()) ?? [];
+		this.#supportsBlockProvenance = capabilities.includes(AUTH_BROKER_CAPABILITY_BLOCK_PROVENANCE);
+		this.#supportsRetryAfterBlocks =
+			this.#supportsBlockProvenance || capabilities.includes(AUTH_BROKER_CAPABILITY_RETRY_AFTER_BLOCKS);
 	}
 
 	async deleteCredentialBlock(
@@ -499,6 +511,7 @@ export class AuthBrokerClient {
 					body: payload,
 					signal,
 				});
+				this.#noteServerCapabilities(response);
 				if (!response.ok && response.status !== 304) {
 					let text = "";
 					try {

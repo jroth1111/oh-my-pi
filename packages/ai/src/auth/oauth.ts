@@ -10,6 +10,7 @@ import type { AccountPolicies } from "./policy";
 import type { CredentialPool } from "./pool";
 import type { OAuthRefresher } from "./refresh";
 import type { CredentialSelector } from "./select";
+import { resolveCredentialStateScopeKey } from "./sqlite-credential-store";
 import type {
 	AuthAccountPolicy,
 	AuthApiKeyOptions,
@@ -212,10 +213,21 @@ export class OAuthAccounts implements OAuthApi {
 				};
 			}
 			const { credential } = resolved;
+			const credentialIdentity = resolveCredentialStateScopeKey(provider, credential) ?? undefined;
 			return {
 				ok: true,
 				credentialId: selection.credentialId,
 				accessToken: credential.access,
+				resolvedKey: {
+					apiKey: resolved.apiKey,
+					credentialId: selection.credentialId,
+					...(credentialIdentity ? { credentialIdentity } : {}),
+					oauthIdentity: {
+						orgId: credential.orgId,
+						region: credential.region,
+						inferenceRegion: credential.inferenceRegion,
+					},
+				},
 				accountId: credential.accountId,
 				email: credential.email,
 				projectId: credential.projectId,

@@ -51,7 +51,7 @@ describe("AuthStorage api-key login upsert", () => {
 		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-ai-auth-api-key-login-"));
 		dbPath = path.join(tempDir, "agent.db");
 		store = await SqliteAuthCredentialStore.open(dbPath);
-		authStorage = new AuthStorage(store);
+		authStorage = new AuthStorage(store, { usageProviderResolver: () => undefined });
 	});
 
 	afterEach(async () => {

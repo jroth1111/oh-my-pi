@@ -7,7 +7,7 @@
  * Everything credential-shaped lives here so each route drives the same
  * broker-backed rotation policy and the same usage ledger.
  */
-import { $env, extractHttpStatusFromError, logger } from "@oh-my-pi/pi-utils";
+import { extractHttpStatusFromError, logger } from "@oh-my-pi/pi-utils";
 import type { ApiKeyResolver, ResolvedApiKey } from "../auth-retry";
 import type { AuthApiKeyOptions, AuthStorage } from "../auth-storage";
 import * as AIError from "../error";
@@ -16,19 +16,17 @@ import { isUsageLimitOutcome } from "../error/rate-limit";
 import type { Api, FetchImpl, Model, Usage } from "../types";
 import type { ClientUsageIdentity } from "../usage";
 import { extractProviderRetryHint } from "../utils/retry-after";
-import type { AuthGatewayServerOptions } from "./types";
+import type { RouteDefinition, RouteRegistry } from "./route-graph";
 import type { RouteDecisionTraceLog } from "./decision-trace";
 import type { GatewayHooks } from "./hooks";
-import type { RouteDefinition, RouteRegistry } from "./route-graph";
+import type { ProviderHealthBook } from "./provider-health";
+import type { PromptCacheAffinityStore } from "./prompt-cache-store";
+import type { AuthGatewayServerOptions } from "./types";
 
 export type ModelResolver = (modelId: string) => Model<Api> | undefined;
 
 /** What the gateway's routes need, whatever transport carries the requests. */
 export interface AuthGatewayRouteOptions {
-	routeRegistry?: RouteRegistry;
-	routes?: readonly RouteDefinition[];
-	decisionTraces?: RouteDecisionTraceLog;
-	hooks?: GatewayHooks;
 	/** Source of credentials: broker-backed for `serve`, the CLI's own for `stdio`. */
 	storage: AuthStorage;
 	/**
@@ -43,6 +41,21 @@ export interface AuthGatewayRouteOptions {
 	excludeProviders?: ReadonlySet<string>;
 	/** Upstream transport for every provider call; defaults to global `fetch`. Test seam. */
 	fetch?: FetchImpl;
+	/** Compiled-route registry; boot definitions are applied even when the caller supplies this object. */
+	routeRegistry?: RouteRegistry;
+	/** Virtual definitions registered at router boot for HTTP and stdio; an empty list is a no-op. */
+	routes?: readonly RouteDefinition[];
+	/** Explicit opt-in to route mutation; defaults to false. */
+	allowManagement?: boolean;
+	/** Separate administrator capability. Empty/omitted never authorizes writes. */
+	adminBearerTokens?: readonly string[];
+	/** Shared bounded request-decision history, owned by the router when omitted. */
+	decisionTraces?: RouteDecisionTraceLog;
+	/** Awaited lifecycle callbacks for parsed, resolved chat and pi-native requests. */
+	hooks?: GatewayHooks;
+	/** Per-router target circuit; injection keeps ownership and test clocks explicit. */
+	providerHealth?: ProviderHealthBook;
+	promptCacheAffinity?: PromptCacheAffinityStore;
 }
 
 /** The HTTP server's options: the routes' plus its listener and inbound auth. */
@@ -72,17 +85,16 @@ export function normalizeClientSessionKey(clientKey: string | undefined): string
 export function resolveGatewayAccount(
 	storage: AuthStorage,
 	provider: string,
-	sessionId: string,
-	apiKey: string,
+	_sessionId: string,
+	apiKey: ResolvedApiKey | string,
 ): string {
-	const identity = storage.oauth.identity(provider, sessionId);
+	if (typeof apiKey !== "string")
+		return apiKey.credentialIdentity
+			? `oauth:${apiKey.credentialIdentity}`
+			: `key:${Bun.hash(apiKey.apiKey).toString(36)}`;
+	const identity = storage.getCredentialIdentityMatchingApiKey(provider, apiKey);
 	if (identity) {
-		return `oauth:${JSON.stringify([
-			identity.accountId ?? "",
-			identity.email ?? "",
-			identity.projectId ?? "",
-			identity.orgId ?? "",
-		])}`;
+		return `oauth:${identity}`;
 	}
 	return `key:${Bun.hash(apiKey).toString(36)}`;
 }
@@ -94,30 +106,39 @@ export function resolveGatewayAccount(
  * and its OAuth identity together (refreshing through the broker when needed).
  * Keep this selection snapshot intact even if another request replaces the
  * stored token before dispatch. Storage failures map through
- * {@link classifyGatewayError}; a provider without any credential is a 401.
+ * {@link classifyGatewayError}; a provider without a usable credential is
+ * unavailable, not proof that the client's gateway bearer was rejected.
  */
+export interface GatewayCredentialFailure extends GatewayErrorClassification {
+	credentialLookupFailed?: true;
+}
+
 export async function resolveGatewayApiKey(
 	storage: AuthStorage,
 	model: Model<Api>,
 	sessionId: string,
 	signal: AbortSignal,
 	peer: string,
-): Promise<ResolvedApiKey | GatewayErrorClassification> {
+	selection?: Pick<AuthApiKeyOptions, "credentialId" | "requestId">,
+): Promise<ResolvedApiKey | GatewayCredentialFailure> {
 	let apiKey: ResolvedApiKey | undefined;
 	try {
-		apiKey = await storage.keys.getWithCredential(model.provider, sessionId, modelKeyOptions(model, signal));
+		apiKey = await storage.keys.getWithCredential(model.provider, sessionId, {
+			...modelKeyOptions(model, signal),
+			...selection,
+		});
 	} catch (error) {
 		const classified = classifyGatewayError(error);
 		logger.warn("auth-gateway getApiKey threw", { provider: model.provider, peer, error: classified.message });
-		return classified;
+		return { ...classified, credentialLookupFailed: true };
 	}
 	if (apiKey) return apiKey;
 	return {
-		status: 401,
-		type: "authentication_error",
+		status: 503,
+		type: "upstream_error",
 		message: `No credential available for provider ${model.provider}`,
-		owner: "credential",
-		disposition: "credential_permanent",
+		owner: "provider",
+		disposition: "provider_unavailable",
 	};
 }
 
@@ -143,15 +164,6 @@ export async function resolveGatewayApiKey(
  * failure with a fresh credential. Returning `undefined` aborts the retry
  * and surfaces the original error to the caller.
  */
-/**
- * Default cooldown for Cursor credentials that fail with a non-usage-limit
- * auth error in the gateway path. Cursor 401s are often temporary token
- * expiries; a short cooldown lets the OAuth refresh fix the token while a
- * sibling credential handles traffic. Overridable via
- * `CURSOR_GATEWAY_COOLDOWN_MS` env var.
- */
-const CURSOR_GATEWAY_DEFAULT_COOLDOWN_MS = 60_000;
-
 async function refreshGatewayApiKeyAfterAuthError(
 	storage: AuthStorage,
 	model: Model<Api>,
@@ -188,41 +200,6 @@ async function refreshGatewayApiKeyAfterAuthError(
 		if (!switched) return undefined;
 		return storage.keys.getWithCredential(provider, sessionId, modelKeyOptions(model, signal, requestId));
 	}
-	// Cursor auth failures are often temporary token expiries rather than
-	// permanently bad credentials. Apply a short cooldown (default 60s) so the
-	// OAuth refresh has a chance to fix the token while a sibling credential
-	// handles traffic. Only fall through to permanent invalidation when no
-	// sibling is available.
-	if (provider === "cursor") {
-		const rawCooldown = $env.CURSOR_GATEWAY_COOLDOWN_MS;
-		const parsedCooldown = rawCooldown !== undefined && rawCooldown !== "" ? Number(rawCooldown) : undefined;
-		const cooldownMs =
-			parsedCooldown !== undefined && Number.isFinite(parsedCooldown) && parsedCooldown >= 0
-				? parsedCooldown
-				: CURSOR_GATEWAY_DEFAULT_COOLDOWN_MS;
-		const { switched, retryAtMs } = await storage.limits.markReached(provider, sessionId, {
-			retryAfterMs: cooldownMs,
-			providerTimed: true,
-			baseUrl: model.baseUrl,
-			modelId: model.id,
-			apiKey: oldKey,
-			signal,
-		});
-		logger.debug("auth-gateway retrying cursor credential after cooldown block", {
-			format,
-			provider,
-			peer,
-			switched,
-			cooldownMs,
-			retryAtMs,
-			error: message,
-		});
-		if (switched) {
-			return storage.keys.getWithCredential(provider, sessionId, modelKeyOptions(model, signal));
-		}
-		// No sibling available — fall through to invalidation so the next
-		// request re-resolves from scratch after the cooldown expires.
-	}
 	await storage.limits.invalidateMatching(provider, oldKey, { sessionId, signal });
 	logger.debug("auth-gateway retrying provider request after credential invalidation", {
 		format,
@@ -235,12 +212,7 @@ async function refreshGatewayApiKeyAfterAuthError(
 
 /** Model-scoped key options: usage ranking by model id, routing to accounts discovery saw serve it. */
 function modelKeyOptions(model: Model<Api>, signal: AbortSignal, requestId?: string): AuthApiKeyOptions {
-	return {
-		modelId: model.id,
-		accountIds: model.accountAccess && Object.keys(model.accountAccess),
-		signal,
-		requestId,
-	};
+	return { modelId: model.id, accountIds: model.accountAccess && Object.keys(model.accountAccess), signal, requestId };
 }
 
 /**
@@ -259,6 +231,8 @@ function modelKeyOptions(model: Model<Api>, signal: AbortSignal, requestId?: str
  * the bearer they sent. `onResolvedKey` observes every rotation; routes that
  * retain provider session state use it to re-key the account lease, one-shot
  * routes pass `undefined`.
+ * `lastResolved` also retains the complete serving snapshot when a held
+ * pre-output attempt reopens; its initial resolve must not revive an old bearer.
  */
 export function buildGatewayApiKeyResolver(
 	storage: AuthStorage,
@@ -268,25 +242,27 @@ export function buildGatewayApiKeyResolver(
 	requestSignal: AbortSignal,
 	format: string,
 	peer: string,
-	onResolvedKey?: (apiKey: string) => void,
+	onResolvedKey?: (apiKey: ResolvedApiKey) => void,
 	requestId?: string,
 ): ApiKeyResolver {
 	let lastKey = initialKey.apiKey;
+	let lastResolved = initialKey;
 	return async ({ lastChance, error, signal, previousKey }) => {
 		const sig = signal ?? requestSignal;
 		if (error === undefined) {
-			lastKey = initialKey.apiKey;
-			return initialKey;
+			return lastResolved;
 		}
 		if (!lastChance) {
 			const refreshed = await storage.keys.getWithCredential(model.provider, sessionId, {
-				...modelKeyOptions(model, sig),
+				...modelKeyOptions(model, sig, requestId),
 				forceRefresh: true,
 				refreshReason: AIError.status(error) === 401 ? "auth-recovery" : undefined,
-				requestId,
 			});
 			lastKey = refreshed?.apiKey ?? lastKey;
-			if (refreshed) onResolvedKey?.(refreshed.apiKey);
+			if (refreshed) {
+				lastResolved = refreshed;
+				onResolvedKey?.(refreshed);
+			}
 			return refreshed;
 		}
 		const next = await refreshGatewayApiKeyAfterAuthError(
@@ -302,8 +278,40 @@ export function buildGatewayApiKeyResolver(
 			requestId,
 		);
 		lastKey = next?.apiKey ?? lastKey;
-		if (next) onResolvedKey?.(next.apiKey);
+		if (next) {
+			lastResolved = next;
+			onResolvedKey?.(next);
+		}
 		return next;
+	};
+}
+
+/** Recover a continuation's owning row, never switching its account or replaying its response ID on a sibling. */
+export function buildGatewayContinuationApiKeyResolver(
+	storage: AuthStorage,
+	model: Model<Api>,
+	initialKey: ResolvedApiKey,
+	requestSignal: AbortSignal,
+	onResolvedKey?: (apiKey: ResolvedApiKey) => void,
+	requestId?: string,
+): ApiKeyResolver {
+	let current = initialKey;
+	return async ({ lastChance, error, signal }) => {
+		if (error === undefined) return current;
+		if (lastChance || initialKey.credentialId === undefined || initialKey.credentialIdentity === undefined)
+			return undefined;
+		const sig = signal ?? requestSignal;
+		const access = await storage.oauth.accessById(model.provider, initialKey.credentialId, {
+			...modelKeyOptions(model, sig, requestId),
+			forceRefresh: true,
+			recordAffinity: false,
+			refreshReason: AIError.status(error) === 401 ? "auth-recovery" : undefined,
+		});
+		if (!access?.ok || !access.resolvedKey || access.resolvedKey.credentialIdentity !== initialKey.credentialIdentity)
+			return undefined;
+		current = access.resolvedKey;
+		onResolvedKey?.(current);
+		return current;
 	};
 }
 

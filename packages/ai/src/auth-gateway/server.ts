@@ -1,13 +1,12 @@
-import { requestNeeds } from "./capabilities";
 /**
  * omp auth-gateway router and HTTP server.
  *
  * Accepts any provider-format request (OpenAI chat-completions, Anthropic
- * messages, OpenAI Responses, Gemini v1beta) and dispatches through pi-ai's
- * `streamSimple()` — which handles credential injection, anthropic-beta
- * headers, codex websocket transport, and all the per-provider intricacies.
- * The gateway is pure protocol translation: foreign wire → omp Context →
- * pi-ai stream() → omp events → foreign wire.
+ * messages, OpenAI Responses) and dispatches through pi-ai's `streamSimple()`
+ * — which handles credential injection, anthropic-beta headers, codex
+ * websocket transport, and all the per-provider intricacies. The gateway is
+ * pure protocol translation: foreign wire → omp Context → pi-ai stream() →
+ * omp events → foreign wire.
  *
  * Endpoints:
  *   GET  /healthz                          → unauth; ok + version
@@ -15,32 +14,17 @@ import { requestNeeds } from "./capabilities";
  *   GET  /v1/credentials/check             → per-credential auth probe (diagnose 401s in a multi-account pool)
  *   GET  /v1/models                        → list known models from the registry
  *   GET  /v1/routes                        → list registered virtual routes
- *   GET  /v1/routes/:id                    → one registered virtual route
- *   PUT  /v1/routes/:id                    → register or replace a virtual route
- *   DELETE /v1/routes/:id                    → unregister a virtual route
- *   GET  /v1/executions/:id                → redacted decision traces for one execution
- *   GET  /v1/health/routes                 → virtual route ids, generations, and targets (no credentials)
- *   GET  /v1/credentials                   → stored credential ids, providers, and types (no secrets)
- *   POST /v1/credentials/:id/disable       → disable a stored credential
- *   POST /v1/credentials/:id/pin           → pin a session to an OAuth credential
+ *   GET  /v1/routes/:id                    → inspect one registered virtual route
+ *   PUT  /v1/routes/:id                    → register/replace a route (opt-in admin)
+ *   DELETE /v1/routes/:id                  → remove a route (opt-in admin)
  *   POST /v1/chat/completions              → OpenAI chat-completions in/out
- *   POST /v1/grok/chat/completions         → OpenAI chat-completions (xAI alias)
  *   POST /v1/messages                      → Anthropic messages in/out
- *   POST /v1/messages/count_tokens         → Anthropic Messages count_tokens
- *   POST /v1/realtime                      → 501 not available on this gateway
  *   POST /v1/responses                     → OpenAI Responses in/out
- *   POST /backend-api/codex/responses      → OpenAI Responses (Codex alias)
- *   POST /backend-api/responses            → OpenAI Responses (Codex alias)
- *   POST /v1beta/models/generateContent    → Gemini v1beta generateContent
- *   POST /v1beta/models/streamGenerateContent → Gemini v1beta streamGenerateContent
  *   POST /v1/pi/stream                     → native pi-ai stream in/out
  *   POST /v1/systemone | /alpha/decisions  → TypeSafe System One judgments (routes/systemone)
  *   POST /v1/images[/generations|/edits]   → image generation, OpenAI/OpenRouter wire (routes/images)
  *   POST /v1/audio/speech                  → text-to-speech, raw audio out (routes/speech)
  *   POST /v1/audio/transcriptions          → speech-to-text, multipart or JSON base64 in (routes/transcriptions)
- *   POST /v1/embeddings                    → embeddings, OpenAI wire (routes/embeddings)
- *   POST /v1/rerank                        → rerank, OpenRouter wire (routes/rerank)
- *   POST /v1/videos                        → video generation submit/poll/content (routes/video)
  *
  * Chat routes live in this file; every other modality is a `routes/*` module
  * built on the shared plumbing in `dispatch.ts`. {@link createAuthGatewayRouter}
@@ -50,43 +34,31 @@ import { requestNeeds } from "./capabilities";
 
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { type ModelKind, modelKind } from "@oh-my-pi/pi-catalog/types";
-import { extractHttpStatusFromError, isRecord, logger } from "@oh-my-pi/pi-utils";
-import { type AuthStorage, DEFAULT_TURN_RESERVATION_TTL_MS } from "../auth-storage";
-import * as AIError from "../error";
-import type { ResolvedApiKey } from "../auth-retry";
-import { classifyGatewayError, type GatewayErrorClassification } from "../error/gateway";
-import { handleCountTokens } from "../providers/anthropic-count-tokens-server";
+import { isRecord, logger } from "@oh-my-pi/pi-utils";
+import type { AuthStorage } from "../auth-storage";
+import { ValidationError } from "../error";
 import * as anthropicMessages from "../providers/anthropic-messages-server";
 import * as geminiV1beta from "../providers/gemini-v1beta-server";
+import { handleCountTokens } from "../providers/anthropic-count-tokens-server";
 import * as openaiChat from "../providers/openai-chat-server";
 import * as openaiResponses from "../providers/openai-responses-server";
 import * as piNative from "../providers/pi-native-server";
-import { completeSimple, streamSimple } from "../stream";
-import type { Api, AssistantMessage, AssistantMessageEventStream, Context, Model, SimpleStreamOptions } from "../types";
+export * from "./legacy-turn";
+import type { Api, Context, Model, SimpleStreamOptions } from "../types";
 import { deterministicUuid } from "../utils/deterministic-id";
 import { parseBind } from "../utils/parse-bind";
 import { resolvePeer } from "../utils/resolve-peer";
-import { candidateAllowed } from "./affinity";
-import {
-	type RouteDecisionTrace,
-	RouteDecisionTraceLog,
-	type RouteSkipReason,
-	redactedDecisionSummary,
-} from "./decision-trace";
+import { runGatewayChatExecution } from "./chat-execution";
+import { RouteDecisionTraceLog } from "./decision-trace";
 import {
 	type AuthGatewayBootOptions,
 	type AuthGatewayRouteOptions,
-	buildGatewayApiKeyResolver,
 	mirrorRequestAbort,
 	normalizeClientSessionKey,
-	recordGatewayUsage,
-	resolveGatewayAccount,
 } from "./dispatch";
-import { type GatewayHooks, runHook } from "./hooks";
 import {
 	captureRequestHeaders,
 	corsHeaders,
-	gatewayResponseHeaders,
 	hasMisplacedBearer,
 	isAuthorized,
 	json,
@@ -94,11 +66,16 @@ import {
 	resolvePromptCacheKey,
 	withCors,
 } from "./http";
-import { PromptCacheAffinityStore } from "./prompt-cache-store";
+import {
+	type GatewayResponseOwner,
+	type GatewayResponseOwnership,
+	responseEndpointIdentity,
+} from "./response-ownership";
+import { RouteRegistry } from "./route-graph";
 import { ProviderHealthBook } from "./provider-health";
-import { decideAttempt, type ExecutionState } from "./route-conductor";
+import { PromptCacheAffinityStore } from "./prompt-cache-store";
+import { routeRequestFacts } from "./request-facts";
 import { parseRouteDefinition } from "./route-definitions";
-import { type CompiledRoute, type RouteDefinition, RouteRegistry, pickInitialRouteTarget } from "./route-graph";
 import { handleEmbeddings } from "./routes/embeddings";
 import { handleImageEdits, handleImageGenerations } from "./routes/images";
 import { handleRerank } from "./routes/rerank";
@@ -106,14 +83,7 @@ import { handleSpeech } from "./routes/speech";
 import { handleSystemOne } from "./routes/systemone";
 import { handleTranscriptions } from "./routes/transcriptions";
 import { handleVideoContent, handleVideoPoll, handleVideoSubmit } from "./routes/video";
-import { type AuthGatewaySessionStateLease, AuthGatewaySessionStateStore } from "./session-state";
-import {
-	commitGateObservesDownstreamSse,
-	observeSseCommit,
-	StreamCommitGate,
-	type StreamCommitState,
-	observeAssistantCommit,
-} from "./stream-commit-gate";
+import { AuthGatewaySessionStateStore } from "./session-state";
 import type {
 	AuthGatewayParsedRequestOptions,
 	AuthGatewayServerHandle,
@@ -122,29 +92,27 @@ import type {
 } from "./types";
 import { DEFAULT_AUTH_GATEWAY_BIND } from "./types";
 
-// ParsedFormatRequest / ParsedFormatOptions / FormatModule come from ./types.
-// ModelResolver and the base AuthGatewayBootOptions (storage, resolveModel,
-// listModels, fetch) live in ./dispatch, shared with the routes/* modules;
-// the interface below adds the chat-route routing/resilience knobs.
-
-export type { AuthGatewayBootOptions } from "./dispatch";
-
 // `parseBind` lives in ../utils/parse-bind so the gateway and broker can't
 // drift on accepted inputs (e.g. empty hostname, IPv6 brackets).
 
-export const FORMAT_ROUTES: Record<string, { module: FormatModule; label: string }> = {
+interface FormatRoute {
+	module: FormatModule;
+	label: string;
+	pathModel?: string;
+	pathStreaming?: boolean;
+}
+
+const GEMINI_MODEL_PATH = /^\/v1beta\/models\/(.+):(generateContent|streamGenerateContent)$/;
+const FORMAT_ROUTES: Record<string, FormatRoute> = {
 	"/v1/chat/completions": { module: openaiChat, label: "openai-chat" },
 	"/v1/grok/chat/completions": { module: openaiChat, label: "openai-chat" },
 	"/v1/messages": { module: anthropicMessages, label: "anthropic-messages" },
 	"/v1/responses": { module: openaiResponses, label: "openai-responses" },
 	"/backend-api/codex/responses": { module: openaiResponses, label: "openai-responses" },
 	"/backend-api/responses": { module: openaiResponses, label: "openai-responses" },
-	"/v1beta/models/generateContent": { module: geminiV1beta, label: "gemini-v1beta" },
-	"/v1beta/models/streamGenerateContent": { module: geminiV1beta, label: "gemini-v1beta" },
+	"/v1beta/models/generateContent": { module: geminiV1beta, label: "gemini-v1beta", pathStreaming: false },
+	"/v1beta/models/streamGenerateContent": { module: geminiV1beta, label: "gemini-v1beta", pathStreaming: true },
 };
-
-/** Gemini puts the model id on the path: `/v1beta/models/{model}:generateContent`. */
-const GEMINI_MODEL_PATH = /^\/v1beta\/models\/([^/]+):(?:generateContent|streamGenerateContent)$/;
 
 // (passthrough fast-path removed — it bypassed pi-ai provider logic, in
 // particular the Anthropic Claude-Code OAuth system-prompt prefix injection.
@@ -207,8 +175,12 @@ function serializeTools(context: Context): string | undefined {
 }
 
 function buildStreamOptions(parsed: ParsedFormatRequest, api: Api, signal: AbortSignal): SimpleStreamOptions {
-	const opts: SimpleStreamOptions = { signal, cursorExternalToolExecutor: true };
+	const opts: SimpleStreamOptions = {
+		signal,
+		cursorExternalToolExecutor: true,
+	};
 	const { options } = parsed;
+	applyParsedGatewayOptions(opts, options);
 	// Codex backend rejects every sampling control with
 	// `Unsupported parameter: …` (#3117). Strip the full set for that one
 	// provider; everything else is harmless to forward — `streamSimple` ignores
@@ -248,26 +220,6 @@ function buildStreamOptions(parsed: ParsedFormatRequest, api: Api, signal: Abort
 	if (options.serviceTier !== undefined) opts.serviceTier = options.serviceTier;
 	if (options.cacheRetention !== undefined) opts.cacheRetention = options.cacheRetention;
 	if (options.include !== undefined) opts.include = options.include;
-	// Cursor-specific gateway options
-	if (options.cursorAutoMode !== undefined) opts.cursorAutoMode = options.cursorAutoMode;
-	if (options.cursorToolPassthrough !== undefined) opts.cursorToolPassthrough = options.cursorToolPassthrough;
-	// Upstream renamed the provider-side flag; bridge the gateway spelling so
-	// the passthrough header keeps working end to end.
-	if (options.cursorToolPassthrough !== undefined && opts.cursorExternalToolExecutor === undefined) {
-		opts.cursorExternalToolExecutor = options.cursorToolPassthrough;
-	}
-	// Cursor control headers without a first-class `SimpleStreamOptions` slot
-	// are threaded through `opts.headers` so Cursor's backend receives them
-	// (cursor.ts spreads caller headers into the upstream request).
-	if (options.cursorExcludeTools !== undefined) {
-		opts.headers = { ...opts.headers, "x-cursor-agent-exclude-tools": options.cursorExcludeTools };
-	}
-	if (options.cursorLocalCliMode) {
-		opts.headers = { ...opts.headers, "local-cli-mode": "true" };
-	}
-	if (options.cursorDevExperimentOverrides !== undefined) {
-		opts.headers = { ...opts.headers, "x-dev-experiment-overrides": options.cursorDevExperimentOverrides };
-	}
 	// Client-supplied `prompt_cache_key` wins; otherwise derive a stable
 	// key from the model + system + tools so prefix caching engages on
 	// Codex-class backends across turns of the same logical conversation.
@@ -276,7 +228,10 @@ function buildStreamOptions(parsed: ParsedFormatRequest, api: Api, signal: Abort
 	opts.promptCacheKey = promptCacheKey;
 	opts.sessionId = promptCacheKey;
 	if (options.thinkingBudgets) {
-		opts.thinkingBudgets = { ...opts.thinkingBudgets, ...options.thinkingBudgets };
+		opts.thinkingBudgets = {
+			...opts.thinkingBudgets,
+			...options.thinkingBudgets,
+		};
 	}
 	if (options.explicitThinkingBudgetTokens !== undefined) {
 		// Mirror Rust's `resolve_thinking_budget`: explicit budget pins onto
@@ -313,10 +268,47 @@ export function applyParsedGatewayOptions(opts: SimpleStreamOptions, options: Au
 	if (options.logitBias !== undefined) opts.logitBias = options.logitBias;
 	if (options.user !== undefined) opts.user = options.user;
 	if (options.responseFormat !== undefined) opts.responseFormat = options.responseFormat;
+	if (options.responseMimeType !== undefined) opts.responseMimeType = options.responseMimeType;
+	if (options.responseSchema !== undefined) opts.responseSchema = options.responseSchema;
+	if (options.responseJsonSchema !== undefined) opts.responseJsonSchema = options.responseJsonSchema;
 }
 
 function clientClosedResponse(route: { module: FormatModule }): Response {
 	return route.module.formatError(499, "request_aborted", "client closed request");
+}
+
+function continuationRejection(
+	storage: AuthStorage,
+	model: Model<Api>,
+	previousId: string | undefined,
+	owner: Readonly<GatewayResponseOwner> | undefined,
+	headers?: Record<string, string>,
+): string | undefined {
+	if (!previousId) return undefined;
+	if (owner?.credentialId !== undefined) {
+		const explicit = storage.sessions.explicitCredentialId(model.provider, owner.sessionId);
+		if (explicit !== undefined && explicit !== owner.credentialId)
+			return "previous_response_id belongs to another account";
+	}
+	if (model.api !== "openai-responses" && model.api !== "azure-openai-responses") {
+		return "previous_response_id requires an OpenAI or Azure Responses upstream";
+	}
+	if (
+		owner &&
+		(owner.target !== `${model.provider}/${model.id}` ||
+			owner.api !== model.api ||
+			owner.endpoint !== responseEndpointIdentity(model, headers))
+	) {
+		return "previous_response_id belongs to another upstream deployment";
+	}
+	if (
+		!owner &&
+		storage.peekApiKeyOverrides(model.provider) === undefined &&
+		storage.credentials.list(model.provider).length > 1
+	) {
+		return "Unknown previous_response_id is ambiguous across multiple stored credentials";
+	}
+	return undefined;
 }
 
 /** Route that serves each non-chat catalog kind the gateway advertises. */
@@ -331,369 +323,51 @@ const KIND_ROUTES: Partial<Record<ModelKind, string>> = {
 };
 
 /** Chat routes cannot drive a non-chat model; name the route that does, or `undefined` for chat models. */
-function chatRouteRejection(model: Model<Api>): string | undefined {
+function chatRouteRejection(model: Model<Api>, context: Context): string | undefined {
 	const kind = modelKind(model);
 	const route = KIND_ROUTES[kind];
-	return route && `Model ${model.provider}/${model.id} is a ${kind} model; use ${route}`;
-}
-
-type FormatErrorFn = (status: number, type: string, message: string) => Response;
-
-type AttemptPrep =
-	| { type: "key"; apiKey: ResolvedApiKey }
-	| { type: "retry" }
-	| { type: "respond"; response: Response };
-
-/**
- * Resolve the first viable dispatch target for a compiled route. A primary
- * that is absent from the catalog (stale route, credential-scoped model
- * change) is marked attempted and the conductor advances to the next sibling
- * instead of 404ing a route with usable fallbacks.
- */
-function resolveFirstAvailableTarget(
-	compiled: CompiledRoute,
-	resolveModel: (id: string) => Model<Api> | undefined,
-	firstTarget: string,
-	attemptedTargets: Set<string>,
-): { target: string; model: Model<Api> | undefined } {
-	let current = firstTarget;
-	for (;;) {
-		const model = resolveModel(current);
-		if (model !== undefined) return { target: current, model };
-		attemptedTargets.add(current);
-		const next = decideAttempt({
-			route: compiled,
-			state: conductorExecutionState(compiled, attemptedTargets, new Set<number>(), 0, 0, current, false, "probing"),
-			commitState: "probing",
-		});
-		if (next.type !== "dispatch") return { target: current, model: undefined };
-		current = next.targetModelId;
-	}
-}
-
-function unknownModelResponse(formatError: FormatErrorFn, modelId: string): Response {
-	return formatError(404, "invalid_request_error", `Unknown model: ${modelId}`);
-}
-
-function conductorExecutionState(
-	compiled: CompiledRoute,
-	attemptedTargets: ReadonlySet<string>,
-	attemptedCredentials: ReadonlySet<number>,
-	retryCount: number,
-	fallbackCount: number,
-	currentTarget: string,
-	siblingsExhausted: boolean,
-	commitState: StreamCommitState,
-): ExecutionState {
-	return {
-		routeId: compiled.id,
-		generation: compiled.generation,
-		attemptedTargets,
-		attemptedCredentials,
-		retryCount,
-		fallbackCount,
-		committed: commitState !== "probing",
-		currentTarget,
-		siblingsExhausted,
-	};
-}
-
-function dispatchTargetId(
-	compiled: CompiledRoute,
-	state: ExecutionState,
-	commitState: StreamCommitState,
-	cacheStore: PromptCacheAffinityStore,
-	fingerprint: string,
-	initialTarget: string,
-): string | undefined {
-	const hit = cacheStore.lookup(fingerprint);
-	const action = decideAttempt({
-		route: compiled,
-		state,
-		commitState,
-		preferredTargetId: hit?.model ?? initialTarget,
-	});
-	return action.type === "dispatch" ? action.targetModelId : undefined;
-}
-
-function messageHasBillableUsage(message: AssistantMessage): boolean {
-	const usage = message.usage;
-	return usage.input + usage.output + usage.cacheRead + usage.cacheWrite > 0;
-}
-
-const STREAM_PRELUDE_MAX_BYTES = 4 * 1024 * 1024;
-
-type SseRead = { done: boolean; value?: Uint8Array };
-
-type HeldSse =
-	| { type: "forward"; stream: ReadableStream<Uint8Array> }
-	| { type: "failed"; error: unknown; message?: AssistantMessage };
-
-function attachCommitGateSseObserver(
-	streamOpts: SimpleStreamOptions,
-	commitGate: StreamCommitGate,
-	routeLabel: string,
-): void {
-	const previousSse = streamOpts.onSseEvent;
-	streamOpts.onSseEvent = (event, sseModel) => {
-		const raw = event.raw;
-		let bytes = 0;
-		for (const line of raw) bytes += line.length + 1;
-		commitGate.classifyAndObserve(event.event ?? "", bytes);
-		// Consume the observation: a terminal event that ended the stream
-		// before commit is the pre-commit-failure signal the failover loop
-		// routes on; surface it instead of discarding the gate state.
-		if (commitGate.state === "terminated") {
-			logger.debug("auth-gateway stream terminated pre-commit", {
-				route: routeLabel,
-				event: event.event ?? "",
-			});
-		}
-		previousSse?.(event, sseModel);
-	};
-}
-
-function concatSsePrelude(
-	prelude: Uint8Array[],
-	reader: { read(): Promise<SseRead>; cancel(reason?: unknown): Promise<void> },
-	pending: Promise<SseRead> | undefined,
-): ReadableStream<Uint8Array> {
-	let pendingRead = pending;
-	let preludeOffset = 0;
-	return new ReadableStream({
-		async pull(controller) {
-			if (preludeOffset < prelude.length) {
-				const chunk = prelude[preludeOffset];
-				preludeOffset += 1;
-				if (chunk) controller.enqueue(chunk);
-				return;
-			}
-			const read = pendingRead ?? reader.read();
-			pendingRead = undefined;
-			const { done, value } = await read;
-			if (done || value === undefined) {
-				controller.close();
-				return;
-			}
-			controller.enqueue(value);
-		},
-		cancel(reason) {
-			return reader.cancel(reason);
-		},
-	});
-}
-
-/**
- * Buffer encoded SSE until the commit gate leaves probing or the upstream
- * attempt settles. Callers must not return HTTP 200 while still probing.
- */
-async function holdSseUntilCommit(
-	sseStream: ReadableStream<Uint8Array>,
-	gate: StreamCommitGate,
-	settled: Promise<AssistantMessage>,
-): Promise<HeldSse> {
-	const reader = sseStream.getReader();
-	const prelude: Uint8Array[] = [];
-	let preludeBytes = 0;
-	let pendingRead: Promise<SseRead> | undefined;
-	let settleOutcome: { ok: true; message: AssistantMessage } | { ok: false; error: unknown } | undefined;
-	const watchSettled = settled.then(
-		message => {
-			settleOutcome = { ok: true, message };
-		},
-		(error: unknown) => {
-			settleOutcome = { ok: false, error };
-		},
-	);
-
-	const forward = (): HeldSse => ({
-		type: "forward",
-		stream: concatSsePrelude(prelude, reader, pendingRead),
-	});
-
-	const failedFromOutcome = (): HeldSse => {
-		if (!settleOutcome) return { type: "failed", error: "Upstream request failed" };
-		if (!settleOutcome.ok) return { type: "failed", error: settleOutcome.error };
-		return {
-			type: "failed",
-			error: settleOutcome.message.errorMessage ?? settleOutcome.message,
-			message: settleOutcome.message,
-		};
-	};
-
-	try {
-		while (true) {
-			if (gate.state === "committed") return forward();
-			if (preludeBytes >= STREAM_PRELUDE_MAX_BYTES) {
-				if (gate.state === "probing") gate.classifyAndObserve("", STREAM_PRELUDE_MAX_BYTES);
-				return forward();
-			}
-			if (settleOutcome) {
-				if (!settleOutcome.ok) return failedFromOutcome();
-				const reason = settleOutcome.message.stopReason;
-				if (reason === "error" || reason === "aborted") return failedFromOutcome();
-				return forward();
-			}
-			pendingRead ??= reader.read();
-			const raced = await Promise.race([
-				pendingRead.then(r => ({ source: "read" as const, r })),
-				watchSettled.then(() => ({ source: "settled" as const })),
-			]);
-			if (raced.source === "settled") continue;
-			pendingRead = undefined;
-			const { done, value } = raced.r;
-			if (done || value === undefined) {
-				await watchSettled;
-				continue;
-			}
-			prelude.push(value);
-			preludeBytes += value.byteLength;
-		}
-	} catch (error) {
-		return { type: "failed", error };
-	}
+	if (route) return `Model ${model.provider}/${model.id} is a ${kind} model; use ${route}`;
+	if (
+		model.api !== "openai-responses" &&
+		model.api !== "azure-openai-responses" &&
+		model.api !== "openai-codex-responses" &&
+		context.messages.some(message => {
+			if (
+				message.role === "toolResult" &&
+				message.content.some(
+					block => block.type === "image" && block.providerFile?.provider === "openai" && block.providerFile.id,
+				)
+			)
+				return true;
+			const payload = "providerPayload" in message ? message.providerPayload : undefined;
+			if (payload?.type !== "openaiResponsesHistory") return false;
+			return payload.items.some(
+				item =>
+					isRecord(item) &&
+					Array.isArray(item.content) &&
+					item.content.some(
+						part =>
+							isRecord(part) &&
+							(part.type === "input_image" || part.type === "input_file") &&
+							typeof part.file_id === "string" &&
+							part.file_id.length > 0,
+					),
+			);
+		})
+	)
+		return "OpenAI file references require a Responses-compatible upstream model";
+	return undefined;
 }
 
 // (handlePassthrough removed — see note above.)
 
-/** Wrap an SSE body so turn reservations (and settled probes) release on close, cancel, or read failure. */
-export function renewReservationUntilSettled<T>(
-	storage: AuthStorage,
-	requestId: string,
-	pending: Promise<T>,
-): Promise<T> {
-	const timer = setInterval(() => storage.renewTurnReservation(requestId), DEFAULT_TURN_RESERVATION_TTL_MS / 2);
-	timer.unref?.();
-	return pending.finally(() => clearInterval(timer));
-}
-
-export function releaseTurnOnStreamEnd(
-	stream: ReadableStream<Uint8Array>,
-	storage: AuthStorage,
-	requestId: string,
-	commitGate?: StreamCommitGate,
-	settled?: Promise<unknown>,
-): ReadableStream<Uint8Array> {
-	const reader = stream.getReader();
-	let released = false;
-	const release = (): void => {
-		if (released) return;
-		released = true;
-		if (commitGate?.sawSuccessfulTerminal) {
-			storage.settleQuotaProbeSuccess(requestId);
-		}
-		storage.releaseTurnReservation(requestId);
-	};
-	return new ReadableStream({
-		async pull(controller) {
-			try {
-				const { done, value } = await reader.read();
-				if (done) {
-					await settled;
-					release();
-					controller.close();
-					return;
-				}
-				controller.enqueue(value);
-			} catch (error) {
-				release();
-				controller.error(error);
-			}
-		},
-		cancel(reason) {
-			release();
-			return reader.cancel(reason);
-		},
-	});
-}
-
-function targetSkipReason(
-	compiled: CompiledRoute,
-	health: ProviderHealthBook,
-	targetId: string,
-	model: Model<Api>,
-): RouteSkipReason | undefined {
-	if (
-		compiled.portability !== undefined &&
-		!candidateAllowed(
-			compiled.portability,
-			{ id: targetId, provider: model.provider, deployment: model.baseUrl },
-			compiled.affinity ?? "preferred",
-		)
-	) {
-		return "state_incompatible";
-	}
-	if (health.state(model.provider, model.id) === "open") {
-		return "circuit_open";
-	}
-	return undefined;
-}
-
-function recordProviderHealthFailure(
-	health: ProviderHealthBook,
-	model: Model<Api>,
-	classified: GatewayErrorClassification,
-): void {
-	if (classified.owner === "provider") {
-		health.recordFailure(model.provider, model.id, "provider");
-	} else if (classified.owner === "model") {
-		health.recordFailure(model.provider, model.id, "model");
-	}
-}
-
-function classifyAssistantFailure(message: AssistantMessage): GatewayErrorClassification {
-	return classifyGatewayError(message);
-}
-
-async function settleGatewayStream(
-	settled: Promise<AssistantMessage>,
-	boot: AuthGatewayRouteOptions,
-	health: ProviderHealthBook,
-	model: Model<Api>,
-	requestId: string,
-	onSuccess: () => void,
-	afterOutcome: (ok: boolean) => Promise<void>,
-): Promise<void> {
-	let ok = false;
-	try {
-		const message = await settled;
-		ok = message.stopReason !== "error" && message.stopReason !== "aborted";
-		if (ok) {
-			boot.storage.settleQuotaProbeSuccess(requestId);
-			health.recordSuccess(model.provider, model.id);
-			onSuccess();
-		} else recordProviderHealthFailure(health, model, classifyAssistantFailure(message));
-	} catch (error) {
-		recordProviderHealthFailure(health, model, classifyGatewayError(error));
-	}
-	await afterOutcome(ok);
-}
-
-function rememberPromptCacheHit(
-	cacheStore: PromptCacheAffinityStore,
-	fingerprint: string,
-	model: Model<Api>,
-	sessionId: string,
-	routeTarget?: string,
-): void {
-	cacheStore.remember(fingerprint, {
-		provider: model.provider,
-		// Prefer the route target id so affinity keys match qualified `provider/id` routes.
-		model: routeTarget ?? model.id,
-		accountId: sessionId,
-	});
-}
-
 async function handleFormatEndpoint(
-	route: { module: FormatModule; label: string },
+	route: FormatRoute,
 	bootOpts: AuthGatewayRouteOptions,
 	req: Request,
 	peer: string,
-	health: ProviderHealthBook,
-	cacheStore: PromptCacheAffinityStore,
 	sessionStates: AuthGatewaySessionStateStore,
-	pathModel?: string,
-	geminiStream?: boolean,
+	responseOwners: GatewayResponseOwnership,
 ): Promise<Response> {
 	const startedAt = performance.now();
 	const requestId = crypto.randomUUID();
@@ -708,20 +382,16 @@ async function handleFormatEndpoint(
 		return route.module.formatError(400, "invalid_request_error", `Invalid JSON body: ${String(error)}`);
 	}
 	if (controller.signal.aborted) return clientClosedResponse(route);
-
-	// Gemini model-bearing paths carry the model id when the body omits `model`.
-	if (pathModel && isRecord(body) && (typeof body.model !== "string" || body.model.length === 0)) {
-		body = { ...body, model: pathModel };
-	}
-	// Native Gemini selects streaming via the endpoint, not a body flag: the
-	// module default (stream) must not turn generateContent into SSE.
-	if (
-		route.label === "gemini-v1beta" &&
-		geminiStream !== undefined &&
-		isRecord(body) &&
-		typeof body.stream !== "boolean"
-	) {
-		body = { ...body, stream: geminiStream };
+	if (route.pathModel !== undefined || route.pathStreaming !== undefined) {
+		if (!isRecord(body))
+			return route.module.formatError(400, "invalid_request_error", "Request body must be an object");
+		if (route.pathModel !== undefined && body.model !== undefined && body.model !== route.pathModel)
+			return route.module.formatError(400, "invalid_request_error", "Body model must match the model-action path");
+		body = {
+			...body,
+			...(route.pathModel !== undefined ? { model: route.pathModel } : {}),
+			stream: route.pathStreaming,
+		};
 	}
 
 	// All three supported wire formats put the model id on a top-level `model`
@@ -734,45 +404,7 @@ async function handleFormatEndpoint(
 	if (!modelId) {
 		return route.module.formatError(400, "invalid_request_error", "Missing top-level `model` field");
 	}
-	// Kind-gate the requested model id early. Virtual routes below may retarget
-	// to a sibling model, but a request naming a non-chat model outright is a
-	// client error regardless of routing; an unresolvable id still falls through
-	// to the route registry (a virtual route may serve it).
-	const requestedModel = bootOpts.resolveModel(modelId);
-	const requestedKindRejection = requestedModel ? chatRouteRejection(requestedModel) : undefined;
-	if (requestedKindRejection) {
-		return route.module.formatError(400, "invalid_request_error", requestedKindRejection);
-	}
-	let parsed: ParsedFormatRequest;
-	try {
-		parsed = route.module.parseRequest(body, req.headers);
-	} catch (error) {
-		if (controller.signal.aborted) return clientClosedResponse(route);
-		const message = error instanceof Error ? error.message : String(error);
-		return route.module.formatError(400, "invalid_request_error", message);
-	}
-	const compiled = (bootOpts.routeRegistry ?? new RouteRegistry(bootOpts.resolveModel)).resolve(modelId, {
-		vision: requestNeeds(parsed.context).vision === true,
-	});
-	if (!compiled) {
-		return unknownModelResponse(route.module.formatError, modelId);
-	}
-	const firstTarget = bootOpts.routeRegistry?.pickInitialTarget(compiled) ?? pickInitialRouteTarget(compiled);
-	if (firstTarget === undefined) {
-		return unknownModelResponse(route.module.formatError, modelId);
-	}
-	const attemptedTargets = new Set<string>();
-	const initial = resolveFirstAvailableTarget(
-		compiled,
-		id => bootOpts.resolveModel(id),
-		firstTarget,
-		attemptedTargets,
-	);
-	let currentTarget = initial.target;
-	if (initial.model === undefined) {
-		return unknownModelResponse(route.module.formatError, currentTarget);
-	}
-	let model: Model<Api> = initial.model;
+	const registry = bootOpts.routeRegistry ?? new RouteRegistry(bootOpts.resolveModel);
 	const client = resolveClientIdentity(req.headers);
 
 	// Parse the wire-format request BEFORE resolving the credential so we
@@ -781,12 +413,16 @@ async function handleFormatEndpoint(
 	// this id; without it `getApiKey` would re-roundrobin every request
 	// and `markUsageLimitReached` would no-op (it can only mark the
 	// credential it last handed out to that session).
-
-	await runHook(bootOpts.hooks?.beforeRequest, {
-		requestId,
-		routeId: compiled.id,
-		generation: compiled.generation,
-	});
+	let parsed: ParsedFormatRequest;
+	try {
+		parsed = route.module.parseRequest(body, req.headers);
+	} catch (error) {
+		if (controller.signal.aborted) return clientClosedResponse(route);
+		const message = error instanceof Error ? error.message : String(error);
+		return route.module.formatError(400, "invalid_request_error", message);
+	}
+	const compiled = registry.resolve(modelId, routeRequestFacts(parsed.context));
+	if (!compiled) return route.module.formatError(404, "invalid_request_error", `Unknown model: ${modelId}`);
 	// Merge gateway-captured passthrough headers under the parser's own
 	// captures. Parsers that set `options.headers` themselves win (they may
 	// have stripped or normalized values); the gateway's allow-list fills in
@@ -794,637 +430,74 @@ async function handleFormatEndpoint(
 	{
 		const captured = captureRequestHeaders(req.headers);
 		parsed.options.headers = { ...captured, ...parsed.options.headers };
-		// Cursor-specific control headers: parse into typed options so they
-		// flow through `buildStreamOptions` into `SimpleStreamOptions`.
-		if (captured["x-cursor-auto-mode"] === "true") {
-			parsed.options.cursorAutoMode = true;
-		}
-		if (captured["x-cursor-tool-passthrough"] === "true") {
-			parsed.options.cursorToolPassthrough = true;
-		}
-		if (captured["x-cursor-agent-exclude-tools"]) {
+		if (captured["x-cursor-auto-mode"] === "true") parsed.options.cursorAutoMode = true;
+		if (captured["x-cursor-tool-passthrough"] === "true") parsed.options.cursorToolPassthrough = true;
+		if (captured["x-cursor-agent-exclude-tools"])
 			parsed.options.cursorExcludeTools = captured["x-cursor-agent-exclude-tools"];
-		}
-		if (captured["local-cli-mode"] === "true") {
-			parsed.options.cursorLocalCliMode = true;
-		}
-		if (captured["x-dev-experiment-overrides"]) {
+		if (captured["local-cli-mode"] === "true") parsed.options.cursorLocalCliMode = true;
+		if (captured["x-dev-experiment-overrides"])
 			parsed.options.cursorDevExperimentOverrides = captured["x-dev-experiment-overrides"];
-		}
 	}
 	if (controller.signal.aborted) return clientClosedResponse(route);
 
-	const requestHasOpenAIImageFileReferences = parsed.context.messages.some(message => {
-		if (
-			message.role === "toolResult" &&
-			message.content.some(
-				block => block.type === "image" && block.providerFile?.provider === "openai" && block.providerFile.id,
-			)
-		)
-			return true;
-		const payload = "providerPayload" in message ? message.providerPayload : undefined;
-		if (payload?.type !== "openaiResponsesHistory") return false;
-		return payload.items.some(
-			item =>
-				Array.isArray(item.content) &&
-				item.content.some(
-					(part: unknown) =>
-						isRecord(part) &&
-						(part.type === "input_image" || part.type === "input_file") &&
-						typeof part.file_id === "string" &&
-						part.file_id.length > 0,
-				),
-		);
-	});
-	const openaiImageFileCompatError = (candidate: Model<Api>): Response | undefined => {
-		if (route.label !== "openai-responses" || !requestHasOpenAIImageFileReferences) return undefined;
-		const supportsOpenAIImageFileReferences =
-			candidate.api === "openai-responses" ||
-			candidate.api === "azure-openai-responses" ||
-			candidate.api === "openai-codex-responses";
-		if (supportsOpenAIImageFileReferences) return undefined;
-		return route.module.formatError(
-			400,
-			"invalid_request_error",
-			"OpenAI file IDs require a Responses-compatible upstream model",
-		);
-	};
-
 	// Sticky credential id: honour the client's `prompt_cache_key` when
-	// supplied (so external session ids align), otherwise derive from
+	// supplied (so external session ids align), then a remembered
+	// `previous_response_id` chain key (a continuation's context holds only the
+	// new input, so content derivation cannot reproduce the original session —
+	// without this lookup each hop can land on a different account whose store
+	// does not know the referenced response), otherwise derive from
 	// modelId + system + tools + first message. Mirrored into
 	// streamOpts.sessionId / promptCacheKey by `buildStreamOptions`.
 	const clientKey = normalizeClientSessionKey(parsed.options.promptCacheKey);
+	const previousId = parsed.options.previousResponseId;
+	const previousOwner = previousId ? responseOwners.get(previousId) : undefined;
 	const toolsJson = clientKey === undefined ? serializeTools(parsed.context) : undefined;
-	const sessionId = clientKey ?? deriveSessionId(parsed.modelId, parsed.context, toolsJson);
-	parsed.options.promptCacheKey ??= sessionId;
-
-	const traces = bootOpts.decisionTraces ?? new RouteDecisionTraceLog();
-	const commitGate = new StreamCommitGate();
-	const formatError: FormatErrorFn = (status, type, message) => {
-		const response = route.module.formatError(status, type, message);
-		response.headers.set("x-request-id", requestId);
-		response.headers.set("request-id", requestId);
-		return response;
-	};
-	const fingerprint = resolvePromptCacheKey(body, req.headers) ?? sessionId;
-	const attemptedCredentials = new Set<number>();
-	let retryCount = 0;
-	let fallbackCount = 0;
-	let pendingFallback: string | undefined;
-	let lastClassified: GatewayErrorClassification | undefined;
-	let siblingsExhausted = false;
-	// One dispatch + one sibling-credential retry per target, plus a spare iteration.
-	const attemptCap = compiled.targets.length * 2 + 1;
-
-	const stateNow = (): ExecutionState =>
-		conductorExecutionState(
-			compiled,
-			attemptedTargets,
-			attemptedCredentials,
-			retryCount,
-			fallbackCount,
-			currentTarget,
-			siblingsExhausted,
-			commitGate.state,
-		);
-
-	const classifiedError = (classified: GatewayErrorClassification, message = classified.message): Response => {
-		const response = formatError(classified.status, classified.type, message);
-		if (classified.errorRetryable !== undefined)
-			response.headers.set("x-should-retry", String(classified.errorRetryable));
-		return response;
-	};
-
-	// Per-session provider learning (sticky strict-tools / fast-mode / thinking
-	// fallbacks, Codex transport sessions). Owned by this gateway instance: the
-	// map is non-serializable, so no client can supply it and every turn would
-	// otherwise re-learn each lesson from a fresh upstream rejection.
-	//
-	// The lease binds the {clientKey, model} pair, so it is acquired per
-	// attempt — a target fallback re-acquires against the new model — and MUST
-	// be released on every exit path: non-streaming settles release it inline,
-	// streaming hands it to the event stream's result.
-	let attemptLease: AuthGatewaySessionStateLease | undefined;
-	const acquireAttemptLease = (apiKey: string): AuthGatewaySessionStateLease => {
-		attemptLease?.release();
-		attemptLease = sessionStates.acquire({
-			clientKey,
-			model,
-			context: parsed.context,
-			toolsJson,
-			account: resolveGatewayAccount(bootOpts.storage, model.provider, sessionId, apiKey),
-		});
-		return attemptLease;
-	};
-	const releaseAttemptLease = () => {
-		attemptLease?.release();
-		attemptLease = undefined;
-	};
-
-	const considerFallback = (classified: GatewayErrorClassification): boolean => {
-		lastClassified = classified;
-		recordProviderHealthFailure(health, model, classified);
-		if (parsed.options.previousResponseId) return false;
-		if (commitGate.state === "committed") return false;
-		const action = decideAttempt({
-			route: compiled,
-			state: conductorExecutionState(
-				compiled,
-				attemptedTargets,
-				attemptedCredentials,
-				retryCount,
-				fallbackCount,
-				currentTarget,
-				siblingsExhausted,
-				"probing",
-			),
-			classification: classified,
-			commitState: "probing",
-		});
-		if (action.type === "sibling_credential") {
-			siblingsExhausted = true;
-			pendingFallback = currentTarget;
-			retryCount += 1;
-			return true;
-		}
-		if (action.type === "fallback_target") {
-			// New target gets a fresh sibling-credential budget.
-			siblingsExhausted = false;
-			pendingFallback = action.targetModelId;
-			fallbackCount += 1;
-			retryCount += 1;
-			return true;
-		}
-		return false;
-	};
-
-	const bindCurrentTarget = (targetId: string): Response | undefined | "skipped" => {
-		currentTarget = targetId;
-		const resolved = bootOpts.resolveModel(currentTarget);
-		if (!resolved) {
-			attemptedTargets.add(currentTarget);
-			return "skipped";
-		}
-		model = resolved;
-		const kindRejection = chatRouteRejection(model);
-		if (kindRejection) return formatError(400, "invalid_request_error", kindRejection);
-		const incompatible = openaiImageFileCompatError(model);
-		if (incompatible) return incompatible;
-		const skip = targetSkipReason(compiled, health, currentTarget, model);
-		if (skip !== undefined) {
-			attemptedTargets.add(currentTarget);
-			const skipped = traces.record({
-				requestId,
-				routeId: compiled.id,
-				generation: compiled.generation,
-				selectedTarget: currentTarget,
-				disposition: "skipped",
-				reason: skip,
-			});
-			logger.debug("auth-gateway route decision", redactedDecisionSummary(skipped));
-			return "skipped";
-		}
-		attemptedTargets.add(currentTarget);
-		return undefined;
-	};
-
-	const pickTarget = (): Response | undefined => {
-		for (;;) {
-			let targetId: string | undefined;
-			if (pendingFallback !== undefined) {
-				targetId = pendingFallback;
-				pendingFallback = undefined;
-			} else {
-				targetId = parsed.options.previousResponseId
-					? attemptedTargets.has(currentTarget)
-						? undefined
-						: currentTarget
-					: dispatchTargetId(compiled, stateNow(), commitGate.state, cacheStore, fingerprint, currentTarget);
-			}
-			if (targetId === undefined) {
-				if (lastClassified) return classifiedError(lastClassified);
-				if (attemptedTargets.size > 0) {
-					return formatError(502, "upstream_error", "Upstream request failed");
-				}
-				return unknownModelResponse(formatError, modelId);
-			}
-			const bound = bindCurrentTarget(targetId);
-			if (bound === "skipped") {
-				if (lastClassified) {
-					const action = decideAttempt({
-						route: compiled,
-						state: conductorExecutionState(
-							compiled,
-							attemptedTargets,
-							attemptedCredentials,
-							retryCount,
-							fallbackCount,
-							currentTarget,
-							siblingsExhausted,
-							"probing",
-						),
-						classification: lastClassified,
-						commitState: "probing",
-					});
-					if (action.type === "fallback_target") {
-						siblingsExhausted = false;
-						pendingFallback = action.targetModelId;
-					}
-				}
-				continue;
-			}
-			return bound;
-		}
-	};
-
-	const resolveCredential = async (): Promise<AttemptPrep> => {
-		let apiKey: ResolvedApiKey | undefined;
-		if (
-			parsed.options.previousResponseId &&
-			!bootOpts.storage.peekApiKeyOverrides(model.provider) &&
-			bootOpts.storage.listStoredCredentials(model.provider).length > 1
-		) {
-			return {
-				type: "respond",
-				response: formatError(
-					400,
-					"invalid_request_error",
-					"Response continuation requires an unambiguous credential",
-				),
-			};
-		}
-		try {
-			apiKey = await bootOpts.storage.keys.getWithCredential(model.provider, sessionId, {
-				modelId: model.id,
-				signal: controller.signal,
-				requestId,
-			});
-		} catch (error) {
-			if (controller.signal.aborted) return { type: "respond", response: clientClosedResponse(route) };
-			const classified = classifyGatewayError(error);
-			logger.warn("auth-gateway getApiKey threw", { provider: model.provider, peer, error: classified.message });
-			traces.record({
-				requestId,
-				routeId: compiled.id,
-				generation: compiled.generation,
-				selectedTarget: currentTarget,
-				disposition: "skipped",
-				reason: "credential_lookup_failed",
-			});
-			if (considerFallback(classified)) return { type: "retry" };
-			return { type: "respond", response: classifiedError(classified) };
-		}
-		if (controller.signal.aborted) return { type: "respond", response: clientClosedResponse(route) };
-		if (!apiKey) {
-			const skipped = traces.record({
-				requestId,
-				routeId: compiled.id,
-				generation: compiled.generation,
-				selectedTarget: currentTarget,
-				disposition: "skipped",
-				reason: "credential_unavailable",
-			});
-			logger.debug("auth-gateway route decision", redactedDecisionSummary(skipped));
-			const unconfigured = !bootOpts.storage.hasAuth(model.provider);
-			const classified: GatewayErrorClassification = {
-				status: unconfigured ? 503 : 401,
-				type: unconfigured ? "upstream_error" : "authentication_error",
-				message: `No credential available for provider ${model.provider}`,
-				owner: unconfigured ? "provider" : "credential",
-				disposition: unconfigured ? "provider_unavailable" : "credential_transient",
-			};
-			// No key means there is no sibling credential to rotate — skip straight
-			// to disposition-compiled credential_transient fallbacks when present.
-			siblingsExhausted = true;
-			if (considerFallback(classified)) return { type: "retry" };
-			return {
-				type: "respond",
-				response: formatError(classified.status, classified.type, classified.message),
-			};
-		}
-		const activeCredentialId = bootOpts.storage
-			.listOAuthAccounts(model.provider, sessionId)
-			.find(account => account.active)?.credentialId;
-		if (activeCredentialId !== undefined) attemptedCredentials.add(activeCredentialId);
-		const dispatched = traces.record({
-			requestId,
-			routeId: compiled.id,
-			generation: compiled.generation,
-			selectedTarget: currentTarget,
-			disposition: "dispatched",
-		});
-		logger.debug("auth-gateway route decision", redactedDecisionSummary(dispatched));
-		return { type: "key", apiKey };
-	};
-
-	const buildAttemptStreamOpts = (apiKey: ResolvedApiKey): SimpleStreamOptions => {
-		const streamOpts = buildStreamOptions(parsed, model.api, controller.signal);
-		if (bootOpts.fetch) streamOpts.fetch = bootOpts.fetch;
-		const lease = acquireAttemptLease(apiKey.apiKey);
-		streamOpts.providerSessionState = lease.states;
-		streamOpts.apiKey = parsed.options.previousResponseId
-			? () => apiKey
-			: buildGatewayApiKeyResolver(
-					bootOpts.storage,
-					model,
-					sessionId,
-					apiKey,
-					controller.signal,
-					route.label,
-					peer,
-					resolvedKey =>
-						lease.updateAccount(resolveGatewayAccount(bootOpts.storage, model.provider, sessionId, resolvedKey)),
-					requestId,
-				);
-		// openai-responses wraps the downstream body in observeSseCommit. Feeding
-		// onSseEvent as well double-counts prelude bytes and trips the 4 MiB cap at ~2 MiB.
-		if (!commitGateObservesDownstreamSse(route.label)) {
-			attachCommitGateSseObserver(streamOpts, commitGate, route.label);
-		}
-		return streamOpts;
-	};
-
-	const attemptHookCtx = () => ({
+	const sessionId =
+		previousOwner?.sessionId ?? clientKey ?? deriveSessionId(parsed.modelId, parsed.context, toolsJson);
+	parsed.options.promptCacheKey = sessionId;
+	return runGatewayChatExecution({
+		boot: bootOpts,
+		registry,
+		compiled,
 		requestId,
-		routeId: compiled.id,
-		target: currentTarget,
-		generation: compiled.generation,
+		controller,
+		peer,
+		startedAt,
+		label: route.label,
+		requestedModelId: parsed.modelId,
+		context: parsed.context,
+		stream: parsed.stream,
+		client,
+		sessionId,
+		clientKey,
+		toolsJson,
+		previousId,
+		previousOwner,
+		requestHeaders: parsed.options.headers,
+		cacheFingerprint: Bun.SHA256.hash(
+			JSON.stringify([compiled.id, resolvePromptCacheKey(body, req.headers) ?? sessionId]),
+			"hex",
+		),
+		requiresNativeSurface:
+			parsed.options.responseMimeType !== undefined ||
+			parsed.options.responseSchema !== undefined ||
+			parsed.options.responseJsonSchema !== undefined
+				? "gemini-v1beta"
+				: undefined,
+		sessionStates,
+		responseOwners,
+		validateModel: target => {
+			const rejection =
+				chatRouteRejection(target, parsed.context) ??
+				continuationRejection(bootOpts.storage, target, previousId, previousOwner, parsed.options.headers);
+			if (rejection) return rejection;
+			return undefined;
+		},
+		buildOptions: (target, signal) => buildStreamOptions(parsed, target.api, signal),
+		encodeResponse: message => route.module.encodeResponse(message, parsed.modelId, parsed.options),
+		encodeStream: (events, control) => route.module.encodeStream(events, parsed.modelId, parsed.options, control),
+		formatError: route.module.formatError,
 	});
-
-	if (!parsed.stream) {
-		try {
-			for (let attempt = 0; attempt < attemptCap; attempt++) {
-				if (attempt > 0) commitGate.reset();
-				if (controller.signal.aborted) return clientClosedResponse(route);
-				const picked = pickTarget();
-				if (picked) return picked;
-				const cred = await resolveCredential();
-				if (cred.type === "retry") {
-					await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
-					releaseAttemptLease();
-					bootOpts.storage.releaseTurnReservation(requestId);
-					continue;
-				}
-				if (cred.type === "respond") {
-					await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
-					return cred.response;
-				}
-				try {
-					await runHook(bootOpts.hooks?.beforeAttempt, attemptHookCtx());
-				} catch (error) {
-					releaseAttemptLease();
-					bootOpts.storage.releaseTurnReservation(requestId);
-					throw error;
-				}
-				const streamOpts = buildAttemptStreamOpts(cred.apiKey);
-				logger.info("auth-gateway request", {
-					requestId,
-					format: route.label,
-					model: parsed.modelId,
-					resolvedProvider: model.provider,
-					resolvedModel: model.id,
-					stream: parsed.stream,
-					peer,
-				});
-				try {
-					const message = await renewReservationUntilSettled(
-						bootOpts.storage,
-						requestId,
-						completeSimple(model, parsed.context, streamOpts),
-					);
-					recordGatewayUsage(bootOpts.storage, model, client, message.usage, message.timestamp || undefined);
-					if (message.stopReason === "aborted" || message.stopReason === "error") {
-						const errorMessage =
-							message.errorMessage ??
-							(message.stopReason === "aborted" ? "Request was aborted" : "Upstream request failed");
-						logger.warn("auth-gateway non-streaming failed", {
-							format: route.label,
-							reason: message.stopReason,
-							error: errorMessage,
-							peer,
-						});
-						if (message.stopReason === "aborted") {
-							await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
-							return formatError(499, "request_aborted", errorMessage);
-						}
-						const classified = classifyAssistantFailure(message);
-						if (messageHasBillableUsage(message)) {
-							recordProviderHealthFailure(health, model, classified);
-							await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
-							return classifiedError(classified, errorMessage);
-						}
-						if (considerFallback(classified)) {
-							await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
-							releaseAttemptLease();
-							bootOpts.storage.releaseTurnReservation(requestId);
-							continue;
-						}
-						await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
-						return classifiedError(classified, errorMessage);
-					}
-					bootOpts.storage.settleQuotaProbeSuccess(requestId);
-					health.recordSuccess(model.provider, model.id);
-					rememberPromptCacheHit(cacheStore, fingerprint, model, sessionId, currentTarget);
-					await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: true });
-					await runHook(bootOpts.hooks?.afterRequest, {
-						requestId,
-						routeId: compiled.id,
-						generation: compiled.generation,
-						ok: true,
-					});
-					return json(
-						200,
-						route.module.encodeResponse(message, parsed.modelId),
-						gatewayResponseHeaders(model, { requestId, message, startedAt }),
-					);
-				} catch (error) {
-					if (controller.signal.aborted) return clientClosedResponse(route);
-					const classified = classifyGatewayError(error);
-					logger.warn("auth-gateway non-streaming aborted", {
-						format: route.label,
-						error: classified.message,
-						peer,
-					});
-					if (considerFallback(classified)) {
-						await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
-						releaseAttemptLease();
-						bootOpts.storage.releaseTurnReservation(requestId);
-						continue;
-					}
-					await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
-					return classifiedError(classified);
-				} finally {
-					// Every non-streaming outcome — answered, upstream error,
-					// thrown, client gone — is done with the provider state here.
-					releaseAttemptLease();
-				}
-			}
-			if (lastClassified) return classifiedError(lastClassified);
-			return formatError(502, "upstream_error", "Upstream request failed");
-		} finally {
-			releaseAttemptLease();
-			bootOpts.storage.releaseTurnReservation(requestId);
-		}
-	}
-
-	for (let attempt = 0; attempt < attemptCap; attempt++) {
-		if (attempt > 0) commitGate.reset();
-		if (controller.signal.aborted) {
-			releaseAttemptLease();
-			bootOpts.storage.releaseTurnReservation(requestId);
-			return clientClosedResponse(route);
-		}
-		const picked = pickTarget();
-		if (picked) {
-			releaseAttemptLease();
-			bootOpts.storage.releaseTurnReservation(requestId);
-			return picked;
-		}
-		const cred = await resolveCredential();
-		if (cred.type === "retry") {
-			await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
-			releaseAttemptLease();
-			bootOpts.storage.releaseTurnReservation(requestId);
-			continue;
-		}
-		if (cred.type === "respond") {
-			await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
-			releaseAttemptLease();
-			bootOpts.storage.releaseTurnReservation(requestId);
-			return cred.response;
-		}
-		try {
-			await runHook(bootOpts.hooks?.beforeAttempt, attemptHookCtx());
-		} catch (error) {
-			releaseAttemptLease();
-			bootOpts.storage.releaseTurnReservation(requestId);
-			throw error;
-		}
-		const streamOpts = buildAttemptStreamOpts(cred.apiKey);
-		logger.info("auth-gateway request", {
-			requestId,
-			format: route.label,
-			model: parsed.modelId,
-			resolvedProvider: model.provider,
-			resolvedModel: model.id,
-			stream: parsed.stream,
-			peer,
-		});
-		let events: AssistantMessageEventStream;
-		try {
-			events = streamSimple(model, parsed.context, streamOpts);
-		} catch (error) {
-			const classified = classifyGatewayError(error);
-			logger.warn("auth-gateway streamSimple threw", { format: route.label, error: classified.message, peer });
-			if (considerFallback(classified)) {
-				await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
-				releaseAttemptLease();
-				bootOpts.storage.releaseTurnReservation(requestId);
-				continue;
-			}
-			await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
-			releaseAttemptLease();
-			bootOpts.storage.releaseTurnReservation(requestId);
-			return classifiedError(classified);
-		}
-		if (!commitGateObservesDownstreamSse(route.label)) observeAssistantCommit(events, commitGate);
-		const settled = renewReservationUntilSettled(bootOpts.storage, requestId, events.result());
-		void settled
-			.then(message =>
-				recordGatewayUsage(bootOpts.storage, model, client, message.usage, message.timestamp || undefined),
-			)
-			.catch(() => {})
-			.finally(() => releaseAttemptLease());
-		let sseStream = route.module.encodeStream(events, parsed.modelId, parsed.options, {
-			signal: controller.signal,
-			onCancel: reason => {
-				if (!controller.signal.aborted) {
-					controller.abort(reason instanceof Error ? reason : new Error("client closed request"));
-				}
-			},
-		});
-		if (route.label === "openai-responses") {
-			sseStream = observeSseCommit(sseStream, commitGate);
-		}
-		const held = await holdSseUntilCommit(sseStream, commitGate, settled);
-		if (held.type === "failed") {
-			if (held.message && messageHasBillableUsage(held.message)) {
-				const errorMessage =
-					held.message.errorMessage ??
-					(held.message.stopReason === "aborted" ? "Request was aborted" : "Upstream request failed");
-				if (held.message.stopReason === "aborted") {
-					await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
-					releaseAttemptLease();
-					bootOpts.storage.releaseTurnReservation(requestId);
-					return formatError(499, "request_aborted", errorMessage);
-				}
-				const classified = classifyAssistantFailure(held.message);
-				recordProviderHealthFailure(health, model, classified);
-				await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
-				releaseAttemptLease();
-				bootOpts.storage.releaseTurnReservation(requestId);
-				return classifiedError(classified, errorMessage);
-			}
-			const classified = held.message ? classifyAssistantFailure(held.message) : classifyGatewayError(held.error);
-			logger.warn("auth-gateway stream attempt failed before commit", {
-				format: route.label,
-				error: classified.message,
-				peer,
-			});
-			if (considerFallback(classified)) {
-				await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
-				releaseAttemptLease();
-				bootOpts.storage.releaseTurnReservation(requestId);
-				continue;
-			}
-			await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
-			releaseAttemptLease();
-			bootOpts.storage.releaseTurnReservation(requestId);
-			return classifiedError(classified);
-		}
-		if (controller.signal.aborted) {
-			await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
-			releaseAttemptLease();
-			bootOpts.storage.releaseTurnReservation(requestId);
-			return clientClosedResponse(route);
-		}
-		const outcome = settleGatewayStream(
-			settled,
-			bootOpts,
-			health,
-			model,
-			requestId,
-			() => rememberPromptCacheHit(cacheStore, fingerprint, model, sessionId, currentTarget),
-			async ok => {
-				await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok });
-				await runHook(bootOpts.hooks?.afterRequest, {
-					requestId,
-					routeId: compiled.id,
-					generation: compiled.generation,
-					ok,
-				});
-			},
-		);
-		sseStream = releaseTurnOnStreamEnd(held.stream, bootOpts.storage, requestId, undefined, outcome);
-		return new Response(sseStream, {
-			status: 200,
-			headers: {
-				...gatewayResponseHeaders(model, { requestId }),
-				"Content-Type": "text/event-stream; charset=utf-8",
-				"Cache-Control": "no-cache",
-				Connection: "keep-alive",
-				// Disable proxy buffering (nginx and ingress controllers honor this).
-				// Without it the SSE stream gets held until the buffer flushes, which
-				// stalls the long-thinking-budget calls we exist to support.
-				"X-Accel-Buffering": "no",
-			},
-		});
-	}
-	releaseAttemptLease();
-	bootOpts.storage.releaseTurnReservation(requestId);
-	if (lastClassified) return classifiedError(lastClassified);
-	return formatError(502, "upstream_error", "Upstream request failed");
 }
 
 /**
@@ -1445,9 +518,8 @@ async function handlePiNative(
 	bootOpts: AuthGatewayRouteOptions,
 	req: Request,
 	peer: string,
-	health: ProviderHealthBook,
-	cacheStore: PromptCacheAffinityStore,
 	sessionStates: AuthGatewaySessionStateStore,
+	responseOwners: GatewayResponseOwnership,
 ): Promise<Response> {
 	const startedAt = performance.now();
 	const requestId = crypto.randomUUID();
@@ -1473,604 +545,86 @@ async function handlePiNative(
 		return piNative.formatError(400, "invalid_request_error", message);
 	}
 
-	const compiled = (bootOpts.routeRegistry ?? new RouteRegistry(bootOpts.resolveModel)).resolve(parsed.modelId, {
-		vision: requestNeeds(parsed.context).vision === true,
-	});
+	const registry = bootOpts.routeRegistry ?? new RouteRegistry(bootOpts.resolveModel);
+	const compiled = registry.resolve(parsed.modelId, routeRequestFacts(parsed.context));
 	if (!compiled) {
-		return unknownModelResponse(piNative.formatError, parsed.modelId);
+		return piNative.formatError(404, "invalid_request_error", `Unknown model: ${parsed.modelId}`);
 	}
-	const firstTarget = bootOpts.routeRegistry?.pickInitialTarget(compiled) ?? pickInitialRouteTarget(compiled);
-	if (firstTarget === undefined) {
-		return unknownModelResponse(piNative.formatError, parsed.modelId);
-	}
-	const attemptedTargets = new Set<string>();
-	const initial = resolveFirstAvailableTarget(
-		compiled,
-		id => bootOpts.resolveModel(id),
-		firstTarget,
-		attemptedTargets,
-	);
-	let currentTarget = initial.target;
-	if (initial.model === undefined) {
-		return unknownModelResponse(piNative.formatError, currentTarget);
-	}
-	let model: Model<Api> = initial.model;
-	const kindRejection = chatRouteRejection(model);
-	if (kindRejection) return piNative.formatError(400, "invalid_request_error", kindRejection);
 	const client = resolveClientIdentity(req.headers);
-	// Pi-native already parsed `streamOpts.sessionId` (when set by the
-	// client); fall back to the derived key so credential-stickiness lines
+	// Prefer the native cache identity, then the explicit session/header
+	// identity; fall back to the derived key so credential-stickiness lines
 	// up with cache-prefix stickiness — same identity used for both means
 	// the next turn of this conversation reuses the same credential until
 	// it hits a usage cap, then markUsageLimitReached can hand off.
-	const clientKey = normalizeClientSessionKey(parsed.options.sessionId);
+	const clientKey =
+		normalizeClientSessionKey(parsed.options.promptCacheKey) ??
+		normalizeClientSessionKey(parsed.options.sessionId) ??
+		normalizeClientSessionKey(resolvePromptCacheKey(body, req.headers));
+	const previousId = parsed.options.previousResponseId;
+	const previousOwner = previousId ? responseOwners.get(previousId) : undefined;
+	const requestHeaders = {
+		...captureRequestHeaders(req.headers),
+		...parsed.options.headers,
+	};
 	const toolsJson = clientKey === undefined ? serializeTools(parsed.context) : undefined;
-	const sessionId = clientKey ?? deriveSessionId(parsed.modelId, parsed.context, toolsJson);
-	parsed.options.sessionId ??= sessionId;
-
-	const traces = bootOpts.decisionTraces ?? new RouteDecisionTraceLog();
-	const commitGate = new StreamCommitGate();
-	const formatError: FormatErrorFn = (status, type, message) => {
-		const response = piNative.formatError(status, type, message);
-		response.headers.set("x-request-id", requestId);
-		response.headers.set("request-id", requestId);
-		return response;
-	};
-	const fingerprint = resolvePromptCacheKey(body, req.headers) ?? sessionId;
-	const attemptedCredentials = new Set<number>();
-	let retryCount = 0;
-	let fallbackCount = 0;
-	let pendingFallback: string | undefined;
-	let lastClassified: GatewayErrorClassification | undefined;
-	let siblingsExhausted = false;
-	// One dispatch + one sibling-credential retry per target, plus a spare iteration.
-	const attemptCap = compiled.targets.length * 2 + 1;
-
-	const stateNow = (): ExecutionState =>
-		conductorExecutionState(
-			compiled,
-			attemptedTargets,
-			attemptedCredentials,
-			retryCount,
-			fallbackCount,
-			currentTarget,
-			siblingsExhausted,
-			commitGate.state,
-		);
-
-	const classifiedError = (classified: GatewayErrorClassification, message = classified.message): Response => {
-		const response = formatError(classified.status, classified.type, message);
-		if (classified.errorRetryable !== undefined)
-			response.headers.set("x-should-retry", String(classified.errorRetryable));
-		return response;
-	};
-
-	// Per-session provider learning, owned by this gateway instance. The map is
-	// non-serializable, so `parseRequest` cannot accept one from the wire and
-	// every turn would otherwise re-learn each lesson from a fresh upstream
-	// rejection. Acquired per attempt — a target fallback re-acquires against
-	// the new model — and released on every exit path.
-	let attemptLease: AuthGatewaySessionStateLease | undefined;
-	const acquireAttemptLease = (apiKey: string): AuthGatewaySessionStateLease => {
-		attemptLease?.release();
-		attemptLease = sessionStates.acquire({
-			clientKey,
-			model,
-			context: parsed.context,
-			toolsJson,
-			account: resolveGatewayAccount(bootOpts.storage, model.provider, sessionId, apiKey),
-		});
-		return attemptLease;
-	};
-	const releaseAttemptLease = () => {
-		attemptLease?.release();
-		attemptLease = undefined;
-	};
-
-	const considerFallback = (classified: GatewayErrorClassification): boolean => {
-		lastClassified = classified;
-		recordProviderHealthFailure(health, model, classified);
-		if (parsed.options.previousResponseId) return false;
-		if (commitGate.state === "committed") return false;
-		const action = decideAttempt({
-			route: compiled,
-			state: conductorExecutionState(
-				compiled,
-				attemptedTargets,
-				attemptedCredentials,
-				retryCount,
-				fallbackCount,
-				currentTarget,
-				siblingsExhausted,
-				"probing",
-			),
-			classification: classified,
-			commitState: "probing",
-		});
-		if (action.type === "sibling_credential") {
-			siblingsExhausted = true;
-			pendingFallback = currentTarget;
-			retryCount += 1;
-			return true;
-		}
-		if (action.type === "fallback_target") {
-			// New target gets a fresh sibling-credential budget.
-			siblingsExhausted = false;
-			pendingFallback = action.targetModelId;
-			fallbackCount += 1;
-			retryCount += 1;
-			return true;
-		}
-		return false;
-	};
-
-	const bindCurrentTarget = (targetId: string): Response | undefined | "skipped" => {
-		currentTarget = targetId;
-		const resolved = bootOpts.resolveModel(currentTarget);
-		if (!resolved) {
-			attemptedTargets.add(currentTarget);
-			return "skipped";
-		}
-		model = resolved;
-		const boundKindRejection = chatRouteRejection(model);
-		if (boundKindRejection) return formatError(400, "invalid_request_error", boundKindRejection);
-		const skip = targetSkipReason(compiled, health, currentTarget, model);
-		if (skip !== undefined) {
-			attemptedTargets.add(currentTarget);
-			const skipped = traces.record({
-				requestId,
-				routeId: compiled.id,
-				generation: compiled.generation,
-				selectedTarget: currentTarget,
-				disposition: "skipped",
-				reason: skip,
-			});
-			logger.debug("auth-gateway route decision", redactedDecisionSummary(skipped));
-			return "skipped";
-		}
-		attemptedTargets.add(currentTarget);
-		return undefined;
-	};
-
-	const pickTarget = (): Response | undefined => {
-		for (;;) {
-			let targetId: string | undefined;
-			if (pendingFallback !== undefined) {
-				targetId = pendingFallback;
-				pendingFallback = undefined;
-			} else {
-				targetId = parsed.options.previousResponseId
-					? attemptedTargets.has(currentTarget)
-						? undefined
-						: currentTarget
-					: dispatchTargetId(compiled, stateNow(), commitGate.state, cacheStore, fingerprint, currentTarget);
-			}
-			if (targetId === undefined) {
-				if (lastClassified) return classifiedError(lastClassified);
-				if (attemptedTargets.size > 0) {
-					return formatError(502, "upstream_error", "Upstream request failed");
-				}
-				return unknownModelResponse(formatError, parsed.modelId);
-			}
-			const bound = bindCurrentTarget(targetId);
-			if (bound === "skipped") {
-				if (lastClassified) {
-					const action = decideAttempt({
-						route: compiled,
-						state: conductorExecutionState(
-							compiled,
-							attemptedTargets,
-							attemptedCredentials,
-							retryCount,
-							fallbackCount,
-							currentTarget,
-							siblingsExhausted,
-							"probing",
-						),
-						classification: lastClassified,
-						commitState: "probing",
-					});
-					if (action.type === "fallback_target") {
-						siblingsExhausted = false;
-						pendingFallback = action.targetModelId;
-					}
-				}
-				continue;
-			}
-			return bound;
-		}
-	};
-
-	const resolveCredential = async (): Promise<AttemptPrep> => {
-		let apiKey: ResolvedApiKey | undefined;
-		if (
-			parsed.options.previousResponseId &&
-			!bootOpts.storage.peekApiKeyOverrides(model.provider) &&
-			bootOpts.storage.listStoredCredentials(model.provider).length > 1
-		) {
-			return {
-				type: "respond",
-				response: formatError(
-					400,
-					"invalid_request_error",
-					"Response continuation requires an unambiguous credential",
-				),
-			};
-		}
-		try {
-			apiKey = await bootOpts.storage.keys.getWithCredential(model.provider, sessionId, {
-				modelId: model.id,
-				signal: controller.signal,
-				requestId,
-			});
-		} catch (error) {
-			if (controller.signal.aborted) return { type: "respond", response: aborted() };
-			const classified = classifyGatewayError(error);
-			logger.warn("auth-gateway getApiKey threw", { provider: model.provider, peer, error: classified.message });
-			traces.record({
-				requestId,
-				routeId: compiled.id,
-				generation: compiled.generation,
-				selectedTarget: currentTarget,
-				disposition: "skipped",
-				reason: "credential_lookup_failed",
-			});
-			if (considerFallback(classified)) return { type: "retry" };
-			return { type: "respond", response: classifiedError(classified) };
-		}
-		if (controller.signal.aborted) return { type: "respond", response: aborted() };
-		if (!apiKey) {
-			const skipped = traces.record({
-				requestId,
-				routeId: compiled.id,
-				generation: compiled.generation,
-				selectedTarget: currentTarget,
-				disposition: "skipped",
-				reason: "credential_unavailable",
-			});
-			logger.debug("auth-gateway route decision", redactedDecisionSummary(skipped));
-			const unconfigured = !bootOpts.storage.hasAuth(model.provider);
-			const classified: GatewayErrorClassification = {
-				status: unconfigured ? 503 : 401,
-				type: unconfigured ? "upstream_error" : "authentication_error",
-				message: `No credential available for provider ${model.provider}`,
-				owner: unconfigured ? "provider" : "credential",
-				disposition: unconfigured ? "provider_unavailable" : "credential_transient",
-			};
-			// No key means there is no sibling credential to rotate — skip straight
-			// to disposition-compiled credential_transient fallbacks when present.
-			siblingsExhausted = true;
-			if (considerFallback(classified)) return { type: "retry" };
-			return {
-				type: "respond",
-				response: formatError(classified.status, classified.type, classified.message),
-			};
-		}
-		const activeCredentialId = bootOpts.storage
-			.listOAuthAccounts(model.provider, sessionId)
-			.find(account => account.active)?.credentialId;
-		if (activeCredentialId !== undefined) attemptedCredentials.add(activeCredentialId);
-		const dispatched = traces.record({
-			requestId,
-			routeId: compiled.id,
-			generation: compiled.generation,
-			selectedTarget: currentTarget,
-			disposition: "dispatched",
-		});
-		logger.debug("auth-gateway route decision", redactedDecisionSummary(dispatched));
-		return { type: "key", apiKey };
-	};
-
-	const buildAttemptStreamOpts = (apiKey: ResolvedApiKey): SimpleStreamOptions => {
-		// Build the SimpleStreamOptions actually handed to `streamSimple`. We
-		// trust the client's options (already allow-listed by `parseRequest`) and
-		// only inject server-controlled fields. The codex sampling strip mirrors
-		// `buildStreamOptions` — Codex rejects every one with a 400 (#3117).
-		const lease = acquireAttemptLease(apiKey.apiKey);
-		const streamOpts: SimpleStreamOptions = {
-			...parsed.options,
-			apiKey: () => apiKey,
-			signal: controller.signal,
-			cursorExternalToolExecutor: true,
-			providerSessionState: lease.states,
-		};
-		if (bootOpts.fetch) streamOpts.fetch = bootOpts.fetch;
-		streamOpts.apiKey = parsed.options.previousResponseId
-			? () => apiKey
-			: buildGatewayApiKeyResolver(
-					bootOpts.storage,
-					model,
-					sessionId,
-					apiKey,
-					controller.signal,
-					"pi-native",
-					peer,
-					resolvedKey =>
-						lease.updateAccount(resolveGatewayAccount(bootOpts.storage, model.provider, sessionId, resolvedKey)),
-					requestId,
-				);
-		if (model.api === "openai-codex-responses") {
-			delete streamOpts.temperature;
-			delete streamOpts.topP;
-			delete streamOpts.topK;
-			delete streamOpts.minP;
-			delete streamOpts.stopSequences;
-			delete streamOpts.presencePenalty;
-			delete streamOpts.frequencyPenalty;
-			delete streamOpts.repetitionPenalty;
-		}
-		// Merge gateway-captured passthrough headers under the client's own
-		// headers — the client's values win when they collide.
-		const captured = captureRequestHeaders(req.headers);
-		streamOpts.headers = { ...captured, ...(streamOpts.headers ?? {}) };
-		streamOpts.sessionId ??= sessionId;
-		if (!commitGateObservesDownstreamSse("pi-native")) {
-			attachCommitGateSseObserver(streamOpts, commitGate, "pi-native");
-		}
-		return streamOpts;
-	};
-
-	const attemptHookCtx = () => ({
+	const sessionId =
+		previousOwner?.sessionId ?? clientKey ?? deriveSessionId(parsed.modelId, parsed.context, toolsJson);
+	parsed.options.sessionId = sessionId;
+	return runGatewayChatExecution({
+		boot: bootOpts,
+		registry,
+		compiled,
 		requestId,
-		routeId: compiled.id,
-		target: currentTarget,
-		generation: compiled.generation,
+		controller,
+		peer,
+		startedAt,
+		label: "pi-native",
+		requestedModelId: parsed.modelId,
+		context: parsed.context,
+		stream: parsed.stream,
+		client,
+		sessionId,
+		clientKey,
+		toolsJson,
+		previousId,
+		previousOwner,
+		requestHeaders,
+		cacheFingerprint: Bun.SHA256.hash(JSON.stringify([compiled.id, sessionId]), "hex"),
+		requiresNativeSurface:
+			parsed.options.responseMimeType !== undefined ||
+			parsed.options.responseSchema !== undefined ||
+			parsed.options.responseJsonSchema !== undefined
+				? "gemini-v1beta"
+				: undefined,
+		sessionStates,
+		responseOwners,
+		validateModel: target =>
+			chatRouteRejection(target, parsed.context) ??
+			continuationRejection(bootOpts.storage, target, previousId, previousOwner, requestHeaders),
+		buildOptions: (target, signal) => {
+			const options: SimpleStreamOptions = {
+				...parsed.options,
+				headers: requestHeaders,
+				signal,
+				cursorExternalToolExecutor: true,
+				sessionId,
+			};
+			if (target.api === "openai-codex-responses") {
+				delete options.temperature;
+				delete options.topP;
+				delete options.topK;
+				delete options.minP;
+				delete options.stopSequences;
+				delete options.presencePenalty;
+				delete options.frequencyPenalty;
+				delete options.repetitionPenalty;
+			}
+			return options;
+		},
+		encodeResponse: message => ({ message }),
+		encodeStream: (events, control) => piNative.encodeStream(events, parsed.modelId, parsed.options, control),
+		formatError: piNative.formatError,
 	});
-
-	if (!parsed.stream) {
-		try {
-			for (let attempt = 0; attempt < attemptCap; attempt++) {
-				if (attempt > 0) commitGate.reset();
-				if (controller.signal.aborted) return aborted();
-				const picked = pickTarget();
-				if (picked) return picked;
-				const cred = await resolveCredential();
-				if (cred.type === "retry") {
-					await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
-					releaseAttemptLease();
-					bootOpts.storage.releaseTurnReservation(requestId);
-					continue;
-				}
-				if (cred.type === "respond") {
-					await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
-					return cred.response;
-				}
-				try {
-					await runHook(bootOpts.hooks?.beforeAttempt, attemptHookCtx());
-				} catch (error) {
-					releaseAttemptLease();
-					bootOpts.storage.releaseTurnReservation(requestId);
-					throw error;
-				}
-				const streamOpts = buildAttemptStreamOpts(cred.apiKey);
-				logger.info("auth-gateway request", {
-					requestId,
-					format: "pi-native",
-					model: parsed.modelId,
-					resolvedProvider: model.provider,
-					resolvedModel: model.id,
-					stream: parsed.stream,
-					peer,
-				});
-				try {
-					const message = await renewReservationUntilSettled(
-						bootOpts.storage,
-						requestId,
-						completeSimple(model, parsed.context, streamOpts),
-					);
-					recordGatewayUsage(bootOpts.storage, model, client, message.usage, message.timestamp || undefined);
-					if (message.stopReason === "aborted" || message.stopReason === "error") {
-						const errorMessage =
-							message.errorMessage ??
-							(message.stopReason === "aborted" ? "Request was aborted" : "Upstream request failed");
-						logger.warn("auth-gateway non-streaming failed", {
-							format: "pi-native",
-							reason: message.stopReason,
-							error: errorMessage,
-							peer,
-						});
-						if (message.stopReason === "aborted") {
-							await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
-							return formatError(499, "request_aborted", errorMessage);
-						}
-						const classified = classifyAssistantFailure(message);
-						if (messageHasBillableUsage(message)) {
-							recordProviderHealthFailure(health, model, classified);
-							await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
-							return classifiedError(classified, errorMessage);
-						}
-						if (considerFallback(classified)) {
-							await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
-							releaseAttemptLease();
-							bootOpts.storage.releaseTurnReservation(requestId);
-							continue;
-						}
-						await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
-						return classifiedError(classified, errorMessage);
-					}
-					bootOpts.storage.settleQuotaProbeSuccess(requestId);
-					health.recordSuccess(model.provider, model.id);
-					rememberPromptCacheHit(cacheStore, fingerprint, model, sessionId, currentTarget);
-					await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: true });
-					return json(200, { message }, gatewayResponseHeaders(model, { requestId, message, startedAt }));
-				} catch (error) {
-					if (controller.signal.aborted) return aborted();
-					const classified = classifyGatewayError(error);
-					logger.warn("auth-gateway non-streaming aborted", {
-						format: "pi-native",
-						error: classified.message,
-						peer,
-					});
-					if (considerFallback(classified)) {
-						await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
-						releaseAttemptLease();
-						bootOpts.storage.releaseTurnReservation(requestId);
-						continue;
-					}
-					await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
-					return classifiedError(classified);
-				}
-			}
-			if (lastClassified) return classifiedError(lastClassified);
-			return formatError(502, "upstream_error", "Upstream request failed");
-		} finally {
-			releaseAttemptLease();
-			bootOpts.storage.releaseTurnReservation(requestId);
-		}
-	}
-
-	for (let attempt = 0; attempt < attemptCap; attempt++) {
-		if (attempt > 0) commitGate.reset();
-		if (controller.signal.aborted) {
-			releaseAttemptLease();
-			bootOpts.storage.releaseTurnReservation(requestId);
-			return aborted();
-		}
-		const picked = pickTarget();
-		if (picked) {
-			releaseAttemptLease();
-			bootOpts.storage.releaseTurnReservation(requestId);
-			return picked;
-		}
-		const cred = await resolveCredential();
-		if (cred.type === "retry") {
-			await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
-			releaseAttemptLease();
-			bootOpts.storage.releaseTurnReservation(requestId);
-			continue;
-		}
-		if (cred.type === "respond") {
-			await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
-			releaseAttemptLease();
-			bootOpts.storage.releaseTurnReservation(requestId);
-			return cred.response;
-		}
-		try {
-			await runHook(bootOpts.hooks?.beforeAttempt, attemptHookCtx());
-		} catch (error) {
-			releaseAttemptLease();
-			bootOpts.storage.releaseTurnReservation(requestId);
-			throw error;
-		}
-		const streamOpts = buildAttemptStreamOpts(cred.apiKey);
-		logger.info("auth-gateway request", {
-			requestId,
-			format: "pi-native",
-			model: parsed.modelId,
-			resolvedProvider: model.provider,
-			resolvedModel: model.id,
-			stream: parsed.stream,
-			peer,
-		});
-		let events: AssistantMessageEventStream;
-		try {
-			events = streamSimple(model, parsed.context, streamOpts);
-		} catch (error) {
-			const classified = classifyGatewayError(error);
-			logger.warn("auth-gateway streamSimple threw", { format: "pi-native", error: classified.message, peer });
-			if (considerFallback(classified)) {
-				await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
-				releaseAttemptLease();
-				bootOpts.storage.releaseTurnReservation(requestId);
-				continue;
-			}
-			await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
-			releaseAttemptLease();
-			bootOpts.storage.releaseTurnReservation(requestId);
-			return classifiedError(classified);
-		}
-		if (!commitGateObservesDownstreamSse("pi-native")) observeAssistantCommit(events, commitGate);
-		const settled = renewReservationUntilSettled(bootOpts.storage, requestId, events.result());
-		void settled
-			.then(message =>
-				recordGatewayUsage(bootOpts.storage, model, client, message.usage, message.timestamp || undefined),
-			)
-			.catch(() => {})
-			.finally(() => releaseAttemptLease());
-		let sseStream = piNative.encodeStream(events, parsed.modelId, parsed.options, {
-			signal: controller.signal,
-			onCancel: reason => {
-				if (!controller.signal.aborted) {
-					controller.abort(reason instanceof Error ? reason : new Error("client closed request"));
-				}
-			},
-		});
-		sseStream = observeSseCommit(sseStream, commitGate);
-		const held = await holdSseUntilCommit(sseStream, commitGate, settled);
-		if (held.type === "failed") {
-			if (held.message && messageHasBillableUsage(held.message)) {
-				const errorMessage =
-					held.message.errorMessage ??
-					(held.message.stopReason === "aborted" ? "Request was aborted" : "Upstream request failed");
-				if (held.message.stopReason === "aborted") {
-					await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
-					releaseAttemptLease();
-					bootOpts.storage.releaseTurnReservation(requestId);
-					return formatError(499, "request_aborted", errorMessage);
-				}
-				const classified = classifyAssistantFailure(held.message);
-				recordProviderHealthFailure(health, model, classified);
-				await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
-				releaseAttemptLease();
-				bootOpts.storage.releaseTurnReservation(requestId);
-				return classifiedError(classified, errorMessage);
-			}
-			const classified = held.message ? classifyAssistantFailure(held.message) : classifyGatewayError(held.error);
-			logger.warn("auth-gateway stream attempt failed before commit", {
-				format: "pi-native",
-				error: classified.message,
-				peer,
-			});
-			if (considerFallback(classified)) {
-				await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
-				releaseAttemptLease();
-				bootOpts.storage.releaseTurnReservation(requestId);
-				continue;
-			}
-			await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
-			releaseAttemptLease();
-			bootOpts.storage.releaseTurnReservation(requestId);
-			return classifiedError(classified);
-		}
-		if (controller.signal.aborted) {
-			await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok: false });
-			releaseAttemptLease();
-			bootOpts.storage.releaseTurnReservation(requestId);
-			return aborted();
-		}
-		const outcome = settleGatewayStream(
-			settled,
-			bootOpts,
-			health,
-			model,
-			requestId,
-			() => rememberPromptCacheHit(cacheStore, fingerprint, model, sessionId, currentTarget),
-			async ok => {
-				await runHook(bootOpts.hooks?.afterAttempt, { ...attemptHookCtx(), ok });
-				await runHook(bootOpts.hooks?.afterRequest, {
-					requestId,
-					routeId: compiled.id,
-					generation: compiled.generation,
-					ok,
-				});
-			},
-		);
-		sseStream = releaseTurnOnStreamEnd(held.stream, bootOpts.storage, requestId, undefined, outcome);
-		return new Response(sseStream, {
-			status: 200,
-			headers: {
-				...gatewayResponseHeaders(model, { requestId }),
-				"Content-Type": "text/event-stream; charset=utf-8",
-				"Cache-Control": "no-cache",
-				Connection: "keep-alive",
-				"X-Accel-Buffering": "no",
-			},
-		});
-	}
-	releaseAttemptLease();
-	bootOpts.storage.releaseTurnReservation(requestId);
-	if (lastClassified) return classifiedError(lastClassified);
-	return formatError(502, "upstream_error", "Upstream request failed");
 }
 
 /**
@@ -2102,7 +656,10 @@ async function handleUsage(opts: AuthGatewayRouteOptions, signal: AbortSignal): 
  * a clean diagnosis and getting a 429 storm.
  */
 async function handleCredentialsCheck(opts: AuthGatewayRouteOptions, signal: AbortSignal): Promise<Response> {
-	const credentials = await opts.storage.health.check({ signal, excludeProviders: opts.excludeProviders });
+	const credentials = await opts.storage.health.check({
+		signal,
+		excludeProviders: opts.excludeProviders,
+	});
 	return json(200, { generatedAt: Date.now(), credentials });
 }
 
@@ -2112,7 +669,9 @@ async function handleCredentialsCheck(opts: AuthGatewayRouteOptions, signal: Abo
  * (omp's own proxy discovery, Zed's openai_compatible provider, ...) read to
  * size and capability-gate discovered models: `context_length`,
  * `max_output_tokens`, `input_modalities`, and `supports_tools` (only emitted
- * when the catalog explicitly reports `false`; absent means usable).
+ * when the catalog explicitly reports `false`; absent means usable). `kind` is
+ * emitted for non-chat rows (`judge`, `image`, `tts`, `stt`, `embedding`,
+ * `rerank`, `video`) so clients can keep them off chat routes; absent means chat.
  */
 interface ModelListRow {
 	id: string;
@@ -2151,156 +710,103 @@ function handleModelsList(opts: AuthGatewayRouteOptions): Response {
 	return json(200, { object: "list", data });
 }
 
-interface RouteListRow {
-	id: string;
-	generation: number;
-	targets: readonly string[];
-	fallbacks: CompiledRoute["fallbacks"];
-}
-
 function handleRoutesList(registry: RouteRegistry): Response {
-	const data: RouteListRow[] = [];
-	for (const route of registry.list()) {
-		data.push({
-			id: route.id,
-			generation: route.generation,
-			targets: route.targets,
-			fallbacks: route.fallbacks,
-		});
-	}
+	const data = registry
+		.list()
+		.map(({ id, generation, targets, fallbacks }) => ({ id, generation, targets, fallbacks }));
 	return json(200, { object: "list", generation: registry.generation, data });
 }
 
 function handleRouteGet(registry: RouteRegistry, id: string): Response {
 	const route = registry.get(id);
-	if (!route) {
-		return json(404, { error: `Unknown route: ${id}` });
-	}
-	const row: RouteListRow = {
-		id: route.id,
-		generation: route.generation,
-		targets: route.targets,
-		fallbacks: route.fallbacks,
-	};
-	return json(200, row);
+	if (!route) return json(404, { error: `Unknown route: ${id}` });
+	const { generation, targets, fallbacks } = route;
+	return json(200, { id, generation, targets, fallbacks });
 }
 
 async function handleRoutePut(registry: RouteRegistry, id: string, req: Request): Promise<Response> {
 	let body: unknown;
 	try {
-		body = await req.json();
-	} catch (error) {
-		return json(400, { error: `Invalid JSON body: ${String(error)}` });
+		body = Bun.JSON5.parse(await req.text());
+	} catch {
+		return json(400, { error: "Invalid JSON/JSON5 body" });
 	}
-
 	try {
-		if (isRecord(body) && Object.hasOwn(body, "id")) {
-			if (body.id !== id) {
-				throw new AIError.ValidationError(`Route definition id must equal path id "${id}"`);
-			}
-		} else if (isRecord(body)) {
-			body = { ...body, id };
-		}
-		const definition = parseRouteDefinition(body);
-		registry.register(definition);
+		if (!isRecord(body)) throw new ValidationError("Route definition must be an object");
+		if (Object.hasOwn(body, "id") && body.id !== id)
+			throw new ValidationError("Route definition id must equal path id");
+		registry.register(parseRouteDefinition({ ...body, id }));
 	} catch (error) {
-		if (error instanceof AIError.ValidationError) {
-			return json(400, { error: error.message });
-		}
+		if (error instanceof ValidationError) return json(400, { error: error.message });
 		throw error;
 	}
 	return handleRouteGet(registry, id);
 }
 
 function handleRouteDelete(registry: RouteRegistry, id: string): Response {
-	if (!registry.unregister(id)) {
-		return json(404, { error: `Unknown route: ${id}` });
-	}
-	return new Response(null, { status: 204 });
+	return registry.unregister(id) ? new Response(null, { status: 204 }) : json(404, { error: `Unknown route: ${id}` });
 }
 
-function handleExecutionTraces(traces: RouteDecisionTraceLog, id: string): Response {
-	const recorded = traces.get(id);
-	if (recorded.length === 0) {
-		return json(404, { error: `Unknown execution: ${id}` });
-	}
-	const data: RouteDecisionTrace[] = [];
-	for (const trace of recorded) {
-		const row: RouteDecisionTrace = {
-			requestId: trace.requestId,
-			routeId: trace.routeId,
-			generation: trace.generation,
-			selectedTarget: trace.selectedTarget,
-			disposition: trace.disposition,
-			recordedAtMs: trace.recordedAtMs,
-		};
-		if (trace.reason !== undefined) row.reason = trace.reason;
-		data.push(row);
-	}
+const CREDENTIAL_ACTION_PATH = /^\/v1\/credentials\/([^/]+)\/(disable|pin)$/;
+
+function managementRejection(
+	req: Request,
+	opts: AuthGatewayRouteOptions,
+	adminTokens: ReadonlySet<string>,
+): Response | undefined {
+	if (opts.allowManagement !== true) return json(404, { error: "management disabled" });
+	if (adminTokens.size === 0 || !isAuthorized(req, adminTokens))
+		return json(403, { error: "Management mutation requires separate administrator authorization" });
+	if (hasMisplacedBearer(req, new URL(req.url), adminTokens))
+		return json(400, { error: "gateway bearer token outside Authorization" });
+	return undefined;
+}
+
+async function handleCredentialsList(storage: AuthStorage): Promise<Response> {
+	await storage.credentials.reload();
+	const data = storage.credentials
+		.snapshot()
+		.credentials.map(row => ({ id: row.id, provider: row.provider, type: row.credential.type }));
 	return json(200, { object: "list", data });
 }
 
-interface HealthRouteRow {
-	id: string;
-	generation: number;
-	targets: readonly string[];
-}
-
-function handleHealthRoutes(registry: RouteRegistry): Response {
-	const data: HealthRouteRow[] = [];
-	for (const route of registry.list()) {
-		data.push({
-			id: route.id,
-			generation: route.generation,
-			targets: route.targets,
-		});
+async function handleCredentialAction(
+	storage: AuthStorage,
+	rawId: string,
+	action: string,
+	req: Request,
+): Promise<Response> {
+	let decoded: string;
+	try {
+		decoded = decodeURIComponent(rawId);
+	} catch {
+		return json(400, { error: "invalid credential id encoding" });
 	}
-	return json(200, { object: "list", generation: registry.generation, data });
-}
-
-interface CredentialListRow {
-	id: number;
-	provider: string;
-	type: "api_key" | "oauth";
-}
-
-function handleCredentialsList(storage: AuthStorage): Response {
-	const data: CredentialListRow[] = [];
-	for (const entry of storage.exportSnapshot().credentials) {
-		data.push({
-			id: entry.id,
-			provider: entry.provider,
-			type: entry.credential.type,
-		});
+	const id = Number(decoded);
+	if (!/^[1-9]\d*$/.test(decoded) || !Number.isSafeInteger(id)) return json(400, { error: "Invalid credential id" });
+	await storage.credentials.reload();
+	if (action === "disable") {
+		return (await storage.credentials.disable(id, "gateway"))
+			? json(200, { ok: true })
+			: json(404, { error: `No credential with id=${id}` });
 	}
-	return json(200, { object: "list", data });
-}
-
-async function handleCredentialDisable(storage: AuthStorage, id: string): Promise<Response> {
-	const ok = await storage.disableCredentialByIdAsync(Number(id), "gateway");
-	if (!ok) {
-		return json(404, { error: `No credential with id=${id}` });
-	}
-	return json(200, { ok: true });
-}
-
-async function handleCredentialPin(storage: AuthStorage, id: string, req: Request): Promise<Response> {
 	let body: unknown;
 	try {
 		body = await req.json();
-	} catch (error) {
-		return json(400, { error: `Invalid JSON body: ${String(error)}` });
+	} catch {
+		return json(400, { error: "Invalid JSON body" });
 	}
-	if (!isRecord(body) || typeof body.provider !== "string" || typeof body.sessionId !== "string") {
+	if (
+		!isRecord(body) ||
+		typeof body.provider !== "string" ||
+		!body.provider.trim() ||
+		typeof body.sessionId !== "string" ||
+		!body.sessionId.trim()
+	)
 		return json(400, { error: "provider and sessionId are required" });
-	}
-	if (body.provider.length === 0 || body.sessionId.length === 0) {
-		return json(400, { error: "provider and sessionId are required" });
-	}
-	if (!storage.pinSessionOAuthAccount(body.provider, body.sessionId, Number(id))) {
-		return json(404, { error: `No credential with id=${id}` });
-	}
-	return json(200, { ok: true });
+	return storage.sessions.pin(body.provider, body.sessionId, id)
+		? json(200, { ok: true })
+		: json(404, { error: `No credential with id=${id}` });
 }
 
 /** `GET /v1/videos/:id` (poll) and `GET /v1/videos/:id/content` (download); group 1 = id, group 2 = `/content`. */
@@ -2346,13 +852,21 @@ export interface AuthGatewayRouter {
  * two routers in one process never share (or tear down) each other's.
  */
 export function createAuthGatewayRouter(opts: AuthGatewayRouteOptions): AuthGatewayRouter {
-	const registry = opts.routeRegistry ?? new RouteRegistry(opts.resolveModel);
-	if (opts.routes?.length) registry.replaceAll([...registry.list(), ...opts.routes]);
-	const traces = opts.decisionTraces ?? new RouteDecisionTraceLog();
-	const health = new ProviderHealthBook();
-	const cacheStore = new PromptCacheAffinityStore();
-	const boot = { ...opts, routeRegistry: registry, decisionTraces: traces };
+	const routeRegistry = opts.routeRegistry ?? new RouteRegistry(opts.resolveModel);
+	routeRegistry.registerMany(opts.routes ?? []);
+	const adminTokens = new Set(opts.adminBearerTokens?.filter(token => token.trim().length > 0));
+	const boot: AuthGatewayRouteOptions = {
+		...opts,
+		routeRegistry,
+		decisionTraces: opts.decisionTraces ?? new RouteDecisionTraceLog(),
+		providerHealth: opts.providerHealth ?? new ProviderHealthBook(),
+		promptCacheAffinity: opts.promptCacheAffinity ?? new PromptCacheAffinityStore(),
+	};
 	const sessionStates = new AuthGatewaySessionStateStore();
+	const responseOwners: GatewayResponseOwnership = {
+		get: responseId => opts.storage.responses.get(responseId),
+		record: (responseId, owner) => opts.storage.responses.record(responseId, owner),
+	};
 	const route = async (req: Request, peer: string): Promise<Response> => {
 		const pathname = new URL(req.url).pathname;
 		try {
@@ -2360,159 +874,158 @@ export function createAuthGatewayRouter(opts: AuthGatewayRouteOptions): AuthGate
 			// Same shape as the broker's `/v1/usage`, so widget/llm-git speak to either with the
 			// same client struct.
 			if (req.method === "GET" && pathname === "/v1/usage") {
-				return await handleUsage(boot, req.signal);
+				return await handleUsage(opts, req.signal);
 			}
 
 			// Per-credential auth probe — diagnoses which row in a multi-account
 			// pool is producing 401s. Aggregated `/v1/usage` silently drops failed
 			// credentials, so we need a separate endpoint that captures errors.
 			if (req.method === "GET" && pathname === "/v1/credentials/check") {
-				return await handleCredentialsCheck(boot, req.signal);
+				return await handleCredentialsCheck(opts, req.signal);
 			}
-
-			if (req.method === "GET" && pathname === "/v1/credentials") return handleCredentialsList(boot.storage);
-			const credentialAction = /^\/v1\/credentials\/([^/]+)\/(disable|pin)$/.exec(pathname);
-			if (req.method === "POST" && credentialAction) {
-				return credentialAction[2] === "disable"
-					? await handleCredentialDisable(boot.storage, credentialAction[1]!)
-					: await handleCredentialPin(boot.storage, credentialAction[1]!, req);
-			}
-			if (req.method === "POST" && pathname === "/v1/messages/count_tokens")
-				return await handleCountTokens(req, boot.resolveModel);
-			if (req.method === "POST" && pathname === "/v1/realtime")
-				return json(501, { error: "not available on this gateway" });
 
 			// Provider-format dispatch.
-
-			let formatRoute = FORMAT_ROUTES[pathname];
-			let pathModel: string | undefined;
-			const geminiPath = GEMINI_MODEL_PATH.exec(pathname);
-			if (!formatRoute && geminiPath) {
-				formatRoute = { module: geminiV1beta, label: "gemini-v1beta" };
-				try {
-					pathModel = decodeURIComponent(geminiPath[1]!);
-				} catch {
-					pathModel = geminiPath[1];
+			if (req.method === "POST") {
+				const geminiPath = GEMINI_MODEL_PATH.exec(pathname);
+				if (geminiPath) {
+					let pathModel: string;
+					try {
+						pathModel = decodeURIComponent(geminiPath[1]!);
+					} catch {
+						return geminiV1beta.formatError(400, "invalid_request_error", "invalid model path encoding");
+					}
+					return await handleFormatEndpoint(
+						{
+							module: geminiV1beta,
+							label: "gemini-v1beta",
+							pathModel,
+							pathStreaming: geminiPath[2] === "streamGenerateContent",
+						},
+						boot,
+						req,
+						peer,
+						sessionStates,
+						responseOwners,
+					);
 				}
 			}
+			if (req.method === "POST" && pathname === "/v1/messages/count_tokens") {
+				return await handleCountTokens(req, id => {
+					const compiled = routeRegistry.resolve(id);
+					return compiled?.targets
+						.map(target => routeRegistry.getModel(compiled, target))
+						.find(model => model !== undefined);
+				});
+			}
+			if (req.method === "GET" && pathname === "/v1/credentials") return await handleCredentialsList(opts.storage);
+			const credentialAction = req.method === "POST" ? CREDENTIAL_ACTION_PATH.exec(pathname) : null;
+			if (credentialAction) {
+				const rejected = managementRejection(req, opts, adminTokens);
+				if (rejected) return rejected;
+				return await handleCredentialAction(opts.storage, credentialAction[1]!, credentialAction[2]!, req);
+			}
+			const formatRoute = FORMAT_ROUTES[pathname];
 			if (formatRoute && req.method === "POST") {
-				const geminiStream =
-					formatRoute.label === "gemini-v1beta" ? pathname.includes("streamGenerateContent") : undefined;
-				return await handleFormatEndpoint(
-					formatRoute,
-					boot,
-					req,
-					peer,
-					health,
-					cacheStore,
-					sessionStates,
-					pathModel,
-					geminiStream,
-				);
+				return await handleFormatEndpoint(formatRoute, boot, req, peer, sessionStates, responseOwners);
 			}
 
 			// Pi-native fast path. Same auth + provider plumbing as the
 			// foreign-wire routes, just without the wire-format translation.
 			if (req.method === "POST" && pathname === "/v1/pi/stream") {
-				return await handlePiNative(boot, req, peer, health, cacheStore, sessionStates);
+				return await handlePiNative(boot, req, peer, sessionStates, responseOwners);
 			}
 
 			// TypeSafe System One judgments (jev). TypeSafe SDKs and omp's own
 			// judge point `TYPESAFE_BASE_URL` at the gateway; OpenRouter SDKs
 			// reach the same handler through their Decisions path.
 			if (req.method === "POST" && (pathname === "/v1/systemone" || pathname === "/alpha/decisions")) {
-				return await handleSystemOne(boot, req, peer);
+				return await handleSystemOne(opts, req, peer);
 			}
 
 			// Image generation: OpenAI `/v1/images/generations` + OpenRouter `/v1/images`
 			// (JSON), and OpenAI multipart / OpenRouter JSON edits.
 			if (req.method === "POST" && (pathname === "/v1/images/generations" || pathname === "/v1/images")) {
-				return await handleImageGenerations(boot, req, peer);
+				return await handleImageGenerations(opts, req, peer);
 			}
 			if (req.method === "POST" && pathname === "/v1/images/edits") {
-				return await handleImageEdits(boot, req, peer);
+				return await handleImageEdits(opts, req, peer);
 			}
 
 			// Text-to-speech, OpenAI/OpenRouter wire; answers raw audio bytes.
 			if (req.method === "POST" && pathname === "/v1/audio/speech") {
-				return await handleSpeech(boot, req, peer);
+				return await handleSpeech(opts, req, peer);
 			}
 
 			// Speech-to-text, OpenAI multipart or OpenRouter JSON base64 wire.
 			if (req.method === "POST" && pathname === "/v1/audio/transcriptions") {
-				return await handleTranscriptions(boot, req, peer);
+				return await handleTranscriptions(opts, req, peer);
 			}
 
 			// Embeddings, OpenAI wire (OpenRouter is compatible).
 			if (req.method === "POST" && pathname === "/v1/embeddings") {
-				return await handleEmbeddings(boot, req, peer);
+				return await handleEmbeddings(opts, req, peer);
 			}
 
 			// Rerank, OpenRouter wire.
 			if (req.method === "POST" && pathname === "/v1/rerank") {
-				return await handleRerank(boot, req, peer);
+				return await handleRerank(opts, req, peer);
 			}
 
 			// Video generation, OpenRouter's asynchronous wire: submit, then poll
 			// and download by the gateway-issued job id (stateless — the id
 			// encodes provider, model, and upstream job).
 			if (req.method === "POST" && pathname === "/v1/videos") {
-				return await handleVideoSubmit(boot, req, peer);
+				return await handleVideoSubmit(opts, req, peer);
 			}
 			const videoJob = req.method === "GET" ? VIDEO_JOB_PATH.exec(pathname) : null;
 			if (videoJob) {
 				const gatewayId = decodeURIComponent(videoJob[1]);
 				const handler = videoJob[2] ? handleVideoContent : handleVideoPoll;
-				return await handler(boot, req, peer, gatewayId);
+				return await handler(opts, req, peer, gatewayId);
 			}
 
 			// Model catalog.
-			if (req.method === "GET" && pathname === "/v1/models") {
-				return handleModelsList(boot);
-			}
-
-			// Virtual routes — registered ids only, not catalog models.
-			if (req.method === "GET" && pathname === "/v1/routes") {
-				return handleRoutesList(registry);
-			}
-			let routeId: string | undefined;
-			if (pathname.startsWith("/v1/routes/")) {
+			if (req.method === "POST" && pathname === "/v1/realtime")
+				return json(501, { error: "not available on this gateway" });
+			if (req.method === "GET" && pathname === "/v1/health/routes")
+				return json(200, {
+					object: "list",
+					generation: routeRegistry.list()[0]?.generation ?? 0,
+					data: routeRegistry
+						.list()
+						.map(route => ({ id: route.id, generation: route.generation, targets: route.targets })),
+				});
+			if (req.method === "GET" && pathname === "/v1/routes") return handleRoutesList(routeRegistry);
+			if (
+				(req.method === "GET" || req.method === "PUT" || req.method === "DELETE") &&
+				pathname.startsWith("/v1/routes/")
+			) {
+				const rawId = pathname.slice("/v1/routes/".length);
+				if (req.method !== "GET") {
+					const rejected = managementRejection(req, opts, adminTokens);
+					if (rejected) return rejected;
+				}
+				if (!rawId)
+					return req.method === "GET" ? handleRoutesList(routeRegistry) : json(404, { error: "Missing route id" });
+				let id: string;
 				try {
-					routeId = decodeURIComponent(pathname.slice("/v1/routes/".length));
+					id = decodeURIComponent(rawId);
 				} catch {
-					return json(400, { error: "Invalid encoded route id" });
+					return json(400, { error: "invalid route id encoding" });
 				}
+				if (req.method === "PUT") return await handleRoutePut(routeRegistry, id, req);
+				if (req.method === "DELETE") return handleRouteDelete(routeRegistry, id);
+				return handleRouteGet(routeRegistry, id);
 			}
-			if (req.method === "GET" && pathname.startsWith("/v1/routes/")) {
-				const id = routeId!;
-				if (id.length === 0) {
-					return handleRoutesList(registry);
-				}
-				return handleRouteGet(registry, id);
-			}
-			if (req.method === "PUT" && pathname.startsWith("/v1/routes/")) {
-				const id = routeId!;
-				if (id.length === 0) {
-					return json(404, { error: `No route: PUT ${pathname}` });
-				}
-				return await handleRoutePut(registry, id, req);
-			}
-			if (req.method === "DELETE" && pathname.startsWith("/v1/routes/")) {
-				const id = routeId!;
-				if (id.length === 0) {
-					return json(404, { error: `No route: DELETE ${pathname}` });
-				}
-				return handleRouteDelete(registry, id);
-			}
-			if (req.method === "GET" && pathname === "/v1/health/routes") {
-				return handleHealthRoutes(registry);
+			if (req.method === "GET" && pathname === "/v1/models") {
+				return handleModelsList(opts);
 			}
 			if (req.method === "GET" && pathname.startsWith("/v1/executions/")) {
-				const id = pathname.slice("/v1/executions/".length);
-				if (id.length === 0) {
-					return json(404, { error: `No route: GET ${pathname}` });
-				}
-				return handleExecutionTraces(traces, id);
+				const requestId = pathname.slice("/v1/executions/".length);
+				const traces = boot.decisionTraces?.list().filter(entry => entry.requestId === requestId) ?? [];
+				return traces.length
+					? json(200, { ...traces[0], object: "list", data: traces })
+					: json(404, { error: "unknown execution" });
 			}
 
 			// Route-table miss: no format module to defer to, so we emit a
@@ -2534,6 +1047,8 @@ export function createAuthGatewayRouter(opts: AuthGatewayRouteOptions): AuthGate
 export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServerHandle {
 	const bind = parseBind(opts.bind ?? DEFAULT_AUTH_GATEWAY_BIND);
 	const tokens = new Set<string>(opts.bearerTokens);
+	const adminTokens = new Set(opts.adminBearerTokens?.filter(token => token.trim().length > 0));
+	const allTokens = new Set([...tokens, ...adminTokens]);
 	const version = opts.version;
 	const router = createAuthGatewayRouter(opts);
 
@@ -2553,7 +1068,13 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 			if (req.method === "GET" && pathname === "/healthz") {
 				return withCors(json(200, { ok: true, version }), req);
 			}
-			if (!isAuthorized(req, tokens)) {
+			const routePath = pathname === "/v1/routes" || pathname.startsWith("/v1/routes/");
+			const adminSurface =
+				(routePath && (req.method === "GET" || req.method === "PUT" || req.method === "DELETE")) ||
+				(req.method === "POST" && CREDENTIAL_ACTION_PATH.test(pathname)) ||
+				(req.method === "GET" && (pathname === "/v1/credentials" || pathname.startsWith("/v1/executions/")));
+			const adminAuthorized = adminTokens.size > 0 && isAuthorized(req, adminTokens);
+			if (!isAuthorized(req, tokens) && !(adminSurface && adminAuthorized)) {
 				logger.info("auth-gateway request unauthorized", {
 					method: req.method,
 					path: loggablePath(pathname),
@@ -2561,15 +1082,17 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 				});
 				return withCors(json(401, { error: "unauthorized" }), req);
 			}
-			if (hasMisplacedBearer(req, url, tokens)) {
+			if (hasMisplacedBearer(req, url, allTokens)) {
 				return withCors(json(400, { error: "gateway bearer token outside Authorization" }), req);
 			}
 			const peer = resolvePeer(req, socketPeer, opts.trustProxyHeaders);
-			return withCors(await router.route(req, peer), req);
+			const response = await router.route(req, peer);
+			if (response.headers.get("content-type")?.startsWith("text/event-stream")) server.timeout(req, 0);
+			return withCors(response, req);
 		},
 		// Max-out Bun's idle timeout. Long thinking-budget calls can sit idle
 		// for minutes before the first token arrives; the default kills them.
-		idleTimeout: 255,
+		idleTimeout: opts.idleTimeout ?? 255,
 	});
 
 	const boundHost = server.hostname ?? bind.hostname;

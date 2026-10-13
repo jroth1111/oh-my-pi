@@ -7,6 +7,7 @@
  * - `keys` — the provider auth cascade (runtime → config → OAuth → login key → env → stored key)
  * - `oauth` — login, per-account access resolution, account listings, refresh
  * - `sessions` — session → account pins
+ * - `responses` — private response → account/deployment bindings
  * - `usage` — usage reports, header ingestion, history
  * - `health` — model pool health and per-credential auth probes
  * - `limits` — usage-limit marking and credential rotation
@@ -23,6 +24,7 @@ import { SessionAffinity, type SessionRestrictions } from "./auth/affinity";
 import { BlockStoreHealth, CredentialBlocks } from "./auth/blocks";
 import { KeyCascade, KeyOverrides } from "./auth/cascade";
 import { CredentialCoordination } from "./auth/coordination";
+import { extractStructuredApiKeyToken } from "./auth/credential-key";
 import { CredentialHealth } from "./auth/health";
 import { OAuthAccounts } from "./auth/oauth";
 import { AccountPolicies } from "./auth/policy";
@@ -30,9 +32,10 @@ import { CredentialPool } from "./auth/pool";
 import { QuotaProbeLeaseBook } from "./auth/probe-lease";
 import { OAuthRefresher } from "./auth/refresh";
 import { ResetCredits } from "./auth/resets";
+import { ResponseOwners } from "./auth/response-owners";
 import { RateLimits } from "./auth/rotation";
 import { CredentialSelector } from "./auth/select";
-import { SqliteAuthCredentialStore } from "./auth/sqlite-credential-store";
+import { resolveCredentialStateScopeKey, SqliteAuthCredentialStore } from "./auth/sqlite-credential-store";
 import type { AuthCredentialStore } from "./auth/store";
 import type {
 	AuthAccountPolicies,
@@ -41,52 +44,24 @@ import type {
 	AuthCredentialEntry,
 	AuthCredentialSnapshot,
 	AuthCredentialSnapshotEntry,
+	StoredCredentialBlock,
+	TurnReservationResult,
 	AuthStorageOptions,
 	BlocksApi,
-	CheckCredentialsOptions,
-	CredentialDisabledEvent,
-	CredentialHealthResult,
-	CredentialOrigin,
 	CredentialsApi,
-	DisabledCredentialSummary,
 	HealthApi,
 	KeysApi,
 	LimitsApi,
-	ListResetCreditsOptions,
-	MarkUsageLimitOptions,
-	ModelUsageHealth,
-	ModelUsageHealthOptions,
-	OAuthAccess,
-	OAuthAccessResolution,
-	OAuthAccountIdentity,
-	OAuthAccountSummary,
 	OAuthApi,
-	OAuthLoginController,
-	OAuthLoginIdentity,
-	ObservedUsageInput,
-	RedeemResetCreditOptions,
-	ResetCreditRedeemOutcome,
 	ResetsApi,
+	ResponseOwnersApi,
 	SessionsApi,
-	StoredAuthCredential,
-	StoredCredentialBlock,
-	TurnReservationResult,
 	UsageApi,
-	UsageLimitMarkResult,
+	StoredAuthCredential,
 } from "./auth/types";
 import { UsageService } from "./auth/usage";
 import { DEFAULT_USAGE_REQUEST_TIMEOUT_MS, UsageCache } from "./auth/usage-cache";
-import type { ApiKeyResolver } from "./auth-retry";
-import type { Provider } from "./types";
-import type {
-	ClientUsageReport,
-	ClientUsageSummary,
-	UsageHistoryEntry,
-	UsageHistoryQuery,
-	UsageLogger,
-	UsageProvider,
-	UsageReport,
-} from "./usage";
+import type { UsageLogger } from "./usage";
 import { defaultRankingStrategy, defaultUsageProvider } from "./usage/registry";
 
 export {
@@ -102,16 +77,17 @@ export * from "./auth/types";
 
 /** Store-bound credential modules; rebuilt as a unit by {@link AuthStorage.replaceStore}. */
 interface AuthStorageModules {
-	coordination: CredentialCoordination;
 	pool: CredentialPool;
 	keys: KeyCascade;
 	oauth: OAuthAccounts;
 	sessions: SessionAffinity;
+	responses: ResponseOwners;
 	usage: UsageService;
 	health: CredentialHealth;
 	limits: RateLimits;
 	resets: ResetCredits;
 	blocks: CredentialBlocks;
+	coordination: CredentialCoordination;
 }
 
 /**
@@ -128,7 +104,6 @@ export class AuthStorage {
 	readonly #policies: AccountPolicies;
 	readonly #restrictions: SessionRestrictions = new Map();
 	#modules: AuthStorageModules;
-	#generationUnsubscribes = new Map<(generation: number) => void, () => void>();
 
 	constructor(store: AuthCredentialStore, options: AuthStorageOptions = {}) {
 		this.#options = options;
@@ -154,6 +129,10 @@ export class AuthStorage {
 	get sessions(): SessionsApi {
 		return this.#modules.sessions;
 	}
+	/** Durable, private bindings of upstream response IDs to accounts and deployments. */
+	get responses(): ResponseOwnersApi {
+		return this.#modules.responses;
+	}
 	/** Usage reports, header ingestion, history. */
 	get usage(): UsageApi {
 		return this.#modules.usage;
@@ -173,6 +152,54 @@ export class AuthStorage {
 	/** Persisted rate-limit blocks (auth-broker server seam). */
 	get blocks(): BlocksApi {
 		return this.#modules.blocks;
+	}
+
+	/** Request-owned quota recovery leases and physical credential generations. */
+	get coordination(): CredentialCoordination {
+		return this.#modules.coordination;
+	}
+
+	/** Compatibility with existing fork SDK consumers; new code uses the namespaces. */
+	setRuntimeApiKey(provider: string, apiKey: string): void {
+		this.keys.setRuntime(provider, apiKey);
+	}
+	set(provider: string, credential: AuthCredentialEntry): Promise<void> {
+		return this.credentials.set(provider, credential);
+	}
+	hasAuth(provider: string): boolean {
+		return this.keys.source(provider) !== undefined;
+	}
+	peekApiKey(provider: string): Promise<string | undefined> {
+		return this.keys.peek(provider);
+	}
+	listStoredCredentials(provider?: string): StoredAuthCredential[] {
+		return this.credentials.list(provider);
+	}
+	exportSnapshot(): AuthCredentialSnapshot {
+		return this.credentials.snapshot();
+	}
+	upsertCredential(provider: string, credential: AuthCredential): Promise<AuthCredentialSnapshotEntry[]> {
+		return this.credentials.upsert(provider, credential);
+	}
+	upsertCredentialBlock(block: StoredCredentialBlock): void {
+		this.blocks.upsert(block);
+	}
+	tryAcquireTurnReservation(args: {
+		credentialId: number;
+		incarnation: number;
+		requestId: string;
+		ttlMs?: number;
+	}): TurnReservationResult {
+		return this.coordination.tryAcquireTurnReservation(args);
+	}
+	releaseTurnReservation(requestId: string): void {
+		this.coordination.releaseTurnReservation(requestId);
+	}
+	renewTurnReservation(requestId: string, ttlMs?: number): void {
+		this.coordination.renewTurnReservation(requestId, ttlMs);
+	}
+	settleQuotaProbeSuccess(requestId: string): boolean {
+		return this.coordination.settleQuotaProbeSuccess(requestId);
 	}
 
 	/**
@@ -219,7 +246,6 @@ export class AuthStorage {
 		const policies = this.#policies;
 		const blockHealth = new BlockStoreHealth(sourceLabel);
 		const strategies = options.rankingStrategyResolver ?? defaultRankingStrategy;
-		const probeBook = new QuotaProbeLeaseBook();
 		const pool = new CredentialPool(store, {
 			policies,
 			blockHealth,
@@ -227,8 +253,8 @@ export class AuthStorage {
 				selector.resetRoundRobin(provider);
 				affinity.clearProvider(provider);
 			},
-			onCredentialIdentityChanged: (provider, credentialId, previous, next) =>
-				coordination.maybeBumpIncarnation(provider, credentialId, previous, next),
+			onCredentialIdentityChanged: (provider, id, previous, next) =>
+				coordination.maybeBumpIncarnation(provider, id, previous, next),
 		});
 		const refresher = new OAuthRefresher({
 			store,
@@ -240,8 +266,17 @@ export class AuthStorage {
 		// Key reports by the effective provider (runtime extension override first), so an
 		// override's `cacheVersion` separates its rows from other processes sharing the store.
 		const usageCache = new UsageCache(store, pool, provider => usage.providerFor(provider));
-		const blocks = new CredentialBlocks({ store, pool, health: blockHealth, usageCache, strategies, probeBook });
+		const probeLeases = new QuotaProbeLeaseBook();
+		const blocks = new CredentialBlocks({
+			store,
+			pool,
+			health: blockHealth,
+			usageCache,
+			strategies,
+			probeBook: probeLeases,
+		});
 		const affinity = new SessionAffinity(store, pool, overrides, this.#restrictions);
+		const coordination = new CredentialCoordination({ pool, blocks, affinity, usageCache, strategies, probeLeases });
 		const usage = new UsageService({
 			store,
 			pool,
@@ -260,14 +295,6 @@ export class AuthStorage {
 					debug: (message, meta) => logger.debug(message, meta),
 					warn: (message, meta) => logger.warn(message, meta),
 				} satisfies UsageLogger),
-		});
-		const coordination = new CredentialCoordination({
-			pool,
-			blocks,
-			affinity,
-			usageCache,
-			strategies,
-			probeLeases: probeBook,
 		});
 		const selector = new CredentialSelector({
 			store,
@@ -293,11 +320,11 @@ export class AuthStorage {
 		const oauth = new OAuthAccounts({ pool, overrides, policies, selector, affinity, refresher });
 
 		return {
-			coordination,
 			pool,
 			keys,
 			oauth,
 			sessions: affinity,
+			responses: new ResponseOwners(store),
 			usage,
 			health: new CredentialHealth({
 				store,
@@ -314,6 +341,7 @@ export class AuthStorage {
 			limits,
 			resets: new ResetCredits({ store, pool, oauth, usage, usageCache, blocks }),
 			blocks,
+			coordination,
 		};
 	}
 
@@ -328,452 +356,34 @@ export class AuthStorage {
 		this.#modules.pool.close();
 	}
 
-	// ─────────────────────────────────────────────────────────────────────────────
-	// Pre-namespace flat API — kept for the coding-agent, TUI, gateway, and test
-	// callers written before the module split. Everything below delegates to the
-	// namespaces above; new code should use them directly.
-	// ─────────────────────────────────────────────────────────────────────────────
-
-	// Generation / events ------------------------------------------------------
-
-	getGeneration(): number {
-		return this.credentials.generation;
-	}
-
-	async pollExternalChanges(): Promise<boolean> {
-		return this.credentials.poll();
-	}
-
-	onGenerationChanged(listener: (generation: number) => void): () => void {
-		const unsubscribe = this.credentials.onGeneration(listener);
-		this.#generationUnsubscribes.set(listener, unsubscribe);
-		return () => this.offGenerationChanged(listener);
-	}
-
-	offGenerationChanged(listener: (generation: number) => void): void {
-		this.#generationUnsubscribes.get(listener)?.();
-		this.#generationUnsubscribes.delete(listener);
-	}
-
-	onCredentialDisabled(listener: (event: CredentialDisabledEvent) => void | Promise<void>): () => void {
-		return this.credentials.onDisabled(listener);
-	}
-
-	// Key overrides ------------------------------------------------------------
-
-	setRuntimeApiKey(provider: string, apiKey: string): void {
-		this.keys.setRuntime(provider, apiKey);
-	}
-
-	removeRuntimeApiKey(provider: string): void {
-		this.keys.removeRuntime(provider);
-	}
-
-	setConfigApiKey(provider: string, apiKeyConfig: string): void {
-		this.keys.setConfig(provider, apiKeyConfig);
-	}
-
-	removeConfigApiKey(provider: string): void {
-		this.keys.removeConfig(provider);
-	}
-
-	clearConfigApiKeys(): void {
-		this.keys.clearConfig();
-	}
-
-	setConfigValueResolver(resolver: (config: string) => Promise<string | undefined>): void {
-		this.keys.setResolver(resolver);
-	}
-
-	setRuntimeUsageProvider(provider: Provider, usageProvider: UsageProvider, apiKey?: string): void {
-		this.usage.setProvider(provider, usageProvider, apiKey);
-	}
-
-	removeRuntimeUsageProvider(provider: Provider): void {
-		this.usage.removeProvider(provider);
-	}
-
-	// Credentials --------------------------------------------------------------
-
-	reload(): Promise<void> {
-		return this.credentials.reload();
-	}
-
-	get(provider: string): AuthCredential | undefined {
-		return this.credentials.get(provider);
-	}
-
-	set(provider: string, credential: AuthCredentialEntry): Promise<void> {
-		return this.credentials.set(provider, credential);
-	}
-
-	listStoredCredentials(provider?: string): StoredAuthCredential[] {
-		return this.credentials.list(provider);
-	}
-
-	list(provider?: string): StoredAuthCredential[] {
-		return this.credentials.list(provider);
-	}
-
-	remove(provider: string): Promise<void> {
-		return this.credentials.remove(provider);
-	}
-
-	removeCredential(provider: string, credentialId: number): Promise<boolean> {
-		return this.credentials.removeById(provider, credentialId);
-	}
-
-	has(provider: string): boolean {
-		return this.credentials.has(provider);
-	}
-
-	hasOAuth(provider: string): boolean {
-		return this.credentials.hasOAuth(provider);
-	}
-
-	getOAuthCredential(provider: string) {
-		return this.credentials.getOAuth(provider);
-	}
-
-	getAll() {
-		return this.credentials.all();
-	}
-
-	exportSnapshot(): AuthCredentialSnapshot {
-		return this.credentials.snapshot();
-	}
-
-	listDisabledCredentials(provider?: string, signal?: AbortSignal): Promise<DisabledCredentialSummary[]> {
-		return this.credentials.listDisabled(provider, signal);
-	}
-
-	revalidateCredentials(): Promise<void> {
-		return this.credentials.revalidate();
-	}
-
-	disableCredentialById(id: number, disabledCause: string): Promise<boolean> {
-		return this.credentials.disable(id, disabledCause);
-	}
-
-	disableCredentialByIdAsync(id: number, disabledCause: string): Promise<boolean> {
-		return this.credentials.disable(id, disabledCause);
-	}
-
-	upsertCredential(provider: string, credential: AuthCredential): Promise<AuthCredentialSnapshotEntry[]> {
-		return this.credentials.upsert(provider, credential);
-	}
-
-	// Auth-source classification ------------------------------------------------
-
-	getCredentialOrigin(provider: string): CredentialOrigin | undefined {
-		return this.keys.source(provider);
-	}
-
-	describeCredentialSource(provider: string, sessionId?: string): string | undefined {
-		return this.keys.describe(provider, sessionId);
-	}
-
-	hasKeylessPlaceholder(provider: string): boolean {
-		return this.keys.keyless(provider);
-	}
-
-	hasAuth(provider: string): boolean {
-		return this.keys.source(provider) !== undefined;
-	}
-
-	hasConcreteAuth(provider: string): boolean {
-		return this.keys.source(provider)?.concrete === true;
-	}
-
-	hasResolvableAuth(provider: string): boolean {
-		return this.keys.source(provider, { env: "aliases" }) !== undefined;
-	}
-
-	hasNonEnvCredential(provider: string): boolean {
-		const source = this.keys.source(provider);
-		return source !== undefined && source.kind !== "env";
-	}
-
-	// Key resolution ------------------------------------------------------------
-
-	peekApiKey(provider: string): Promise<string | undefined> {
-		return this.keys.peek(provider);
-	}
-
-	/**
-	 * Sync peek of runtime/config override credentials only.
-	 *
-	 * Mirrors the first two legs of {@link peekApiKey} / {@link getApiKey}
-	 * (CLI `--api-key`, then `models.yml` `providers.*.apiKey`) so synchronous
-	 * callers — e.g. credential-scoped startup cache hashing — share the same
-	 * precedence without inventing a second ordering.
-	 */
+	/** Return configured key overrides without resolving or selecting a stored account. */
 	peekApiKeyOverrides(provider: string): string | undefined {
 		return this.#overrides.runtimeKey(provider) ?? this.#overrides.configKey(provider);
 	}
 
+	/** Attribute a resolved OAuth bearer to its stored physical account, not a mutable session cursor. */
+	getCredentialIdentityMatchingApiKey(provider: string, apiKey: string): string | undefined {
+		if (this.peekApiKeyOverrides(provider) !== undefined) return undefined;
+		const bearer = extractStructuredApiKeyToken(apiKey) ?? apiKey;
+		const row = this.#modules.pool
+			.entries(provider)
+			.find(entry => entry.credential.type === "oauth" && entry.credential.access === bearer);
+		return row ? (resolveCredentialStateScopeKey(provider, row.credential) ?? undefined) : undefined;
+	}
+
+	/**
+	 * Legacy redirect for callers of the pre-namespace flat API (e.g. repo scripts).
+	 * @deprecated Use {@link AuthStorage.keys}`.get`.
+	 */
 	getApiKey(provider: string, sessionId?: string, options?: AuthApiKeyOptions): Promise<string | undefined> {
 		return this.keys.get(provider, sessionId, options);
 	}
 
-	resolver(provider: string, options?: { sessionId?: string; baseUrl?: string; modelId?: string }): ApiKeyResolver {
-		return this.keys.resolver(provider, options);
-	}
-
-	// OAuth --------------------------------------------------------------------
-
-	login(
-		provider: Parameters<OAuthApi["login"]>[0],
-		ctrl: OAuthLoginController,
-	): Promise<OAuthLoginIdentity | undefined> {
-		return this.oauth.login(provider, ctrl);
-	}
-
-	async logout(provider: string): Promise<void> {
-		await this.credentials.remove(provider);
-	}
-
-	getOAuthAccess(provider: string, sessionId?: string, options?: AuthApiKeyOptions): Promise<OAuthAccess | undefined> {
-		return this.oauth.access(provider, sessionId, options);
-	}
-
-	getOAuthAccesses(provider: string, options?: AuthApiKeyOptions): Promise<OAuthAccessResolution[]> {
-		return this.oauth.accessAll(provider, options);
-	}
-
-	getOAuthAccessAt(
-		provider: string,
-		position: number,
-		options?: AuthApiKeyOptions,
-	): Promise<OAuthAccessResolution | undefined> {
-		const account = this.oauth.accounts(provider)[position];
-		if (!account) return Promise.resolve(undefined);
-		return this.oauth.accessById(provider, account.credentialId, options);
-	}
-
-	getOAuthAccessByCredentialId(
-		provider: string,
-		credentialId: number,
-		options?: AuthApiKeyOptions,
-	): Promise<OAuthAccessResolution | undefined> {
-		return this.oauth.accessById(provider, credentialId, options);
-	}
-
-	listOAuthAccounts(provider: string, sessionId?: string): OAuthAccountSummary[] {
-		return this.oauth.accounts(provider, sessionId);
-	}
-
-	getOAuthAccountId(provider: string, sessionId?: string): string | undefined {
-		const accountId = this.oauth.identity(provider, sessionId)?.accountId;
-		return typeof accountId === "string" && accountId.length > 0 ? accountId : undefined;
-	}
-
-	getOAuthAccountIdentity(provider: string, sessionId?: string): OAuthAccountIdentity | undefined {
-		return this.oauth.identity(provider, sessionId);
-	}
-
-	refreshCredentialById(id: number, signal?: AbortSignal): Promise<AuthCredentialSnapshotEntry> {
-		return this.oauth.refresh(id, signal);
-	}
-
-	forceRefreshCredentialById(id: number, signal?: AbortSignal): Promise<AuthCredentialSnapshotEntry> {
-		return this.oauth.refresh(id, signal);
-	}
-
-	pinSessionOAuthAccount(
-		provider: string,
-		sessionId: string,
-		credentialId: number,
-		options?: { lastUsedAtMs?: number },
-	): boolean {
-		return this.sessions.pin(provider, sessionId, credentialId, { restoredAtMs: options?.lastUsedAtMs });
-	}
-
-	inheritSessionCredentials(sourceSessionId: string, targetSessionId: string): number {
-		return this.sessions.inherit(sourceSessionId, targetSessionId);
-	}
-
-	releaseSessionCredentialForReselection(provider: string, sessionId: string): boolean {
-		return this.sessions.release(provider, sessionId);
-	}
-
-	// Usage --------------------------------------------------------------------
-
-	fetchUsageReports(options?: {
-		baseUrlResolver?: (provider: Provider) => string | undefined;
-		signal?: AbortSignal;
-	}): Promise<UsageReport[] | null> {
-		return this.usage.reports(options);
-	}
-
-	listUsageHistory(query?: UsageHistoryQuery): UsageHistoryEntry[] {
-		return this.usage.history(query);
-	}
-
-	recordObservedUsage(entry: ObservedUsageInput): void {
-		this.usage.observe(entry);
-	}
-
-	recordClientUsage(report: ClientUsageReport): boolean {
-		return this.usage.recordClient(report);
-	}
-
-	getClientUsageSummary(sinceMs: number): ClientUsageSummary {
-		return this.usage.clientSummary(sinceMs);
-	}
-
-	ingestUsageHeaders(
-		provider: Provider,
-		headers: Record<string, string>,
-		options?: { sessionId?: string; baseUrl?: string; responseStatus?: number },
-	): boolean {
-		return this.usage.ingestHeaders(provider, headers, options);
-	}
-
-	usageProviderFor(provider: Provider): UsageProvider | undefined {
-		return this.usage.providerFor(provider);
-	}
-
-	getUsageReportingModelIds(
-		provider: Provider,
-		modelIds: readonly string[],
-		reports: readonly UsageReport[],
-	): string[] {
-		return this.usage.reportingModelIds(provider, modelIds, reports);
-	}
-
-	invalidateUsageCache(provider?: Provider, signal?: AbortSignal): Promise<void> {
-		return this.usage.invalidate(provider, signal);
-	}
-
-	// Health -------------------------------------------------------------------
-
-	getModelUsageHealth(provider: Provider, options: ModelUsageHealthOptions): Promise<ModelUsageHealth> {
-		return this.health.model(provider, options);
-	}
-
-	checkCredentials(options?: CheckCredentialsOptions): Promise<CredentialHealthResult[]> {
-		return this.health.check(options);
-	}
-
-	// Rate limits / rotation ----------------------------------------------------
-
-	markUsageLimitReached(
-		provider: string,
-		sessionId: string | undefined,
-		options?: MarkUsageLimitOptions,
-	): Promise<UsageLimitMarkResult> {
-		return this.limits.markReached(provider, sessionId, options);
-	}
-
-	async rotateSessionCredential(
-		provider: string,
-		sessionId: string | undefined,
-		options?: Parameters<LimitsApi["rotate"]>[2],
-	): Promise<boolean> {
-		return (await this.limits.rotate(provider, sessionId, options)).switched;
-	}
-
-	invalidateCredentialMatching(
-		provider: string,
-		apiKey: string,
-		options?: Parameters<LimitsApi["invalidateMatching"]>[2],
-	): Promise<boolean> {
-		return this.limits.invalidateMatching(provider, apiKey, options);
-	}
-
-	// Reset credits --------------------------------------------------------------
-
-	listResetCredits(options?: ListResetCreditsOptions) {
-		return this.resets.list(options);
-	}
-
-	redeemResetCredit(options: RedeemResetCreditOptions): Promise<ResetCreditRedeemOutcome> {
-		return this.resets.redeem(options);
-	}
-
-	// Persisted blocks -----------------------------------------------------------
-
-	listCredentialBlocks(credentialIds: readonly number[]): StoredCredentialBlock[] {
-		return this.blocks.list(credentialIds);
-	}
-
-	upsertCredentialBlock(block: StoredCredentialBlock): void {
-		this.blocks.upsert(block);
-	}
-
-	deleteCredentialBlock(credentialId: number, providerKey: string, blockScope: string): void {
-		this.blocks.delete(credentialId, providerKey, blockScope);
-	}
-
-	deleteCredentialBlocks(credentialId: number): void {
-		this.blocks.deleteAll(credentialId);
-	}
-
-	// In-process coordination (fork feature: reservations, probe leases, ---------
-	// incarnation tracking) ------------------------------------------------------
-
 	/**
-	 * True when the provider has stored credentials but every candidate is under
-	 * an active backoff / Retry-After / probe-lease hold (so getApiKey returned
-	 * undefined for quota reasons rather than missing auth).
+	 * Legacy redirect for callers of the pre-namespace flat API (e.g. repo scripts).
+	 * @deprecated Use {@link AuthStorage.credentials}`.reload`.
 	 */
-	hasCoolingDownCredentials(provider: string, modelId?: string): boolean {
-		return this.#modules.coordination.hasCoolingDownCredentials(provider, modelId);
-	}
-
-	getCredentialIncarnation(credentialId: number): number {
-		return this.#modules.coordination.getCredentialIncarnation(credentialId);
-	}
-
-	tryAcquireTurnReservation(args: {
-		credentialId: number;
-		incarnation: number;
-		requestId: string;
-		ttlMs?: number;
-	}): TurnReservationResult {
-		return this.#modules.coordination.tryAcquireTurnReservation(args);
-	}
-
-	releaseTurnReservation(requestId: string): void {
-		this.#modules.coordination.releaseTurnReservation(requestId);
-	}
-
-	/** Extend every live reservation held by `requestId` so long streams outlive the idle TTL. */
-	renewTurnReservation(requestId: string, ttlMs?: number): void {
-		this.#modules.coordination.renewTurnReservation(requestId, ttlMs);
-	}
-
-	tryAcquireQuotaProbeLease(credentialId: number, blockScope: string): string | null {
-		return this.#modules.coordination.tryAcquireQuotaProbeLease(credentialId, blockScope);
-	}
-
-	recordQuotaProbeSuccess(credentialId: number, blockScope: string, leaseId: string | null): boolean {
-		return this.#modules.coordination.recordQuotaProbeSuccess(credentialId, blockScope, leaseId);
-	}
-
-	noteTransientSoftAvoid(credentialId: number, blockScope: string, untilMs: number): void {
-		this.#modules.coordination.noteTransientSoftAvoid(credentialId, blockScope, untilMs);
-	}
-
-	/**
-	 * Drop an inflight quota probe for `requestId` without clearing cooldown.
-	 * Call when the attempt is abandoned (fallback / turn release) so a later
-	 * request can acquire a fresh lease.
-	 */
-	clearQuotaProbe(requestId: string): void {
-		this.#modules.coordination.clearQuotaProbe(requestId);
-	}
-
-	settleQuotaProbeSuccess(requestId: string): boolean {
-		return this.#modules.coordination.settleQuotaProbeSuccess(requestId);
-	}
-
-	clearAnonymousQuotaProbe(credentialId: number, blockScope: string): void {
-		this.#modules.coordination.clearAnonymousQuotaProbe(credentialId, blockScope);
-	}
-
-	settleAnonymousQuotaProbe(credentialId: number, blockScope: string): boolean {
-		return this.#modules.coordination.settleAnonymousQuotaProbe(credentialId, blockScope);
+	reload(): Promise<void> {
+		return this.credentials.reload();
 	}
 }

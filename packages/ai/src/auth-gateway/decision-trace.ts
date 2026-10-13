@@ -53,7 +53,7 @@ export class RouteDecisionTraceLog {
 	#traces: RouteDecisionTrace[] = [];
 
 	record(input: RouteDecisionTraceInput, nowMs: number = Date.now()): RouteDecisionTrace {
-		if (input.disposition === "skipped") {
+		if (input.disposition === "skipped" || input.reason !== undefined) {
 			if (input.reason === undefined || SKIP_REASONS[input.reason] !== true) {
 				throw new Error("skipped route decision requires an allow-listed reason");
 			}
@@ -67,6 +67,7 @@ export class RouteDecisionTraceLog {
 			recordedAtMs: nowMs,
 		};
 		if (input.reason !== undefined) trace.reason = input.reason;
+		Object.freeze(trace);
 		this.#evict(nowMs);
 		this.#traces.push(trace);
 		if (this.#traces.length > MAX_TRACES) {
@@ -77,12 +78,7 @@ export class RouteDecisionTraceLog {
 
 	list(nowMs: number = Date.now()): readonly RouteDecisionTrace[] {
 		this.#evict(nowMs);
-		return this.#traces;
-	}
-
-	get(requestId: string, nowMs: number = Date.now()): readonly RouteDecisionTrace[] {
-		this.#evict(nowMs);
-		return this.#traces.filter(trace => trace.requestId === requestId);
+		return [...this.#traces];
 	}
 
 	#evict(nowMs: number): void {

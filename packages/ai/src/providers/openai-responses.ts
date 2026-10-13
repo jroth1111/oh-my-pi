@@ -535,7 +535,8 @@ export function configureProviderStoreResponses(byProvider: Readonly<Record<stri
 }
 
 /**
- * Whether this request stores its result server-side. Only hosts whose rule
+ * Whether this request stores its result server-side. An explicit wire `store`
+ * value wins. Otherwise only hosts whose rule
  * sets `store-responses` (they finish runs after a client disconnect, so a
  * dropped stream can be resumed) are eligible, and storage is opt-in:
  * `options.storeResponses`, then `PI_MUSE_STORE_RESPONSES`, then the host
@@ -547,6 +548,7 @@ function storesResponsesServerSide(
 	model: Model<"openai-responses">,
 	options: OpenAIResponsesOptions | undefined,
 ): boolean {
+	if (options?.store !== undefined) return options.store;
 	if (model.compat.storeResponses !== true) return false;
 	return (
 		options?.storeResponses ??
@@ -558,6 +560,8 @@ function isOpenAIResponsesStatefulEnabled(
 	options: OpenAIResponsesOptions | undefined,
 	model: Model<"openai-responses">,
 ): boolean {
+	// Explicit wire storage consent outranks the implicit chain default.
+	if ((options?.store ?? options?.storeResponses) === false) return false;
 	// Chaining forces `store: true`, so a storing host whose storage is off
 	// must never chain — not even when the caller asks for it.
 	if (model.compat.storeResponses === true && !storesResponsesServerSide(model, options)) return false;
@@ -838,24 +842,21 @@ const streamOpenAIResponsesOnce = (
 				// Platform `previous_response_id` chaining only resolves stored responses.
 				params.store = true;
 			}
-			if (options?.previousResponseId || options?.store === true) {
-				// Continuations and explicit store requests need persisted responses.
-				// store must be true on the *creating* turn as well as the follow-up.
-				params.store = true;
-			}
 			applyReasoningEffortFallbackForRequest(params);
-			if (options?.store === true || options?.previousResponseId) params.store = true;
+			if (options?.store !== undefined) params.store = options.store;
 			// A caller-supplied `previous_response_id` names the client's own stored
 			// response; internal chain deltas are computed against a DIFFERENT
 			// baseline (the provider session's last response), so pairing them with
 			// the client's id would send the delta to the wrong conversation.
-			// Branch before any delta construction — the client id wins.
+			// Branch before any delta construction — the client id wins. An empty
+			// string still counts as supplied: the malformed id reaches upstream
+			// validation rather than silently continuing a different stored chain.
 			const clientPreviousResponseId = options?.previousResponseId;
 			const hasClientPreviousResponseId = clientPreviousResponseId !== undefined;
 			let chainedInternal = false;
 			let chained: OpenAIResponsesChainedParams = hasClientPreviousResponseId
 				? {
-						params: { ...params, previous_response_id: clientPreviousResponseId, store: true },
+						params: { ...params, previous_response_id: clientPreviousResponseId },
 						previousResponseId: clientPreviousResponseId,
 					}
 				: chainState && !chainState.disabled
@@ -1015,16 +1016,9 @@ const streamOpenAIResponsesOnce = (
 								chainState?.canAppend ? chainState.lastParams?.input : undefined,
 							);
 							const fallbackParams = fallbackBuilt.params;
-							// Rebuild starts from store:false; reapply explicit client store /
-							// continuation and internal chain requirements onto the retry.
-							if (
-								(chainState && !chainState.disabled) ||
-								options?.previousResponseId ||
-								options?.store === true ||
-								activeRequestParams?.store === true
-							) {
-								fallbackParams.store = true;
-							}
+							// Retain the actual request's storage intent, including explicit
+							// opt-out and onPayload overrides, without inferring consent from an id.
+							if (activeRequestParams?.store !== undefined) fallbackParams.store = activeRequestParams.store;
 							const fallbackClientPreviousResponseId = options?.previousResponseId;
 							const hasFallbackClientPreviousResponseId = fallbackClientPreviousResponseId !== undefined;
 							let fallbackChained: OpenAIResponsesChainedParams = hasFallbackClientPreviousResponseId
@@ -1201,7 +1195,7 @@ const streamOpenAIResponsesOnce = (
 							// forces `store: true` on official OpenAI too, where a dropped run
 							// is not known to finish server-side and polling would only park
 							// a turn that used to fail fast.
-							storeEnabled: storesResponsesServerSide(model, options),
+							storeEnabled: model.compat.storeResponses === true && storesResponsesServerSide(model, options),
 							partialContent: output.content,
 							failure: streamFailure,
 						})

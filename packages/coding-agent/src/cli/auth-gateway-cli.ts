@@ -254,11 +254,11 @@ export function indexModelsByRequestId(
 /** Refresh routing against the credential snapshot that is current after discovery. */
 export async function refreshAuthGatewayModelIndex(
 	registry: Pick<ModelRegistry, "refresh" | "getAll">,
-	storage: Pick<AuthStorage, "listStoredCredentials" | "reload">,
+	storage: Pick<AuthStorage, "credentials">,
 ): Promise<Map<string, Model<Api>>> {
-	await storage.reload();
+	await storage.credentials.reload();
 	await registry.refresh();
-	const providers = new Set(storage.listStoredCredentials().map(entry => entry.provider));
+	const providers = new Set(storage.credentials.list().map(entry => entry.provider));
 	return indexModelsByRequestId(registry.getAll(), providers);
 }
 
@@ -316,6 +316,14 @@ export function createSerializedRebuilder(run: (force: boolean) => Promise<void>
 }
 
 async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
+	if (flags.routes !== undefined && flags.routes.trim().length === 0)
+		throw new Error("`omp auth-gateway serve --routes` requires a file path");
+	// Validate before contacting the broker or creating private token/cache files.
+	const settings = await resolveEffectiveSettings();
+	const routesPath = flags.routes ?? cfgAuthGatewayRoutesFile.get(settings);
+	if (routesPath !== undefined && !routesPath.trim())
+		throw new Error("`auth.gateway.routesFile` requires a file path");
+	const routes = routesPath === undefined ? undefined : await loadRouteDefinitionsFile(routesPath);
 	const brokerConfig = await resolveAuthBrokerConfig();
 	if (!brokerConfig) {
 		throw new Error(
@@ -324,11 +332,12 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 	}
 	const bind = flags.bind ?? DEFAULT_AUTH_GATEWAY_BIND;
 	const gatewayToken = flags.noAuth ? null : await ensureToken();
+	// Management is explicitly opt-in and never shares the inference/no-auth capability.
+	const adminToken = process.env.OMP_AUTH_GATEWAY_ADMIN_TOKEN?.trim();
 
 	// Build a broker-backed AuthStorage — same pattern as discoverAuthStorage()
-	// in sdk.ts. The gateway never touches local SQLite.
+	// in sdk.ts. Credentials remain broker-only; private routing metadata has its own database.
 	const accountPool = await loadAuthBrokerAccountPool();
-	const settings = await resolveEffectiveSettings();
 	const { accountPolicies, defaultReservePct } = await loadEffectiveAuthAccountPolicyConfig({ settings });
 	const client = createBrokerClient(brokerConfig);
 	const initialSnapshot = await fetchBrokerSnapshot(client);
@@ -336,6 +345,11 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 		client,
 		initialSnapshot,
 		accountPool,
+		metadataCachePath: path.join(
+			getConfigRootDir(),
+			"auth-gateway",
+			`state-${Bun.SHA256.hash(brokerConfig.url.replace(/\/+$/, ""), "hex")}.db`,
+		),
 	});
 	// Refresh + usage both flow through the store's broker hooks automatically —
 	// `RemoteAuthCredentialStore.refreshOAuthCredential` and `.fetchUsageReports`.
@@ -380,14 +394,6 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 	});
 	await rebuildCatalog();
 
-	let configRoutesFile: string | undefined;
-	if (flags.routes === undefined) {
-		const loaded = isSettingsInitialized() ? Settings.instance : await Settings.loadReadOnly();
-		configRoutesFile = cfgAuthGatewayRoutesFile.get(loaded);
-	}
-	const routePath = resolveAuthGatewayRoutesPath(flags.routes, configRoutesFile);
-	const routes = routePath !== undefined ? await loadRouteDefinitionsFile(routePath) : undefined;
-
 	const handle = startAuthGateway({
 		storage,
 		bind,
@@ -396,8 +402,10 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 		version: VERSION,
 		resolveModel: (id: string) => resolveGatewayModel(id, modelById, routable),
 		listModels: () => modelById.values(),
-		...(routes !== undefined ? { routes } : {}),
 		excludeProviders: new Set(cfgDisabledProviders.get(settings)),
+		routes,
+		allowManagement: Boolean(adminToken),
+		adminBearerTokens: adminToken ? [adminToken] : [],
 	});
 	process.stdout.write(`auth-gateway listening on ${handle.url}\n`);
 	if (gatewayToken) {
@@ -579,6 +587,8 @@ async function runStatus(flags: AuthGatewayCommandArgs["flags"]): Promise<void> 
 }
 
 export async function runAuthGatewayCommand(cmd: AuthGatewayCommandArgs): Promise<void> {
+	if (cmd.flags.routes !== undefined && cmd.action !== "serve")
+		throw new Error("`--routes` is only supported by `omp auth-gateway serve`");
 	switch (cmd.action) {
 		case "serve":
 			await runServe(cmd.flags);

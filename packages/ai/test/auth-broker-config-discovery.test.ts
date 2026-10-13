@@ -161,7 +161,10 @@ describe("resolveAuthBrokerConfig config discovery", () => {
 		});
 
 		await withEnv(SUPPRESS_AUTH_BROKER_ENV, async () => {
-			const storage = await discoverAuthStorage({ agentDir });
+			const storage = await discoverAuthStorage({
+				agentDir,
+				authStorageOptions: { usageProviderResolver: () => undefined },
+			});
 			try {
 				await storage.credentials.set("openai-codex", [
 					{

@@ -296,12 +296,14 @@ test("catalog refresh includes newly credentialed providers and removes revoked 
 	const model = getBundledModels("anthropic")[0]!;
 	let credentials: StoredAuthCredential[] = [];
 	let afterDiscovery: StoredAuthCredential[] = [];
-	const storage: Pick<AuthStorage, "listStoredCredentials" | "reload"> = {
-		listStoredCredentials: () => credentials,
-		reload: async () => {
-			credentials = afterDiscovery;
+	const storage = {
+		credentials: {
+			list: () => credentials,
+			reload: async () => {
+				credentials = afterDiscovery;
+			},
 		},
-	};
+	} as Pick<AuthStorage, "credentials">;
 	const registry: Pick<ModelRegistry, "refresh" | "getAll"> = { refresh: async () => {}, getAll: () => [model] };
 	expect((await refreshAuthGatewayModelIndex(registry, storage)).has(`${model.provider}/${model.id}`)).toBe(false);
 	afterDiscovery = [

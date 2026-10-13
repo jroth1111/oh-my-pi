@@ -141,11 +141,6 @@ export class SessionAffinity implements SessionsApi {
 		}
 	}
 
-	/** Drop only this in-memory session pin after OAuth selection falls through. */
-	forget(provider: string, sessionId: string): void {
-		this.#sessionLastCredential.get(provider)?.delete(sessionId);
-	}
-
 	/**
 	 * Drop every session pin that resolves to `credentialId` — called when the
 	 * row's physical identity changes (incarnation bump) so stale pins can't
@@ -154,21 +149,29 @@ export class SessionAffinity implements SessionsApi {
 	 */
 	clearCredential(provider: string, credentialId: number): void {
 		const sessionMap = this.#sessionLastCredential.get(provider);
-		if (!sessionMap) return;
 		const index = this.#pool.entries(provider).findIndex(entry => entry.id === credentialId);
-		for (const sessionId of sessionMap.keys()) {
-			const sticky = sessionMap.peek(sessionId);
-			if (!sticky) continue;
-			if (sticky.credentialId === credentialId || (sticky.credentialId === undefined && sticky.index === index)) {
-				sessionMap.delete(sessionId);
+		if (sessionMap) {
+			for (const sessionId of sessionMap.keys()) {
+				const sticky = sessionMap.peek(sessionId);
+				if (
+					sticky &&
+					(sticky.credentialId === credentialId || (sticky.credentialId === undefined && sticky.index === index))
+				) {
+					sessionMap.delete(sessionId);
+				}
 			}
+			if (sessionMap.size === 0) this.#sessionLastCredential.delete(provider);
 		}
-		if (sessionMap.size === 0) this.#sessionLastCredential.delete(provider);
 		try {
 			this.#store.deleteCachePrefix?.(`${SESSION_STICKY_CACHE_PREFIX}${provider}:`);
 		} catch (err) {
 			logger.debug("Failed to clear provider session sticky credentials from persistent store cache", { err });
 		}
+	}
+
+	/** Drop only this in-memory session pin after OAuth selection falls through. */
+	forget(provider: string, sessionId: string): void {
+		this.#sessionLastCredential.get(provider)?.delete(sessionId);
 	}
 
 	/**
@@ -245,6 +248,11 @@ export class SessionAffinity implements SessionsApi {
 		if (!sessionId) return undefined;
 		const credential = this.#lookup(provider, sessionId);
 		return credential && this.#permits(provider, sessionId, credential.index) ? credential : undefined;
+	}
+
+	explicitCredentialId(provider: string, sessionId: string): number | undefined {
+		const pin = this.get(provider, sessionId);
+		return pin?.explicit ? pin.credentialId : undefined;
 	}
 
 	#lookup(provider: string, sessionId: string): SessionCredential | undefined {

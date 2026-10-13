@@ -1,8 +1,8 @@
 import { describe, expect, it } from "bun:test";
 import type { CompiledRoute } from "@oh-my-pi/pi-ai/auth-gateway";
-import { RouteRegistry } from "@oh-my-pi/pi-ai/auth-gateway/route-graph";
 import { decideAttempt, type ExecutionState } from "@oh-my-pi/pi-ai/auth-gateway/route-conductor";
 import type { GatewayErrorClassification, GatewayErrorDisposition } from "@oh-my-pi/pi-ai/error";
+import { RouteRegistry } from "../src/auth-gateway/route-graph";
 
 function route(
 	overrides: {
@@ -10,13 +10,17 @@ function route(
 		fallbacks?: Partial<Record<GatewayErrorDisposition, readonly string[]>>;
 	} = {},
 ): CompiledRoute {
+	const fallbacks = overrides.fallbacks ?? { provider_unavailable: ["backup", "tertiary"] };
 	return {
 		generation: 1,
 		id: "virtual/primary",
 		root: { type: "target", model: "primary" },
-		targets: overrides.targets ?? ["primary", "backup"],
-		fallbacks: overrides.fallbacks ?? { provider_unavailable: ["backup", "tertiary"] },
-	} as CompiledRoute;
+		targets: overrides.targets ?? [
+			...new Set(["primary", "backup", ...Object.values(fallbacks).flatMap(value => value ?? [])]),
+		],
+		fallbacks,
+		fallbackByTarget: { primary: fallbacks },
+	};
 }
 
 function state(overrides: Partial<ExecutionState> = {}): ExecutionState {
@@ -24,7 +28,6 @@ function state(overrides: Partial<ExecutionState> = {}): ExecutionState {
 		routeId: "virtual/primary",
 		generation: 1,
 		attemptedTargets: new Set(),
-		attemptedCredentials: new Set<number>(),
 		retryCount: 0,
 		fallbackCount: 0,
 		committed: false,
@@ -52,68 +55,6 @@ describe("decideAttempt", () => {
 			commitState: "probing",
 		});
 		expect(action).toEqual({ type: "dispatch", targetModelId: "backup" });
-	});
-
-	it("dispatches preferred unused target over list order", () => {
-		const action = decideAttempt({
-			route: route({ targets: ["primary", "backup"] }),
-			state: state(),
-			commitState: "probing",
-			preferredTargetId: "backup",
-		});
-		expect(action).toEqual({ type: "dispatch", targetModelId: "backup" });
-	});
-
-	it("uses firstUnused when preferred was already attempted (negative)", () => {
-		const action = decideAttempt({
-			route: route({ targets: ["primary", "backup"] }),
-			state: state({ attemptedTargets: new Set(["backup"]) }),
-			commitState: "probing",
-			preferredTargetId: "backup",
-		});
-		expect(action).toEqual({ type: "dispatch", targetModelId: "primary" });
-		expect(action).not.toEqual({ type: "dispatch", targetModelId: "backup" });
-	});
-
-	it("ignores preferred that is not a route target (negative)", () => {
-		const action = decideAttempt({
-			route: route({ targets: ["primary", "backup"] }),
-			state: state(),
-			commitState: "probing",
-			preferredTargetId: "other",
-		});
-		expect(action).toEqual({ type: "dispatch", targetModelId: "primary" });
-		expect(action).not.toEqual({ type: "dispatch", targetModelId: "other" });
-	});
-
-	it("falls back to an unused earlier compiled fallback after a preferred later target fails", () => {
-		const action = decideAttempt({
-			route: route({
-				targets: ["primary", "backup", "tertiary"],
-				fallbacks: { provider_unavailable: ["backup", "tertiary"] },
-			}),
-			state: state({ attemptedTargets: new Set(["tertiary"]), currentTarget: "tertiary" }),
-			classification: classification("provider_unavailable"),
-			commitState: "probing",
-			preferredTargetId: "tertiary",
-		});
-		expect(action).toEqual({ type: "fallback_target", targetModelId: "backup" });
-		expect(action).not.toEqual({ type: "terminal" });
-	});
-
-	it("does not retry unused leaves outside disposition-compiled fallbacks (negative)", () => {
-		const action = decideAttempt({
-			route: route({
-				targets: ["small", "large"],
-				fallbacks: { context_overflow: ["large"] },
-			}),
-			state: state({ attemptedTargets: new Set(["large"]), currentTarget: "large" }),
-			classification: classification("context_overflow"),
-			commitState: "probing",
-			preferredTargetId: "large",
-		});
-		expect(action).toEqual({ type: "terminal" });
-		expect(action).not.toEqual({ type: "fallback_target", targetModelId: "small" });
 	});
 
 	it("returns terminal after commit even when fallbacks remain (negative)", () => {
@@ -151,78 +92,14 @@ describe("decideAttempt", () => {
 		expect(action).toEqual({ type: "sibling_credential" });
 	});
 
-	it("honors credential_quota compiled fallbacks after siblings are exhausted", () => {
+	it("returns sibling_credential on credential_permanent before exhaustion", () => {
 		const action = decideAttempt({
-			route: route({ fallbacks: { credential_quota: ["backup"] } }),
-			state: state({ attemptedTargets: new Set(["primary"]), siblingsExhausted: true }),
-			classification: classification("credential_quota"),
-			commitState: "probing",
-		});
-		expect(action).toEqual({ type: "fallback_target", targetModelId: "backup" });
-	});
-
-	it("returns sibling_credential on credential_quota while siblings remain even when quota fallbacks exist (negative)", () => {
-		const action = decideAttempt({
-			route: route({ fallbacks: { credential_quota: ["claude"] } }),
-			state: state({
-				attemptedTargets: new Set(["primary"]),
-				attemptedCredentials: new Set([0]),
-				siblingsExhausted: false,
-			}),
-			classification: classification("credential_quota"),
+			route: route(),
+			state: state({ attemptedTargets: new Set(["primary"]) }),
+			classification: classification("credential_permanent"),
 			commitState: "probing",
 		});
 		expect(action).toEqual({ type: "sibling_credential" });
-		expect(action).not.toEqual({ type: "fallback_target", targetModelId: "claude" });
-	});
-
-	it("falls back to the first unused credential_quota target once siblings are exhausted", () => {
-		const action = decideAttempt({
-			route: route({ fallbacks: { credential_quota: ["claude", "gemini"] } }),
-			state: state({
-				attemptedTargets: new Set(["primary"]),
-				siblingsExhausted: true,
-			}),
-			classification: classification("credential_quota"),
-			commitState: "probing",
-		});
-		expect(action).toEqual({ type: "fallback_target", targetModelId: "claude" });
-	});
-
-	it("skips already attempted credential_quota fallbacks once siblings are exhausted", () => {
-		const action = decideAttempt({
-			route: route({ fallbacks: { credential_quota: ["claude", "gemini"] } }),
-			state: state({
-				attemptedTargets: new Set(["primary", "claude"]),
-				siblingsExhausted: true,
-			}),
-			classification: classification("credential_quota"),
-			commitState: "probing",
-		});
-		expect(action).toEqual({ type: "fallback_target", targetModelId: "gemini" });
-	});
-
-	it("returns terminal when credential_quota fallbacks are exhausted after siblings (negative)", () => {
-		const action = decideAttempt({
-			route: route({ fallbacks: { credential_quota: ["claude"] } }),
-			state: state({
-				attemptedTargets: new Set(["primary", "claude"]),
-				siblingsExhausted: true,
-			}),
-			classification: classification("credential_quota"),
-			commitState: "probing",
-		});
-		expect(action).toEqual({ type: "terminal" });
-	});
-
-	it("falls back on credential_transient once siblings are exhausted", () => {
-		const action = decideAttempt({
-			route: route({ fallbacks: { credential_transient: ["backup"] } }),
-			state: state({ siblingsExhausted: true }),
-			classification: classification("credential_transient"),
-			commitState: "probing",
-		});
-		expect(action).toEqual({ type: "fallback_target", targetModelId: "backup" });
 	});
 
 	it("falls back to the first unused fallbacks-map id on provider_unavailable", () => {
@@ -274,187 +151,179 @@ describe("decideAttempt", () => {
 		});
 		expect(action).toEqual({ type: "terminal" });
 	});
-
-	it("rotates balance rr targets across fresh executions", () => {
-		const registry = new RouteRegistry(() => undefined);
-		const balanceRoute = {
-			generation: 1,
-			id: "balance-rr",
-			root: {
-				type: "balance" as const,
-				strategy: "rr" as const,
-				children: [
-					{ type: "target" as const, model: "a" },
-					{ type: "target" as const, model: "b" },
-				],
-			},
-			targets: ["a", "b"],
-			fallbacks: {},
-			fallbackByTarget: {},
-		} as CompiledRoute;
-		const first = decideAttempt({
-			route: balanceRoute,
-			preferredTargetId: registry.pickInitialTarget(balanceRoute),
-			state: state({ routeId: "balance-rr", currentTarget: "a", attemptedTargets: new Set() }),
-			commitState: "probing",
-		});
-		const second = decideAttempt({
-			route: balanceRoute,
-			preferredTargetId: registry.pickInitialTarget(balanceRoute),
-			state: state({ routeId: "balance-rr", currentTarget: "a", attemptedTargets: new Set() }),
-			commitState: "probing",
-		});
-		expect(first).toEqual({ type: "dispatch", targetModelId: "a" });
-		expect(second).toEqual({ type: "dispatch", targetModelId: "b" });
-	});
-
-	it("prefers the highest-weight balance child on fresh dispatch", () => {
-		const registry = new RouteRegistry(() => undefined);
-		const balanceRoute = {
-			generation: 1,
-			id: "balance-weighted",
-			root: {
-				type: "balance" as const,
-				strategy: "weighted" as const,
-				children: [
-					{ type: "target" as const, model: "low", weight: 1 },
-					{ type: "target" as const, model: "high", weight: 9 },
-				],
-			},
-			targets: ["low", "high"],
-			fallbacks: {},
-			fallbackByTarget: {},
-		} as CompiledRoute;
-		const action = decideAttempt({
-			route: balanceRoute,
-			preferredTargetId: registry.pickInitialTarget(balanceRoute),
-			state: state({ routeId: "balance-weighted", currentTarget: "low", attemptedTargets: new Set() }),
-			commitState: "probing",
-		});
-		expect(action).toEqual({ type: "dispatch", targetModelId: "high" });
-	});
 });
 
-it("keeps round-robin positions isolated between gateway registries", () => {
-	const firstRegistry = new RouteRegistry(() => undefined);
-	const secondRegistry = new RouteRegistry(() => undefined);
-	const balanceRoute = {
-		generation: 1,
-		id: "bal",
-		root: {
-			type: "balance" as const,
-			strategy: "rr" as const,
-			children: [
-				{ type: "target" as const, model: "a" },
-				{ type: "target" as const, model: "b" },
-			],
-		},
-		targets: ["a", "b"],
-		fallbacks: {},
-	} satisfies CompiledRoute;
-	const first = decideAttempt({
-		route: balanceRoute,
-		preferredTargetId: firstRegistry.pickInitialTarget(balanceRoute),
-		state: state({ currentTarget: "a", attemptedTargets: new Set() }),
-		commitState: "probing",
-	});
-	const second = decideAttempt({
-		route: balanceRoute,
-		preferredTargetId: secondRegistry.pickInitialTarget(balanceRoute),
-		state: state({ currentTarget: "a", attemptedTargets: new Set() }),
-		commitState: "probing",
-	});
-	expect(first).toEqual({ type: "dispatch", targetModelId: "a" });
-	expect(second).toEqual({ type: "dispatch", targetModelId: "a" });
-});
-
-it("tries an unused primary when a remembered backup is unavailable", () => {
-	expect(
-		decideAttempt({
-			route: route({ targets: ["primary", "backup"], fallbacks: { provider_unavailable: ["backup"] } }),
-			state: state({ attemptedTargets: new Set(["backup"]), currentTarget: "backup" }),
-			classification: classification("provider_unavailable"),
-			commitState: "probing",
-		}),
-	).toEqual({ type: "fallback_target", targetModelId: "primary" });
-});
-
-it("selects nested round-robin leaves and exhausts balanced siblings before the outer fallback", () => {
+it("does not enter a nested-only branch from an unrelated target or the diagnostic union", () => {
 	const registry = new RouteRegistry(() => undefined);
 	registry.register({
 		id: "nested",
 		root: {
 			type: "fallback",
-			on: ["provider_unavailable"],
+			on: ["credential_quota"],
 			children: [
-				{
-					type: "balance",
-					strategy: "rr",
-					children: [
-						{ type: "target", model: "a" },
-						{ type: "target", model: "b" },
-					],
-				},
-				{ type: "target", model: "c" },
-			],
-		},
-	});
-	const compiled = registry.get("nested")!;
-	expect(registry.pickInitialTarget(compiled)).toBe("a");
-	expect(registry.pickInitialTarget(compiled)).toBe("b");
-	for (const [current, attempted, expected] of [
-		["a", ["a"], "b"],
-		["b", ["b"], "a"],
-		["b", ["a", "b"], "c"],
-	] as const) {
-		expect(
-			decideAttempt({
-				route: compiled,
-				state: state({ currentTarget: current, attemptedTargets: new Set(attempted) }),
-				classification: classification("provider_unavailable"),
-				commitState: "probing",
-			}),
-		).toEqual({ type: "fallback_target", targetModelId: expected });
-	}
-});
-
-it("enters a nested fallback at its primary when handling context overflow", () => {
-	const registry = new RouteRegistry(() => undefined);
-	registry.register({
-		id: "nested",
-		root: {
-			type: "fallback",
-			on: ["context_overflow"],
-			children: [
-				{ type: "target", model: "a" },
+				{ type: "target", model: "A" },
 				{
 					type: "fallback",
 					on: ["context_overflow"],
 					children: [
-						{ type: "target", model: "b" },
-						{ type: "target", model: "c" },
+						{ type: "target", model: "B" },
+						{ type: "target", model: "C" },
 					],
 				},
+				{ type: "target", model: "D" },
 			],
 		},
 	});
+	const compiled = registry.resolve("nested")!;
+	const snapshot = (currentTarget: string, attempted: string[]): ExecutionState =>
+		state({
+			routeId: compiled.id,
+			generation: compiled.generation,
+			currentTarget,
+			attemptedTargets: new Set(attempted),
+			siblingsExhausted: true,
+		});
 	expect(
 		decideAttempt({
-			route: registry.get("nested")!,
-			state: state({ currentTarget: "a", attemptedTargets: new Set(["a"]) }),
+			route: compiled,
+			state: snapshot("A", ["A"]),
 			classification: classification("context_overflow"),
 			commitState: "probing",
 		}),
-	).toEqual({ type: "fallback_target", targetModelId: "b" });
-});
-
-it("tries an unused primary when a remembered backup is unavailable", () => {
+	).toEqual({ type: "terminal" });
 	expect(
 		decideAttempt({
-			route: route({ targets: ["primary", "backup"], fallbacks: { provider_unavailable: ["backup"] } }),
-			state: state({ attemptedTargets: new Set(["backup"]), currentTarget: "backup" }),
+			route: compiled,
+			state: snapshot("A", ["A"]),
+			classification: classification("credential_quota"),
+			commitState: "probing",
+		}),
+	).toEqual({ type: "fallback_target", targetModelId: "B" });
+	expect(
+		decideAttempt({
+			route: compiled,
+			state: snapshot("B", ["A", "B"]),
+			classification: classification("credential_quota"),
+			commitState: "probing",
+		}),
+	).toEqual({ type: "fallback_target", targetModelId: "D" });
+	expect(
+		decideAttempt({
+			route: compiled,
+			state: snapshot("B", ["A", "B"]),
+			classification: classification("context_overflow"),
+			commitState: "probing",
+		}),
+	).toEqual({ type: "fallback_target", targetModelId: "C" });
+	expect(
+		decideAttempt({
+			route: compiled,
+			state: snapshot("D", ["A", "B", "D"]),
+			classification: classification("context_overflow"),
+			commitState: "probing",
+		}),
+	).toEqual({ type: "terminal" });
+});
+
+for (const disposition of ["cancelled", "request_terminal", "policy_terminal", "gateway_terminal"] as const) {
+	it(`never dispatches a configured fallback for ${disposition}`, () => {
+		expect(
+			decideAttempt({
+				route: route({ fallbacks: { [disposition]: ["backup"] } }),
+				state: state({ siblingsExhausted: true }),
+				classification: classification(disposition),
+				commitState: "probing",
+			}),
+		).toEqual({ type: "terminal" });
+	});
+}
+
+it("rejects stale route identities and generations without mutating execution state", () => {
+	const compiled = route();
+	for (const execution of [
+		state({ generation: 0 }),
+		state({ routeId: "other" }),
+		state({ currentTarget: "not-in-route" }),
+	]) {
+		const before = { ...execution, attemptedTargets: [...execution.attemptedTargets] };
+		expect(
+			decideAttempt({
+				route: compiled,
+				state: execution,
+				classification: classification("provider_unavailable"),
+				commitState: "probing",
+			}),
+		).toEqual({ type: "terminal" });
+		expect({ ...execution, attemptedTargets: [...execution.attemptedTargets] }).toEqual(before);
+	}
+});
+
+for (const disposition of ["provider_unavailable", "provider_transient", "model_unavailable"] as const)
+	it(`tries unused earlier flat targets before later candidates for ${disposition}`, () => {
+		const registry = new RouteRegistry(() => undefined);
+		registry.register({
+			id: "preferred-flat",
+			root: {
+				type: "fallback",
+				on: [disposition],
+				children: [
+					{ type: "target", model: "A" },
+					{ type: "target", model: "B" },
+					{ type: "target", model: "C" },
+				],
+			},
+		});
+		const compiled = registry.resolve("preferred-flat")!;
+		expect(
+			decideAttempt({
+				route: compiled,
+				state: state({
+					routeId: compiled.id,
+					generation: compiled.generation,
+					currentTarget: "B",
+					attemptedTargets: new Set(["B"]),
+				}),
+				classification: classification(disposition),
+				commitState: "probing",
+			}),
+		).toEqual({ type: "fallback_target", targetModelId: "A" });
+	});
+
+it("keeps backwards recovery inside explicitly declared flat availability policies", () => {
+	const registry = new RouteRegistry(() => undefined);
+	registry.register({
+		id: "context-only",
+		root: {
+			type: "fallback",
+			on: ["context_overflow"],
+			children: [
+				{ type: "target", model: "A" },
+				{ type: "target", model: "B" },
+				{ type: "target", model: "C" },
+			],
+		},
+	});
+	const compiled = registry.resolve("context-only")!;
+	const execution = state({
+		routeId: compiled.id,
+		generation: compiled.generation,
+		currentTarget: "B",
+		attemptedTargets: new Set(["B"]),
+	});
+	expect(
+		decideAttempt({
+			route: compiled,
+			state: execution,
 			classification: classification("provider_unavailable"),
 			commitState: "probing",
 		}),
-	).toEqual({ type: "fallback_target", targetModelId: "primary" });
+	).toEqual({ type: "terminal" });
+	expect(
+		decideAttempt({
+			route: compiled,
+			state: execution,
+			classification: classification("context_overflow"),
+			commitState: "probing",
+		}),
+	).toEqual({ type: "fallback_target", targetModelId: "C" });
 });

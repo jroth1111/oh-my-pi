@@ -53,7 +53,7 @@ describe("AuthStorage forceRefresh + rotateSessionCredential", () => {
 	beforeEach(async () => {
 		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-ai-rotate-"));
 		store = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
-		authStorage = new AuthStorage(store);
+		authStorage = new AuthStorage(store, { usageProviderResolver: () => undefined });
 	});
 
 	afterEach(async () => {

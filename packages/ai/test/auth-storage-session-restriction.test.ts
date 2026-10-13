@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai/auth-storage";
 import * as oauthUtils from "@oh-my-pi/pi-ai/registry/oauth";
+import { MissingApiKeyError } from "@oh-my-pi/pi-ai/error";
 
 const PROVIDER = "unit-oauth-restrict";
 
@@ -122,10 +123,10 @@ describe("AuthStorage session account restrictions", () => {
 		expect(allowedKeys).toContain(second ?? "");
 		expect(second).not.toBe(first);
 
-		// Account c is free, but outside the pool: no sibling is left to switch to,
-		// and the last-resort pass retries a blocked allowed account instead.
+		// Account c is free but outside the pool. Neither the restriction nor
+		// active provider waits can be bypassed when every allowed account is blocked.
 		expect((await storage.limits.markReached(PROVIDER, "session", { retryAfterMs: 60_000 })).switched).toBe(false);
-		expect(allowedKeys).toContain((await storage.keys.get(PROVIDER, "session")) ?? "");
+		await expect(storage.keys.get(PROVIDER, "session")).rejects.toBeInstanceOf(MissingApiKeyError);
 	});
 
 	test("permits only allowed accounts for a restricted session", async () => {

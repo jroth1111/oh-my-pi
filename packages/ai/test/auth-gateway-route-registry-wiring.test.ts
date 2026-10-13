@@ -1,91 +1,77 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { clearCustomApis } from "@oh-my-pi/pi-ai/api-registry";
-import { RouteRegistry, startAuthGateway } from "@oh-my-pi/pi-ai/auth-gateway";
-import { AuthStorage } from "@oh-my-pi/pi-ai/auth-storage";
-import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
+import { clearCustomApis } from "../src/api-registry";
+import { RouteRegistry, startAuthGateway } from "../src/auth-gateway";
+import { AuthStorage } from "../src/auth-storage";
+import { createMockModel, registerMockApi } from "../src/providers/mock";
 
-afterEach(() => {
-	clearCustomApis();
-});
+afterEach(() => clearCustomApis());
 
-describe("auth-gateway RouteRegistry wiring", () => {
-	it("dispatches a registered virtual route to its compiled entry target", async () => {
-		registerMockApi();
-		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gw-route-wire-"));
-		const storage = await AuthStorage.create(path.join(dir, "auth.db"));
-		storage.setRuntimeApiKey("openrouter", "test-key");
-		const mock = createMockModel({ provider: "openrouter", id: "mock/route-wire-target" });
-		mock.push({ content: ["from-virtual-route"] });
-		const registry = new RouteRegistry(id => {
-			if (id === "mock/route-wire-target") return mock.model;
-			return undefined;
-		});
-		registry.register({
-			id: "virtual/route-wire",
-			root: { type: "target", model: "mock/route-wire-target" },
-		});
-		const handle = startAuthGateway({
-			bind: "127.0.0.1:0",
-			bearerTokens: ["omp-fixture-bearer-6dc18ed2"],
-			storage,
-			resolveModel: id => (id === "mock/route-wire-target" ? mock.model : undefined),
-			routeRegistry: registry,
-			version: "test",
-		});
-		try {
-			const res = await fetch(`${handle.url}/v1/chat/completions`, {
-				method: "POST",
-				headers: { "Content-Type": "application/json", Authorization: "Bearer omp-fixture-bearer-6dc18ed2" },
-				body: JSON.stringify({
-					model: "virtual/route-wire",
-					messages: [{ role: "user", content: "hi" }],
-					stream: false,
-				}),
+for (const native of [false, true])
+	for (const virtual of [false, true]) {
+		it(`dispatches the registry-selected target for ${native ? "pi-native" : "chat"} ${virtual ? "virtual routes" : "aliases"} without a second catalog lookup`, async () => {
+			registerMockApi();
+			const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gateway-compiled-target-"));
+			const storage = await AuthStorage.create(path.join(directory, "auth.db"));
+			storage.keys.setRuntime("openrouter", "fixture-key");
+			const target = createMockModel({ provider: "openrouter", id: "mock/compiled-target" });
+			target.push({ content: ["selected registry target"] });
+			const alias = "aliases/with/slashes";
+			const registry = new RouteRegistry(id => (id === alias ? target : undefined));
+			if (virtual)
+				registry.register({
+					id: "virtual/entry",
+					root: {
+						type: "fallback",
+						on: ["credential_quota"],
+						children: [
+							{ type: "target", model: alias },
+							{ type: "target", model: "unknown/fallback" },
+						],
+					},
+				});
+			const requested = virtual ? "virtual/entry" : alias;
+			const gateway = startAuthGateway({
+				bind: "127.0.0.1:0",
+				storage,
+				bearerTokens: ["registry-fixture-client"],
+				routeRegistry: registry,
+				resolveModel: () => undefined,
 			});
-			expect(res.status).toBe(200);
-			const body = (await res.json()) as {
-				choices?: Array<{ message?: { content?: string } }>;
-			};
-			expect(body.choices?.[0]?.message?.content).toContain("from-virtual-route");
-			expect(mock.calls.length).toBe(1);
-		} finally {
-			await handle.close();
-			storage.close();
-			await fs.rm(dir, { recursive: true, force: true });
-		}
-	});
-
-	it("404s when the virtual route id is not registered (negative)", async () => {
-		registerMockApi();
-		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gw-route-wire-miss-"));
-		const storage = await AuthStorage.create(path.join(dir, "auth.db"));
-		const resolveModel = () => undefined;
-		const registry = new RouteRegistry(resolveModel);
-		const handle = startAuthGateway({
-			bind: "127.0.0.1:0",
-			bearerTokens: ["omp-fixture-bearer-6dc18ed2"],
-			storage,
-			resolveModel,
-			routeRegistry: registry,
-			version: "test",
+			try {
+				const response = await fetch(`${gateway.url}${native ? "/v1/pi/stream" : "/v1/chat/completions"}`, {
+					method: "POST",
+					headers: { Authorization: "Bearer registry-fixture-client", "Content-Type": "application/json" },
+					body: JSON.stringify(
+						native
+							? {
+									modelId: requested,
+									context: { messages: [{ role: "user", content: "fixture", timestamp: 0 }] },
+									stream: false,
+								}
+							: { model: requested, messages: [{ role: "user", content: "fixture" }], stream: false },
+					),
+				});
+				expect(response.status).toBe(200);
+				expect(await response.text()).toContain("selected registry target");
+				expect(target.calls).toHaveLength(1);
+			} finally {
+				await gateway.close();
+				storage.close();
+				await fs.rm(directory, { recursive: true });
+			}
 		});
-		try {
-			const res = await fetch(`${handle.url}/v1/chat/completions`, {
-				method: "POST",
-				headers: { "Content-Type": "application/json", Authorization: "Bearer omp-fixture-bearer-6dc18ed2" },
-				body: JSON.stringify({
-					model: "virtual/missing",
-					messages: [{ role: "user", content: "hi" }],
-				}),
-			});
-			expect(res.status).toBe(404);
-		} finally {
-			await handle.close();
-			storage.close();
-			await fs.rm(dir, { recursive: true, force: true });
-		}
-	});
+	}
+
+it("canonicalizes a slash-containing alias without publishing private model headers", () => {
+	const model = createMockModel({ provider: "openrouter", id: "mock/real-target" });
+	const registry = new RouteRegistry(id =>
+		id === "alias/path" ? { ...model, headers: { Authorization: "private-fixture-key" } } : undefined,
+	);
+	const route = registry.resolve("alias/path");
+	expect(route?.targets[0]).toBe("openrouter/mock/real-target");
+	expect(JSON.stringify(route)).not.toContain("private-fixture-key");
+	expect(registry.resolve("missing")).toBeUndefined();
 });

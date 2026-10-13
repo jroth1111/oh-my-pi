@@ -104,6 +104,8 @@ function prepareV6BlockSchema(db: Database): void {
 	db.run(`
 		DROP TRIGGER IF EXISTS auth_codex_shared_insert_to_meters;
 		DROP TRIGGER IF EXISTS auth_codex_shared_update_to_meters;
+		DROP TRIGGER IF EXISTS auth_codex_shared_insert_unknown_origin;
+		DROP TRIGGER IF EXISTS auth_codex_shared_update_unknown_origin;
 		DROP TRIGGER IF EXISTS auth_codex_meter_insert_to_shared;
 		DROP TRIGGER IF EXISTS auth_codex_meter_update_to_shared;
 		DROP TRIGGER IF EXISTS auth_codex_shared_delete_to_meters;
@@ -156,7 +158,7 @@ describe("AuthStorage credential block persistence", () => {
 		}
 
 		const reopenedStore = await SqliteAuthCredentialStore.open(dbPath);
-		const reopenedStorage = new AuthStorage(reopenedStore);
+		const reopenedStorage = new AuthStorage(reopenedStore, { usageProviderResolver: () => undefined });
 		await reopenedStorage.credentials.reload();
 		try {
 			const fableKey = await reopenedStorage.keys.get(PROVIDER, "session-3", { modelId: "claude-fable-5" });
@@ -366,7 +368,7 @@ describe("AuthStorage credential block persistence", () => {
 		disablingStore.close();
 
 		const reopenedStore = await SqliteAuthCredentialStore.open(dbPath);
-		const reopenedStorage = new AuthStorage(reopenedStore);
+		const reopenedStorage = new AuthStorage(reopenedStore, { usageProviderResolver: () => undefined });
 		await reopenedStorage.credentials.reload();
 		try {
 			const key = await reopenedStorage.keys.get(PROVIDER, "a");
@@ -513,12 +515,12 @@ describe("AuthStorage credential block persistence", () => {
 		firstReopen.close();
 		expect(readCredentialBlockRows(dbPath)).toEqual(expectedRows);
 		expect(readLegacyCodexSharedBlock(dbPath, codexRow.id)?.blocked_until_ms).toBe(chatExpiryMs);
-		expect(readAuthSchemaVersion(dbPath)).toBe(8);
+		expect(readAuthSchemaVersion(dbPath)).toBe(9);
 
 		const secondReopen = await SqliteAuthCredentialStore.open(dbPath);
 		secondReopen.close();
 		expect(readCredentialBlockRows(dbPath)).toEqual(expectedRows);
-		expect(readAuthSchemaVersion(dbPath)).toBe(8);
+		expect(readAuthSchemaVersion(dbPath)).toBe(9);
 	});
 
 	it("mirrors a legacy Codex shared insert into meter rows while hiding shared from current APIs", async () => {
@@ -833,13 +835,13 @@ describe("AuthStorage credential block persistence", () => {
 			const expiresAtMs = Date.now() + 3_600_000;
 			expect(migratedStore.tryAcquireCredentialRefreshLease(1, "test-owner", expiresAtMs)).toBe(true);
 			expect(migratedStore.getCredentialRefreshLeaseExpiresAt(1)).toBe(expiresAtMs);
-			expect(readAuthSchemaVersion(dbPath)).toBe(8);
+			expect(readAuthSchemaVersion(dbPath)).toBe(9);
 		} finally {
 			migratedStore.close();
 		}
 	});
 
-	it("migrates a v4 auth database to current version 7 without dropping credential rows", async () => {
+	it("migrates a v4 auth database without dropping credential rows", async () => {
 		const legacyDb = new Database(dbPath);
 		legacyDb.run(`
 			CREATE TABLE auth_schema_version (
@@ -884,7 +886,7 @@ describe("AuthStorage credential block persistence", () => {
 			const rows = migratedStore.listAuthCredentials(PROVIDER);
 			expect(rows).toHaveLength(1);
 			expect(rows[0]!.credential).toMatchObject({ type: "oauth", access: "legacy-access" });
-			expect(readAuthSchemaVersion(dbPath)).toBe(8);
+			expect(readAuthSchemaVersion(dbPath)).toBe(9);
 			expect(tableExists(dbPath, "auth_credential_blocks")).toBe(true);
 		} finally {
 			migratedStore.close();

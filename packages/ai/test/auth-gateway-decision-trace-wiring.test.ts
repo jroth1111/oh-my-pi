@@ -1,183 +1,178 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { clearCustomApis } from "@oh-my-pi/pi-ai/api-registry";
-import { RouteDecisionTraceLog, startAuthGateway } from "@oh-my-pi/pi-ai/auth-gateway";
-import { AuthStorage } from "@oh-my-pi/pi-ai/auth-storage";
-import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
+import { clearCustomApis } from "../src/api-registry";
+import { RouteDecisionTraceLog, startAuthGateway } from "../src/auth-gateway";
+import { AuthStorage } from "../src/auth-storage";
+import { createMockModel, registerMockApi } from "../src/providers/mock";
 
 afterEach(() => {
+	vi.restoreAllMocks();
 	clearCustomApis();
 });
 
-describe("auth-gateway decision-trace wiring", () => {
-	it("records dispatched when a credential is available", async () => {
-		registerMockApi();
-		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gw-trace-wire-"));
-		const storage = await AuthStorage.create(path.join(dir, "auth.db"));
-		storage.setRuntimeApiKey("openrouter", "test-key");
-		const mock = createMockModel({ provider: "openrouter", id: "mock/trace-wire" });
-		mock.push({ content: ["ok"] });
-		const traces = new RouteDecisionTraceLog();
-		const handle = startAuthGateway({
-			bind: "127.0.0.1:0",
-			bearerTokens: ["omp-fixture-bearer-6dc18ed2"],
-			storage,
-			resolveModel: () => mock.model,
-			decisionTraces: traces,
-			version: "test",
-		});
-		try {
-			const res = await fetch(`${handle.url}/v1/chat/completions`, {
-				method: "POST",
-				headers: { "Content-Type": "application/json", Authorization: "Bearer omp-fixture-bearer-6dc18ed2" },
-				body: JSON.stringify({
-					model: "mock/trace-wire",
-					messages: [{ role: "user", content: "hi" }],
-					stream: false,
-				}),
+for (const native of [false, true]) {
+	for (const outcome of ["dispatched", "unavailable", "lookup-failed"] as const) {
+		it(`returns a retrievable ${outcome} trace for ${native ? "pi-native" : "chat"} requests`, async () => {
+			registerMockApi();
+			const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gateway-trace-contract-"));
+			const storage = await AuthStorage.create(path.join(directory, "auth.db"));
+			const target = createMockModel({ provider: "openrouter", id: "mock/trace-target" });
+			target.push({ content: ["trace response"] });
+			if (outcome === "dispatched") storage.keys.setRuntime("openrouter", "fixture-key");
+			else
+				vi.spyOn(storage.keys, "getWithCredential").mockImplementation(async () => {
+					if (outcome === "lookup-failed") throw new Error("fixture credential lookup failure");
+					return undefined;
+				});
+			const gateway = startAuthGateway({
+				bind: "127.0.0.1:0",
+				storage,
+				bearerTokens: ["trace-fixture-client"],
+				resolveModel: () => target,
 			});
-			expect(res.status).toBe(200);
-			const recorded = traces.list().filter(t => t.routeId === "mock/trace-wire");
-			expect(recorded.some(t => t.disposition === "dispatched")).toBe(true);
-			expect(recorded.every(t => t.reason === undefined)).toBe(true);
-		} finally {
-			await handle.close();
-			storage.close();
-			await fs.rm(dir, { recursive: true, force: true });
-		}
-	});
+			try {
+				const response = await fetch(`${gateway.url}${native ? "/v1/pi/stream" : "/v1/chat/completions"}`, {
+					method: "POST",
+					headers: { Authorization: "Bearer trace-fixture-client", "Content-Type": "application/json" },
+					body: JSON.stringify(
+						native
+							? {
+									modelId: target.id,
+									context: { messages: [{ role: "user", content: "private fixture prompt", timestamp: 0 }] },
+									stream: false,
+								}
+							: {
+									model: target.id,
+									messages: [{ role: "user", content: "private fixture prompt" }],
+									stream: false,
+								},
+					),
+				});
+				await response.text();
+				const requestId = response.headers.get("x-request-id");
+				expect(requestId).not.toBeNull();
+				const readback = await fetch(`${gateway.url}/v1/executions/${requestId}`, {
+					headers: { Authorization: "Bearer trace-fixture-client" },
+				});
+				expect(readback.status).toBe(200);
+				const payload = await readback.json();
+				expect(payload).toMatchObject({
+					requestId,
+					selectedTarget: "openrouter/mock/trace-target",
+					disposition: outcome === "dispatched" ? "dispatched" : "skipped",
+					...(outcome === "dispatched"
+						? {}
+						: { reason: outcome === "unavailable" ? "credential_unavailable" : "credential_lookup_failed" }),
+				});
+				expect(JSON.stringify(payload)).not.toContain("private fixture prompt");
+				expect(JSON.stringify(payload)).not.toContain("fixture-key");
+				expect(target.calls).toHaveLength(outcome === "dispatched" ? 1 : 0);
+			} finally {
+				await gateway.close();
+				storage.close();
+				await fs.rm(directory, { recursive: true });
+			}
+		});
+	}
+}
 
-	it("serves a recorded trace over GET /v1/executions/:id", async () => {
-		registerMockApi();
-		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gw-trace-exec-"));
-		const storage = await AuthStorage.create(path.join(dir, "auth.db"));
-		storage.setRuntimeApiKey("openrouter", "test-key");
-		const mock = createMockModel({ provider: "openrouter", id: "mock/trace-exec" });
-		mock.push({ content: ["ok"] });
-		const traces = new RouteDecisionTraceLog();
-		const handle = startAuthGateway({
-			bind: "127.0.0.1:0",
-			bearerTokens: ["omp-fixture-bearer-6dc18ed2"],
-			storage,
-			resolveModel: () => mock.model,
-			decisionTraces: traces,
-			version: "test",
-		});
-		try {
-			const res = await fetch(`${handle.url}/v1/chat/completions`, {
-				method: "POST",
-				headers: { "Content-Type": "application/json", Authorization: "Bearer omp-fixture-bearer-6dc18ed2" },
-				body: JSON.stringify({
-					model: "mock/trace-exec",
-					messages: [{ role: "user", content: "hi" }],
-					stream: false,
-				}),
-			});
-			expect(res.status).toBe(200);
-			await res.text();
-			const recorded = traces.list().filter(tr => tr.routeId === "mock/trace-exec");
-			expect(recorded.length).toBeGreaterThan(0);
-			const id = recorded[0]!.requestId;
-			const got = await fetch(`${handle.url}/v1/executions/${id}`, {
-				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2" },
-			});
-			expect(got.status).toBe(200);
-			expect(await got.json()).toEqual({
-				object: "list",
-				data: expect.arrayContaining([expect.objectContaining({ requestId: id, routeId: "mock/trace-exec" })]),
-			});
-			const missing = await fetch(`${handle.url}/v1/executions/does-not-exist`, {
-				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2" },
-			});
-			expect(missing.status).toBe(404);
-		} finally {
-			await handle.close();
-			storage.close();
-			await fs.rm(dir, { recursive: true, force: true });
-		}
+it("execution responses omit injected non-allowlisted trace fields", async () => {
+	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gateway-trace-redaction-"));
+	const storage = await AuthStorage.create(path.join(directory, "auth.db"));
+	const log = new RouteDecisionTraceLog();
+	const input = {
+		requestId: "fixture-redaction",
+		routeId: "fixture-route",
+		generation: 1,
+		selectedTarget: "fixture-target",
+		disposition: "dispatched" as const,
+		prompt: "private injected prompt",
+		token: "private injected token",
+		headers: { Authorization: "private injected authorization" },
+	};
+	log.record(input);
+	const gateway = startAuthGateway({
+		bind: "127.0.0.1:0",
+		storage,
+		bearerTokens: ["trace-fixture-client"],
+		resolveModel: () => undefined,
+		decisionTraces: log,
 	});
+	try {
+		const response = await fetch(`${gateway.url}/v1/executions/fixture-redaction`, {
+			headers: { Authorization: "Bearer trace-fixture-client" },
+		});
+		expect(response.status).toBe(200);
+		const payload = await response.json();
+		expect(payload).not.toHaveProperty("prompt");
+		expect(payload).not.toHaveProperty("token");
+		expect(payload).not.toHaveProperty("headers");
+		expect(JSON.stringify(payload)).not.toContain("private injected");
+	} finally {
+		await gateway.close();
+		storage.close();
+		await fs.rm(directory, { recursive: true });
+	}
+});
 
-	it("records skipped credential_unavailable when no key exists (negative)", async () => {
-		registerMockApi();
-		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gw-trace-skip-"));
-		const storage = await AuthStorage.create(path.join(dir, "auth.db"));
-		const mock = createMockModel({ provider: "openrouter", id: "mock/trace-skip" });
-		const traces = new RouteDecisionTraceLog();
-		const handle = startAuthGateway({
-			bind: "127.0.0.1:0",
-			bearerTokens: ["omp-fixture-bearer-6dc18ed2"],
-			storage,
-			resolveModel: () => mock.model,
-			decisionTraces: traces,
-			version: "test",
-		});
-		try {
-			const res = await fetch(`${handle.url}/v1/chat/completions`, {
-				method: "POST",
-				headers: { "Content-Type": "application/json", Authorization: "Bearer omp-fixture-bearer-6dc18ed2" },
-				body: JSON.stringify({
-					model: "mock/trace-skip",
-					messages: [{ role: "user", content: "hi" }],
-					stream: false,
-				}),
-			});
-			expect(res.status).toBe(503);
-			const recorded = traces.list().filter(t => t.routeId === "mock/trace-skip");
-			expect(recorded.length).toBeGreaterThanOrEqual(1);
-			expect(recorded.every(t => t.disposition === "skipped" && t.reason === "credential_unavailable")).toBe(true);
-			expect(recorded[0]).toEqual(
-				expect.objectContaining({
-					disposition: "skipped",
-					reason: "credential_unavailable",
-					selectedTarget: "mock/trace-skip",
-				}),
-			);
-		} finally {
-			await handle.close();
-			storage.close();
-			await fs.rm(dir, { recursive: true, force: true });
-		}
+it("execution readback returns every retained decision in order and keeps legacy first-decision fields", async () => {
+	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gateway-trace-history-"));
+	const storage = await AuthStorage.create(path.join(directory, "auth.db"), {
+		usageProviderResolver: () => undefined,
 	});
-
-	it("returns the traced request ID when pi-native credential lookup fails", async () => {
-		registerMockApi();
-		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gw-trace-lookup-"));
-		const storage = await AuthStorage.create(path.join(dir, "auth.db"));
-		const mock = createMockModel({ provider: "openrouter", id: "mock/trace-lookup" });
-		vi.spyOn(storage.keys, "getWithCredential").mockRejectedValue(new Error("credential broker unavailable"));
-		const traces = new RouteDecisionTraceLog();
-		const handle = startAuthGateway({
-			bind: "127.0.0.1:0",
-			bearerTokens: ["omp-fixture-bearer-6dc18ed2"],
-			storage,
-			resolveModel: () => mock.model,
-			decisionTraces: traces,
-			version: "test",
-		});
-		try {
-			const res = await fetch(`${handle.url}/v1/pi/stream`, {
-				method: "POST",
-				headers: { "Content-Type": "application/json", Authorization: "Bearer omp-fixture-bearer-6dc18ed2" },
-				body: JSON.stringify({
-					modelId: "mock/trace-lookup",
-					context: { messages: [{ role: "user", content: "hi", timestamp: 1 }] },
-					stream: false,
-				}),
-			});
-			expect(res.status).toBe(502);
-			const recorded = traces.list().filter(t => t.routeId === "mock/trace-lookup");
-			const requestId = res.headers.get("x-request-id");
-			expect(requestId).toBeTruthy();
-			expect(res.headers.get("request-id")).toBe(requestId);
-			expect(recorded).toHaveLength(1);
-			expect(requestId).toBe(recorded[0]!.requestId);
-			expect(recorded[0]?.reason).toBe("credential_lookup_failed");
-		} finally {
-			await handle.close();
-			storage.close();
-			await fs.rm(dir, { recursive: true, force: true });
-		}
+	const log = new RouteDecisionTraceLog();
+	const input = {
+		requestId: "fixture-history",
+		routeId: "fixture-route",
+		generation: 1,
+		selectedTarget: "unavailable-target",
+		disposition: "skipped" as const,
+		reason: "credential_unavailable" as const,
+		prompt: "private history prompt",
+		token: "private history token",
+	};
+	const first = log.record(input);
+	log.record({
+		requestId: "other-execution",
+		routeId: "other",
+		generation: 1,
+		selectedTarget: "other",
+		disposition: "dispatched",
 	});
+	const second = log.record({
+		requestId: "fixture-history",
+		routeId: "fixture-route",
+		generation: 1,
+		selectedTarget: "serving-target",
+		disposition: "dispatched",
+	});
+	const gateway = startAuthGateway({
+		bind: "127.0.0.1:0",
+		storage,
+		bearerTokens: ["trace-fixture-client"],
+		resolveModel: () => undefined,
+		decisionTraces: log,
+	});
+	try {
+		const url = `${gateway.url}/v1/executions/fixture-history`;
+		expect((await fetch(url)).status).toBe(401);
+		const response = await fetch(url, { headers: { Authorization: "Bearer trace-fixture-client" } });
+		expect(response.status).toBe(200);
+		const payload = await response.json();
+		expect(payload).toMatchObject({ ...first, object: "list", data: [first, second] });
+		expect(JSON.stringify(payload)).not.toContain("private history");
+		expect(
+			(
+				await fetch(`${gateway.url}/v1/executions/absent`, {
+					headers: { Authorization: "Bearer trace-fixture-client" },
+				})
+			).status,
+		).toBe(404);
+	} finally {
+		await gateway.close();
+		storage.close();
+		await fs.rm(directory, { recursive: true });
+	}
 });

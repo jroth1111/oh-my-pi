@@ -2138,7 +2138,7 @@ export async function runRootCommand(
 		const selectedProvider = resolveCliRuntimeApiKeyProvider(apiKeyArgs);
 		const cliApiKeyProvider = parsedArgs.apiKey ? selectedProvider : undefined;
 		if (parsedArgs.apiKey && cliApiKeyProvider) {
-			authStorage.setRuntimeApiKey(cliApiKeyProvider, parsedArgs.apiKey);
+			authStorage.keys.setRuntime(cliApiKeyProvider, parsedArgs.apiKey);
 		}
 
 		// The registry composes policy-dependent metadata synchronously, including

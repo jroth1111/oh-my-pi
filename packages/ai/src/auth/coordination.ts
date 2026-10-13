@@ -4,67 +4,46 @@ import type { RankingStrategyResolver } from "../usage/registry";
 import { credentialBlockScopesForRequest, providerTypeKey } from "./blocks";
 import type { CredentialBlocks } from "./blocks";
 import type { SessionAffinity } from "./affinity";
-import type { CredentialPool, StoredCredential } from "./pool";
+import type { CredentialPool } from "./pool";
 import { QuotaProbeLeaseBook } from "./probe-lease";
 import type { ApiKeySelection } from "./rank";
+import { extractOAuthCredentialPhysicalIdentifiers } from "./sqlite-credential-store";
 import type { UsageCache } from "./usage-cache";
-import type { AuthApiKeyOptions, AuthCredential, TurnReservation, TurnReservationResult } from "./types";
-import { DEFAULT_TURN_RESERVATION_TTL_MS } from "./types";
+import {
+	DEFAULT_TURN_RESERVATION_TTL_MS,
+	type AuthApiKeyOptions,
+	type AuthCredential,
+	type TurnReservation,
+	type TurnReservationResult,
+} from "./types";
 
-/**
- * Stable physical identity for an OAuth row: account/org/project/email only —
- * never token bytes. Two payloads describing the same account share a
- * fingerprint; a refresh that swaps `access`/`refresh` keeps it, while a
- * re-login to a different account changes it.
- */
-function fingerprintOAuthPhysicalIdentity(credential: AuthCredential): string | null {
-	if (credential.type !== "oauth") return null;
-	const parts: string[] = [];
-	const accountId = credential.accountId?.trim();
-	const email = credential.email?.trim().toLowerCase();
-	const orgId = credential.orgId?.trim();
-	const projectId = credential.projectId?.trim();
-	if (accountId) parts.push(`account:${accountId}`);
-	if (email) parts.push(`email:${email}`);
-	if (orgId) parts.push(`org:${orgId}`);
-	if (projectId) parts.push(`project:${projectId}`);
-	if (parts.length === 0) return null;
-	return parts.join("|");
+interface HeldTurn {
+	requestId: string;
+	expiresAtMs: number;
+	credentialId: number;
+	incarnation: number;
+	token: symbol;
 }
 
-/** Stable identity for API-key rows so key replacement bumps incarnation. */
-function fingerprintApiKeyPhysicalIdentity(credential: AuthCredential): string | null {
-	if (credential.type !== "api_key") return null;
-	return `api_key:${Bun.SHA256.hash(credential.key, "base64url")}`;
+function reservationExpiry(ttlMs: number): number {
+	const nowMs = Date.now();
+	if (!Number.isFinite(ttlMs) || ttlMs < 0 || ttlMs > Number.MAX_SAFE_INTEGER - nowMs)
+		throw new RangeError("Turn reservation TTL must be a finite non-negative duration");
+	return nowMs + ttlMs;
 }
 
-function identityFieldMap(fingerprint: string): Map<string, string> {
-	const fields = new Map<string, string>();
-	for (const part of fingerprint.split("|")) {
-		const sep = part.indexOf(":");
-		if (sep <= 0) continue;
-		fields.set(part.slice(0, sep), part.slice(sep + 1));
-	}
-	return fields;
-}
-
-/**
- * True when `newFingerprint` only adds identity fields (or repeats values) —
- * e.g. a refresh that newly reports `orgId` for the same account. Enrichment
- * keeps the incarnation (and any live reservations) stable; a field that
- * changes or disappears is a real identity change and must bump.
- */
-function isConservativeIdentityEnrichment(oldFingerprint: string, newFingerprint: string): boolean {
-	const oldFields = identityFieldMap(oldFingerprint);
-	const newFields = identityFieldMap(newFingerprint);
-	for (const [field, value] of oldFields) {
-		if (newFields.get(field) !== value) return false;
-	}
-	return true;
-}
-
-function turnReservationKey(credentialId: number, incarnation: number): string {
-	return `${credentialId}:${incarnation}`;
+/** True only when an identifier present in both snapshots disagrees. A field
+ * missing from either side is inconclusive (ordinary metadata loss on reload),
+ * never a switch: bumping would purge quota blocks, usage state, and session
+ * affinity for an unchanged account. */
+function credentialIdentitiesConflict(previous: AuthCredential, next: AuthCredential): boolean {
+	if (previous.type !== "oauth" || next.type !== "oauth") return false;
+	const oldFields = extractOAuthCredentialPhysicalIdentifiers(previous);
+	const newFields = extractOAuthCredentialPhysicalIdentifiers(next);
+	return oldFields.some(value => {
+		const prefix = value.slice(0, value.indexOf(":") + 1);
+		return newFields.some(candidate => candidate.startsWith(prefix) && candidate !== value);
+	});
 }
 
 export function anonymousProbeRequestKey(credentialId: number, blockScope: string): string {
@@ -82,8 +61,7 @@ export interface CredentialCoordinationDeps {
 
 /**
  * In-process credential coordination layered over the pool/blocks modules:
- * per-row incarnation counters, requestId-scoped turn reservations, and
- * single-flight quota-probe leases. All state is in-memory — it exists to
+ * per-row incarnation counters and single-flight quota-probe leases. All state is in-memory — it exists to
  * keep *concurrent requests in this process* from double-vending one
  * credential row, and to arbitrate which request may probe a blocked
  * credential's quota. Persisted blocks/affinity live in their own modules.
@@ -91,11 +69,7 @@ export interface CredentialCoordinationDeps {
 export class CredentialCoordination {
 	/** Per-credential generation counter, bumped when a row's physical identity changes. */
 	#credentialIncarnation = new Map<number, number>();
-	#turnReservations = new Map<
-		string,
-		{ requestId: string; expiresAtMs: number; credentialId: number; incarnation: number; token: number }
-	>();
-	#turnReservationToken = 0;
+	#turnReservations = new Map<string, HeldTurn>();
 	#inflightProbes = new Map<string, { credentialId: number; blockScope: string; leaseId: string }>();
 	#probeLeases: QuotaProbeLeaseBook;
 	readonly #deps: CredentialCoordinationDeps;
@@ -120,22 +94,14 @@ export class CredentialCoordination {
 	 * replace observes a differing credential at the same durable row id.
 	 */
 	maybeBumpIncarnation(provider: string, credentialId: number, previous: AuthCredential, next: AuthCredential): void {
-		// Type replacement (oauth ↔ api_key) always invalidates prior reservations.
-		if (previous.type !== next.type) {
+		if (
+			previous.type !== next.type ||
+			(previous.type === "api_key" && next.type === "api_key" && previous.key !== next.key)
+		) {
 			this.#bumpCredentialIncarnation(provider, credentialId);
 			return;
 		}
-		if (previous.type === "api_key" && next.type === "api_key") {
-			const oldFp = fingerprintApiKeyPhysicalIdentity(previous);
-			const newFp = fingerprintApiKeyPhysicalIdentity(next);
-			if (!oldFp || !newFp || oldFp === newFp) return;
-			this.#bumpCredentialIncarnation(provider, credentialId);
-			return;
-		}
-		const oldFp = fingerprintOAuthPhysicalIdentity(previous);
-		const newFp = fingerprintOAuthPhysicalIdentity(next);
-		if (!oldFp || !newFp || oldFp === newFp) return;
-		if (isConservativeIdentityEnrichment(oldFp, newFp)) return;
+		if (!credentialIdentitiesConflict(previous, next)) return;
 		this.#bumpCredentialIncarnation(provider, credentialId);
 	}
 
@@ -145,7 +111,12 @@ export class CredentialCoordination {
 		this.#deps.affinity.clearCredential(provider, credentialId);
 		this.#deps.blocks.clearCredential(provider, credentialId);
 		this.#probeLeases.purgeCredential(credentialId);
-		this.#purgeTurnReservationsForCredential(credentialId);
+		for (const [key, reservation] of this.#turnReservations) {
+			if (reservation.credentialId === credentialId) this.#turnReservations.delete(key);
+		}
+		for (const [requestId, probe] of this.#inflightProbes) {
+			if (probe.credentialId === credentialId) this.#inflightProbes.delete(requestId);
+		}
 		this.#deps.usageCache.invalidate(provider);
 		logger.info("auth-storage credential incarnation bumped after identity change", {
 			provider,
@@ -154,30 +125,25 @@ export class CredentialCoordination {
 		});
 	}
 
-	// ------------------------------------------------------------------
-	// Turn reservations
-	// ------------------------------------------------------------------
-
-	#purgeTurnReservationsForCredential(credentialId: number): void {
-		const prefix = `${credentialId}:`;
-		for (const key of [...this.#turnReservations.keys()]) {
-			if (key.startsWith(prefix)) this.#turnReservations.delete(key);
-		}
-	}
-
+	/** An expired or replaced physical row never retains a turn hold. */
 	activeTurnReservation(
 		credentialId: number,
 		incarnation: number,
-		nowMs: number = Date.now(),
+		nowMs = Date.now(),
 	): { requestId: string; expiresAtMs: number } | undefined {
-		const key = turnReservationKey(credentialId, incarnation);
+		const key = `${credentialId}:${incarnation}`;
 		const held = this.#turnReservations.get(key);
 		if (!held) return undefined;
-		if (held.expiresAtMs <= nowMs) {
+		if (held.expiresAtMs <= nowMs || this.getCredentialIncarnation(credentialId) !== incarnation) {
 			this.#turnReservations.delete(key);
 			return undefined;
 		}
 		return { requestId: held.requestId, expiresAtMs: held.expiresAtMs };
+	}
+
+	hasForeignTurnReservation(credentialId: number, requestId?: string): boolean {
+		const held = this.activeTurnReservation(credentialId, this.getCredentialIncarnation(credentialId));
+		return held !== undefined && held.requestId !== requestId;
 	}
 
 	tryAcquireTurnReservation(args: {
@@ -186,81 +152,105 @@ export class CredentialCoordination {
 		requestId: string;
 		ttlMs?: number;
 	}): TurnReservationResult {
-		const nowMs = Date.now();
-		const ttlMs = args.ttlMs ?? DEFAULT_TURN_RESERVATION_TTL_MS;
-		const key = turnReservationKey(args.credentialId, args.incarnation);
-		const held = this.activeTurnReservation(args.credentialId, args.incarnation, nowMs);
-		if (held && held.requestId !== args.requestId) {
-			return { ok: false, heldByRequestId: held.requestId, expiresAtMs: held.expiresAtMs };
-		}
+		if (
+			!Number.isSafeInteger(args.credentialId) ||
+			args.credentialId < 1 ||
+			!Number.isSafeInteger(args.incarnation) ||
+			args.incarnation < 1 ||
+			!args.requestId
+		)
+			throw new TypeError("Turn reservations require a credential, incarnation and request identity");
+		if (this.getCredentialIncarnation(args.credentialId) !== args.incarnation)
+			return { ok: false, reason: "stale-incarnation" };
+		const expiresAtMs = reservationExpiry(args.ttlMs ?? DEFAULT_TURN_RESERVATION_TTL_MS);
+		const key = `${args.credentialId}:${args.incarnation}`;
+		const held = this.activeTurnReservation(args.credentialId, args.incarnation);
+		if (held && held.requestId !== args.requestId)
+			return { ok: false, reason: "held", heldByRequestId: held.requestId, expiresAtMs: held.expiresAtMs };
+		const token = Symbol("turn-reservation");
+		this.#turnReservations.set(key, { ...args, expiresAtMs, token });
 		const probe = this.#inflightProbes.get(args.requestId);
 		if (probe && probe.credentialId !== args.credentialId) this.clearQuotaProbe(args.requestId);
-		const expiresAtMs = nowMs + ttlMs;
-		this.#turnReservationToken += 1;
-		const token = this.#turnReservationToken;
-		this.#turnReservations.set(key, {
-			requestId: args.requestId,
-			expiresAtMs,
-			credentialId: args.credentialId,
-			incarnation: args.incarnation,
-			token,
-		});
-		const reservation: TurnReservation = {
-			credentialId: args.credentialId,
-			incarnation: args.incarnation,
-			requestId: args.requestId,
-			expiresAtMs,
-			release: () => {
-				const current = this.#turnReservations.get(key);
-				if (current?.requestId === args.requestId && current.token === token) {
-					this.#turnReservations.delete(key);
-				}
+		return {
+			ok: true,
+			reservation: {
+				credentialId: args.credentialId,
+				incarnation: args.incarnation,
+				requestId: args.requestId,
+				expiresAtMs,
+				release: () => {
+					if (this.#turnReservations.get(key)?.token === token) this.#turnReservations.delete(key);
+				},
 			},
 		};
-		return { ok: true, reservation };
+	}
+
+	/** Revalidate prepared material; only recovery probes acquire an implicit exclusive turn hold. */
+	tryReservePreparedCredential(args: {
+		provider: string;
+		credentialId: number;
+		incarnation: number;
+		options?: AuthApiKeyOptions;
+		scopes?: string | readonly string[];
+		probeRequestId?: string;
+		/** Explicit targeted access may inspect a cooled-down row, never a foreign-held one. */
+		ignoreCooldown?: boolean;
+	}): { ok: true; reservation?: TurnReservation } | { ok: false } {
+		if (
+			args.options?.signal?.aborted ||
+			this.getCredentialIncarnation(args.credentialId) !== args.incarnation ||
+			this.hasForeignTurnReservation(args.credentialId, args.options?.requestId)
+		)
+			return { ok: false };
+		const index = this.#deps.pool.entries(args.provider).findIndex(entry => entry.id === args.credentialId);
+		if (index < 0) return { ok: false };
+		const providerKey = providerTypeKey(
+			args.provider,
+			this.#deps.pool.entries(args.provider)[index]!.credential.type,
+		);
+		if (!args.ignoreCooldown && this.#deps.blocks.isBlocked(args.provider, providerKey, index, args.scopes)) {
+			const scope = this.resolveQuotaProbeLeaseScope(args.provider, providerKey, index, args.scopes);
+			if (
+				!args.probeRequestId ||
+				scope === null ||
+				!this.isCurrentProbe(args.probeRequestId, args.credentialId, scope)
+			)
+				return { ok: false };
+		}
+		// A request identity is not a concurrency limit. Healthy account/key traffic remains shareable;
+		// explicit reservation calls still impose their own policy, and quota probes stay single-flight.
+		if (
+			!args.options?.requestId ||
+			args.options.recordAffinity === false ||
+			args.probeRequestId !== args.options.requestId ||
+			!this.hasInflightProbe(args.options.requestId)
+		)
+			return { ok: true };
+		const result = this.tryAcquireTurnReservation({
+			credentialId: args.credentialId,
+			incarnation: args.incarnation,
+			requestId: args.options.requestId,
+		});
+		return result.ok ? { ok: true, reservation: result.reservation } : { ok: false };
 	}
 
 	releaseTurnReservation(requestId: string): void {
 		for (const [key, held] of this.#turnReservations) {
 			if (held.requestId === requestId) this.#turnReservations.delete(key);
 		}
-		// Abandon any inflight probe for this request without treating it as success.
 		this.clearQuotaProbe(requestId);
 	}
 
-	/** Extend every live reservation held by `requestId` so long streams outlive the idle TTL. */
-	renewTurnReservation(requestId: string, ttlMs: number = DEFAULT_TURN_RESERVATION_TTL_MS): void {
-		const expiresAtMs = Date.now() + ttlMs;
+	/** Only renew live, current-incarnation holds; expired owners cannot resurrect a newer turn. */
+	renewTurnReservation(requestId: string, ttlMs = DEFAULT_TURN_RESERVATION_TTL_MS): void {
+		const expiresAtMs = reservationExpiry(ttlMs);
 		for (const [key, held] of this.#turnReservations) {
-			if (held.requestId === requestId) {
-				this.#turnReservations.set(key, { ...held, expiresAtMs });
-			}
+			if (!this.activeTurnReservation(held.credentialId, held.incarnation)) continue;
+			if (held.requestId === requestId) this.#turnReservations.set(key, { ...held, expiresAtMs });
 		}
 	}
 
-	/** Acquire an exclusive turn reservation for a stored API-key row when requestId is set. */
-	tryReserveApiKeySelection(provider: string, selection: ApiKeySelection, requestId: string | undefined): boolean {
-		if (!requestId) return true;
-		const reserveId = this.#deps.pool.entries(provider)[selection.index]?.id;
-		if (reserveId === undefined) return true;
-		return this.tryAcquireTurnReservation({
-			credentialId: reserveId,
-			incarnation: this.getCredentialIncarnation(reserveId),
-			requestId,
-		}).ok;
-	}
-
-	// ------------------------------------------------------------------
-	// Request-aware blocking: a foreign-held reservation counts as a block
-	// ------------------------------------------------------------------
-
-	/**
-	 * {@link CredentialBlocks.blockedUntil} plus the in-flight reservation
-	 * overlay: a credential exclusively held by a different requestId reads as
-	 * blocked until the hold expires. Persisted blocks that outlive the
-	 * in-memory map re-assert Retry-After provenance into the probe book so
-	 * restarts cannot silently downgrade a provider-timed wait.
-	 */
+	/** Foreign in-flight holds overlay durable cooldowns without changing their provenance. */
 	blockedUntilForRequest(
 		provider: string,
 		providerKey: string,
@@ -268,15 +258,10 @@ export class CredentialCoordination {
 		blockScopeOrScopes: string | readonly string[] | undefined = undefined,
 		requestId?: string,
 	): number | undefined {
-		const nowMs = Date.now();
-		const credentialId = this.#deps.pool.entries(provider)[credentialIndex]?.id;
-		let blockedUntil = this.#deps.blocks.blockedUntil(provider, providerKey, credentialIndex, blockScopeOrScopes);
-		if (credentialId === undefined) return blockedUntil;
-		const held = this.activeTurnReservation(credentialId, this.getCredentialIncarnation(credentialId), nowMs);
-		if (held && held.requestId !== requestId && (blockedUntil === undefined || held.expiresAtMs > blockedUntil)) {
-			blockedUntil = held.expiresAtMs;
-		}
-		return blockedUntil;
+		const blocked = this.#deps.blocks.blockedUntil(provider, providerKey, credentialIndex, blockScopeOrScopes);
+		const id = this.#deps.pool.entries(provider)[credentialIndex]?.id;
+		const held = id === undefined ? undefined : this.activeTurnReservation(id, this.getCredentialIncarnation(id));
+		return held && held.requestId !== requestId ? Math.max(blocked ?? 0, held.expiresAtMs) : blocked;
 	}
 
 	isBlockedForRequest(
@@ -297,60 +282,19 @@ export class CredentialCoordination {
 	// ------------------------------------------------------------------
 
 	tryAcquireQuotaProbeLease(credentialId: number, blockScope: string): string | null {
-		return this.#probeLeases.tryAcquire(credentialId, blockScope);
-	}
-
-	/** Re-apply Retry-After provenance from durable blocks after restart / peer reload. */
-	hydrateRetryAfterProvenance(credentialId: number): void {
-		for (const block of this.#deps.blocks.list([credentialId])) {
-			if (!block.retryAfter) continue;
-			if (block.blockedUntilMs <= Date.now()) continue;
-			this.#probeLeases.noteRetryAfterBlock(credentialId, block.blockScope, block.blockedUntilMs);
-		}
-	}
-
-	#resolveQuotaProbeLeaseScope(credentialId: number, blockScope: string): string {
-		if (this.#probeLeases.isRetryAfterSourced(credentialId, blockScope)) return blockScope;
-		if (blockScope !== "" && this.#probeLeases.isRetryAfterSourced(credentialId, "")) return "";
-		return blockScope;
-	}
-
-	/**
-	 * Prefer the block scope that is actually active for this credential (global
-	 * `""` and Retry-After provenance win over a derived chat/spark request scope).
-	 */
-	resolveBlockingProbeScope(
-		provider: string,
-		providerKey: string,
-		credentialIndex: number,
-		credentialId: number,
-		blockScope: string | undefined,
-		blockScopes: readonly string[] | undefined,
-		requestId: string | undefined,
-	): string {
-		const candidates: string[] = [""];
-		if (blockScope) candidates.push(blockScope);
-		for (const scope of blockScopes ?? []) {
-			if (scope && !candidates.includes(scope)) candidates.push(scope);
-		}
-		for (const scope of candidates) {
+		for (const provider of this.#deps.pool.providers()) {
+			const entries = this.#deps.pool.entries(provider);
+			const index = entries.findIndex(entry => entry.id === credentialId);
+			if (index < 0) continue;
+			const providerKey = providerTypeKey(provider, entries[index]!.credential.type);
 			if (
-				this.#probeLeases.isRetryAfterSourced(credentialId, scope) &&
-				this.blockedUntilForRequest(provider, providerKey, credentialIndex, scope || undefined, requestId) !==
-					undefined
-			) {
-				return scope;
-			}
+				this.#deps.blocks.isBlocked(provider, providerKey, index, blockScope) &&
+				this.#deps.blocks.quotaProbeScope(provider, providerKey, index, blockScope) !== blockScope
+			)
+				return null;
+			return this.#probeLeases.tryAcquire(credentialId, blockScope);
 		}
-		for (const scope of candidates) {
-			if (
-				this.blockedUntilForRequest(provider, providerKey, credentialIndex, scope || undefined, requestId) !==
-				undefined
-			) {
-				return scope;
-			}
-		}
-		return blockScope ?? "";
+		return null;
 	}
 
 	/**
@@ -360,7 +304,12 @@ export class CredentialCoordination {
 	 */
 	acquireOrReuseQuotaProbeLease(requestId: string, credentialId: number, probeScope: string): boolean {
 		const existing = this.#inflightProbes.get(requestId);
-		if (existing && existing.credentialId === credentialId && existing.blockScope === probeScope) {
+		if (
+			existing &&
+			existing.credentialId === credentialId &&
+			existing.blockScope === probeScope &&
+			this.#probeLeases.isCurrentLease(credentialId, probeScope, existing.leaseId)
+		) {
 			return true;
 		}
 		const lease = this.tryAcquireQuotaProbeLease(credentialId, probeScope);
@@ -378,17 +327,26 @@ export class CredentialCoordination {
 		return this.#inflightProbes.has(requestId);
 	}
 
+	isCurrentProbe(requestId: string, credentialId: number, blockScope: string): boolean {
+		const probe = this.#inflightProbes.get(requestId);
+		return (
+			probe?.credentialId === credentialId &&
+			probe.blockScope === blockScope &&
+			this.#probeLeases.isCurrentLease(credentialId, blockScope, probe.leaseId)
+		);
+	}
+
 	recordQuotaProbeSuccess(credentialId: number, blockScope: string, leaseId: string | null): boolean {
-		if (!this.#probeLeases.recordSuccess(credentialId, blockScope, leaseId)) return false;
 		for (const provider of this.#deps.pool.providers()) {
 			const entries = this.#deps.pool.entries(provider);
 			const index = entries.findIndex(entry => entry.id === credentialId);
 			if (index < 0) continue;
 			const providerKey = providerTypeKey(provider, entries[index]!.credential.type);
-			this.#deps.blocks.clearScope(provider, credentialId, providerKey, blockScope || undefined);
-			return true;
+			if (this.#deps.blocks.quotaProbeScope(provider, providerKey, index, blockScope) !== blockScope) return false;
+			if (!this.#probeLeases.recordSuccess(credentialId, blockScope, leaseId)) return false;
+			return this.#deps.blocks.clearScope(provider, credentialId, providerKey, blockScope || undefined);
 		}
-		return true;
+		return false;
 	}
 
 	noteTransientSoftAvoid(credentialId: number, blockScope: string, untilMs: number): void {
@@ -432,9 +390,8 @@ export class CredentialCoordination {
 
 	/**
 	 * Probe path for a blocked API-key candidate: acquires the single-flight
-	 * quota-probe lease (anonymous probes keyed by credential+scope) and then
-	 * the caller's turn reservation. Returns true only when the candidate may
-	 * be vended as a probe; releases the lease when reservation fails.
+	 * quota-probe lease (anonymous probes keyed by credential+scope). Returns
+	 * true only when the candidate may be vended as a probe.
 	 */
 	tryApiKeyProbe(
 		provider: string,
@@ -456,23 +413,23 @@ export class CredentialCoordination {
 			return false;
 		const credentialId = this.#deps.pool.entries(provider)[selection.index]?.id;
 		if (credentialId === undefined) return false;
-		const held = this.activeTurnReservation(credentialId, this.getCredentialIncarnation(credentialId));
-		if (held && held.requestId !== options?.requestId) return false;
-		const scope = this.resolveBlockingProbeScope(
-			provider,
-			providerKey,
-			selection.index,
-			credentialId,
-			blockScope,
-			blockScopes,
-			options?.requestId,
-		);
+		if (this.hasForeignTurnReservation(credentialId, options?.requestId)) return false;
+		const scope = this.resolveQuotaProbeLeaseScope(provider, providerKey, selection.index, blockScopes ?? blockScope);
+		if (scope === null) return false;
 		const requestId = options?.requestId ?? anonymousProbeRequestKey(credentialId, scope);
 		if (!options?.requestId && this.#inflightProbes.has(requestId)) return false;
 		if (!this.acquireOrReuseQuotaProbeLease(requestId, credentialId, scope)) return false;
-		if (this.tryReserveApiKeySelection(provider, selection, options?.requestId)) return true;
-		this.clearQuotaProbe(requestId);
-		return false;
+		selection.probeRequestId = requestId;
+		return true;
+	}
+
+	resolveQuotaProbeLeaseScope(
+		provider: string,
+		providerKey: string,
+		index: number,
+		scopes?: string | readonly string[],
+	): string | null {
+		return this.#deps.blocks.quotaProbeScope(provider, providerKey, index, scopes);
 	}
 
 	/**
@@ -496,8 +453,8 @@ export class CredentialCoordination {
 			const anyUnblocked = typed.some(
 				item => !this.isBlockedForRequest(provider, providerKey, item.index, blockScopes ?? blockScope),
 			);
-			if (!anyUnblocked) return true;
+			if (anyUnblocked) return false;
 		}
-		return false;
+		return true;
 	}
 }

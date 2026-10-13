@@ -1,5 +1,25 @@
+import type { ReadableStreamDefaultReader } from "node:stream/web";
 import type { AssistantMessageEventStream } from "../utils/event-stream";
-import type { AssistantMessage } from "../types";
+
+/** Compatibility observer for canonical-event consumers outside the gateway. */
+export function observeAssistantCommit(
+	events: AssistantMessageEventStream,
+	gate: StreamCommitGate,
+): AssistantMessageEventStream {
+	const iterate = events[Symbol.asyncIterator].bind(events);
+	events[Symbol.asyncIterator] = async function* () {
+		for await (const event of { [Symbol.asyncIterator]: iterate }) {
+			if (
+				((event.type === "text_delta" || event.type === "thinking_delta" || event.type === "toolcall_delta") &&
+					event.delta.length > 0) ||
+				event.type === "toolcall_end"
+			)
+				gate.classifyAndObserve("response.output_text.delta", 0);
+			yield event;
+		}
+	};
+	return events;
+}
 
 /** Classification of one Responses SSE event for commit / failover. */
 export type CommitClass = "metadata" | "output" | "terminal-success" | "terminal-retryable" | "terminal-failure";
@@ -7,11 +27,10 @@ export type CommitClass = "metadata" | "output" | "terminal-success" | "terminal
 export type StreamCommitState = "probing" | "committed" | "terminated";
 
 const DEFAULT_MAX_PRELUDE_BYTES = 4 * 1024 * 1024;
-const STREAM_PRELUDE_MAX_BYTES = 4 * 1024 * 1024;
 
 /** Downstream SSE observer is used for Responses; upstream onSseEvent must not also feed the gate. */
 export function commitGateObservesDownstreamSse(formatLabel: string): boolean {
-	return formatLabel === "openai-responses" || formatLabel === "pi-native";
+	return formatLabel === "openai-responses";
 }
 
 const METADATA_EVENTS: Record<string, true> = {
@@ -21,10 +40,15 @@ const METADATA_EVENTS: Record<string, true> = {
 	"response.output_item.added": true,
 	"response.content_part.added": true,
 	start: true,
-	message_start: true,
 	text_start: true,
 	thinking_start: true,
 	toolcall_start: true,
+	message_start: true,
+	// Anthropic SSE metadata: message_delta carries usage/stop_reason, and
+	// content_block_stop is the structural close of a content block — neither
+	// is generated output worth committing the stream over.
+	message_delta: true,
+	content_block_stop: true,
 	heartbeat: true,
 	ping: true,
 };
@@ -40,7 +64,7 @@ export class StreamCommitGate {
 	#maxPreludeBytes: number;
 	#prelude: Uint8Array[] = [];
 	#preludeBytes = 0;
-	#sawSuccessfulTerminal = false;
+	#successfulTerminal = false;
 
 	constructor(maxPreludeBytes: number = DEFAULT_MAX_PRELUDE_BYTES) {
 		this.#maxPreludeBytes = maxPreludeBytes;
@@ -49,9 +73,8 @@ export class StreamCommitGate {
 	get state(): StreamCommitState {
 		return this.#state;
 	}
-
 	get sawSuccessfulTerminal(): boolean {
-		return this.#sawSuccessfulTerminal;
+		return this.#successfulTerminal;
 	}
 
 	/** Reset to probing for the next fallback attempt (clears prelude). */
@@ -60,11 +83,12 @@ export class StreamCommitGate {
 		this.#bytes = 0;
 		this.#prelude = [];
 		this.#preludeBytes = 0;
-		this.#sawSuccessfulTerminal = false;
+		this.#successfulTerminal = false;
 	}
 
 	classifyAndObserve(eventType: string, byteLength: number): StreamCommitState {
 		if (this.#state === "terminated") return this.#state;
+		if (classifyCommitEvent(eventType) === "terminal-success") this.#successfulTerminal = true;
 
 		if (this.#state === "probing") {
 			const add = byteLength > 0 ? byteLength : 0;
@@ -75,7 +99,6 @@ export class StreamCommitGate {
 		}
 
 		const kind = classifyCommitEvent(eventType);
-		if (kind === "terminal-success") this.#sawSuccessfulTerminal = true;
 		if (this.#state === "committed") {
 			// Post-commit, every terminal event ends the stream's failover
 			// eligibility — including `response.failed` (retryable elsewhere),
@@ -135,21 +158,22 @@ export class StreamCommitGate {
 /** Thrown/streamed when a held stream hits a pre-commit retryable terminal. */
 export class PreludeAbortedError extends Error {
 	readonly frames: Uint8Array[];
+	readonly eventType: string;
 	constructor(frames: Uint8Array[], eventType: string) {
 		super(`upstream stream ended before commit (${eventType})`);
 		this.name = "PreludeAbortedError";
 		this.frames = frames;
+		this.eventType = eventType;
 	}
 }
 
 export function classifyCommitEvent(eventType: string): CommitClass {
 	if (!eventType) return "output";
 	if (METADATA_EVENTS[eventType]) return "metadata";
-	if (eventType === "response.completed" || eventType === "done" || eventType === "message_stop")
-		return "terminal-success";
+	if (eventType === "response.completed" || eventType === "message_stop") return "terminal-success";
 	if (eventType === "response.failed") return "terminal-retryable";
 	if (eventType === "response.incomplete") return "terminal-success";
-	if (eventType === "response.error" || eventType === "error") return "terminal-failure";
+	if (eventType === "error" || eventType === "response.error") return "terminal-failure";
 	return "output";
 }
 
@@ -197,38 +221,36 @@ export function holdSseUntilCommit(
 	return stream.pipeThrough(
 		new TransformStream<Uint8Array, Uint8Array>({
 			transform(chunk, controller) {
-				if (committed) {
-					controller.enqueue(chunk);
-					return;
+				const wasCommitted = committed;
+				const buffered = !committed && gate.bufferPrelude(chunk);
+				if (!committed && !buffered) {
+					gate.classifyAndObserve("", chunk.byteLength);
+					committed = true;
 				}
-				const buffered = gate.bufferPrelude(chunk);
 				pending += decoder.decode(chunk, { stream: true });
 				let next = nextSseFrame(pending);
 				while (next) {
 					const eventType = eventTypeFromFrame(next.frame);
 					const state = gate.classifyAndObserve(eventType, next.frame.length);
 					pending = next.rest;
-					next = nextSseFrame(pending);
-					if (state === "terminated" && !gate.sawSuccessfulTerminal) {
+					const success = classifyCommitEvent(eventType) === "terminal-success";
+					if (!committed && state === "terminated" && !success) {
 						throw new PreludeAbortedError(gate.takePrelude() ?? [], eventType);
 					}
-					if (state === "committed" || gate.sawSuccessfulTerminal) {
-						committed = true;
-						for (const held of gate.takePrelude() ?? []) controller.enqueue(held);
-						if (!buffered) controller.enqueue(chunk);
-						return;
-					}
+					if (state === "committed" || success) committed = true;
+					next = nextSseFrame(pending);
 				}
-				if (!buffered) {
-					// Cap crossed: force commit observation and keep the rejected chunk.
-					gate.classifyAndObserve("", chunk.byteLength);
-					committed = true;
+				if (wasCommitted) controller.enqueue(chunk);
+				else if (committed) {
 					for (const held of gate.takePrelude() ?? []) controller.enqueue(held);
-					controller.enqueue(chunk);
+					if (!buffered) controller.enqueue(chunk);
 				}
 			},
 			flush(controller) {
 				if (committed) return;
+				pending += decoder.decode();
+				if (pending.trim().length > 0)
+					throw new PreludeAbortedError(gate.takePrelude() ?? [], "truncated SSE frame");
 				const held = gate.takePrelude() ?? [];
 				if (held.length === 0) return;
 				gate.classifyAndObserve("", 0);
@@ -238,134 +260,130 @@ export function holdSseUntilCommit(
 	);
 }
 
-type SseRead = { done: boolean; value?: Uint8Array };
-
-export type HeldSse =
-	| { type: "forward"; stream: ReadableStream<Uint8Array> }
-	| { type: "failed"; error: unknown; message?: AssistantMessage };
-
-function concatSsePrelude(
-	prelude: Uint8Array[],
-	reader: { read(): Promise<SseRead>; cancel(reason?: unknown): Promise<void> },
-	pending: Promise<SseRead> | undefined,
-): ReadableStream<Uint8Array> {
-	let pendingRead = pending;
-	let preludeOffset = 0;
-	return new ReadableStream({
-		async pull(controller) {
-			if (preludeOffset < prelude.length) {
-				const chunk = prelude[preludeOffset];
-				preludeOffset += 1;
-				if (chunk) controller.enqueue(chunk);
-				return;
-			}
-			const read = pendingRead ?? reader.read();
-			pendingRead = undefined;
-			const { done, value } = await read;
-			if (done || value === undefined) {
-				controller.close();
-				return;
-			}
-			controller.enqueue(value);
-		},
-		cancel(reason) {
-			return reader.cancel(reason);
-		},
-	});
-}
-
-function encodedChunkHasOutput(chunk: Uint8Array): boolean {
-	const text = new TextDecoder().decode(chunk);
-	if (text.includes("[DONE]")) return false;
-	if (/(?:\"type\"\s*:\s*\"error\"|\"error\"\s*:)/.test(text)) return false;
-	if (/\"type\"\s*:\s*\"(?:start|message_start)\"/.test(text)) return false;
-	return !/\"role\"\s*:\s*\"assistant\"/.test(text) || /\"(?:content|tool_calls|reasoning_content)\"\s*:/.test(text);
+export interface HeldSsePumpOptions {
+	/** Total attempts including the first. Defaults to 3. */
+	maxAttempts?: number;
+	/** Canonical failure eligibility; defaults to the terminal event classification. */
+	shouldRetry?: (error: PreludeAbortedError) => boolean | Promise<boolean>;
+	/** Invoked after each discarded pre-commit attempt. */
+	onAbort?: (error: PreludeAbortedError, attempt: number) => void;
+	/** Terminal frame enqueued when reopening an attempt throws before any commit. */
+	synthesizeFailure?: (error: unknown) => Uint8Array | undefined;
+	/** Called exactly once when the pump settles (done, flushed, failed, or cancelled). */
+	onSettle?: () => void;
 }
 
 /**
- * Gateway hold path with canonical-result awareness. It buffers encoded bytes
- * until the gate commits or the provider result settles, then either forwards
- * the complete prelude or returns the settled failure for conductor handling.
+ * Decision consumer for {@link holdSseUntilCommit}: pumps held attempts into one
+ * downstream body so a pre-commit retryable terminal fails over transparently —
+ * the dead attempt's metadata frames are discarded and the replacement attempt's
+ * prelude becomes the only prelude the client sees. The first attempt is passed
+ * in already open so its setup errors can still surface as HTTP errors to the
+ * caller; `openNext` supplies replacements, and `gate.reset()` runs between
+ * attempts. Retryable exhaustion (or a pre-commit `terminal-failure`) flushes
+ * the last attempt's held frames so the client observes the provider's real
+ * terminal event rather than a silent truncation.
  */
-export async function holdSseUntilCommitOutcome(
-	sseStream: ReadableStream<Uint8Array>,
+export function pumpHeldSseAttempts(
+	first: ReadableStream<Uint8Array>,
+	openNext: () => ReadableStream<Uint8Array> | Promise<ReadableStream<Uint8Array>>,
 	gate: StreamCommitGate,
-	settled: Promise<AssistantMessage>,
-	commitOnFirstEncodedByte = false,
-): Promise<HeldSse> {
-	const reader = sseStream.getReader();
-	const prelude: Uint8Array[] = [];
-	let preludeBytes = 0;
-	let pendingRead: Promise<SseRead> | undefined;
-	let settleOutcome: { ok: true; message: AssistantMessage } | { ok: false; error: unknown } | undefined;
-	const watchSettled = settled.then(
-		message => {
-			settleOutcome = { ok: true, message };
-		},
-		(error: unknown) => {
-			settleOutcome = { ok: false, error };
-		},
-	);
-
-	const forward = (): HeldSse => ({
-		type: "forward",
-		stream: concatSsePrelude(prelude, reader, pendingRead),
-	});
-	const failedFromOutcome = (): HeldSse => {
-		if (!settleOutcome) return { type: "failed", error: "Upstream request failed" };
-		if (!settleOutcome.ok) return { type: "failed", error: settleOutcome.error };
-		return {
-			type: "failed",
-			error: settleOutcome.message.errorMessage ?? settleOutcome.message,
-			message: settleOutcome.message,
-		};
-	};
-
-	try {
-		while (true) {
-			if (gate.state === "committed") return forward();
-			if (preludeBytes >= STREAM_PRELUDE_MAX_BYTES) {
-				if (gate.state === "probing") gate.classifyAndObserve("", STREAM_PRELUDE_MAX_BYTES);
-				return forward();
-			}
-			if (settleOutcome) {
-				if (!settleOutcome.ok) return failedFromOutcome();
-				const reason = settleOutcome.message.stopReason;
-				if (reason === "error" || reason === "aborted") return failedFromOutcome();
-				if (gate.state === "probing") gate.classifyAndObserve("", STREAM_PRELUDE_MAX_BYTES);
-				return forward();
-			}
-			pendingRead ??= reader.read();
-			const raced = await Promise.race([
-				pendingRead.then(r => ({ source: "read" as const, r })),
-				watchSettled.then(() => ({ source: "settled" as const })),
-			]);
-			if (raced.source === "settled") continue;
-			pendingRead = undefined;
-			const { done, value } = raced.r;
-			if (done || value === undefined) {
-				await watchSettled;
-				continue;
-			}
-			prelude.push(value);
-			preludeBytes += value.byteLength;
-			if (commitOnFirstEncodedByte && gate.state === "probing") {
-				// Give a same-turn canonical failure a chance to settle before the
-				// provider's initial role/start frame commits the attempt.
-				await Promise.resolve();
-				if (settleOutcome) continue;
-				if (encodedChunkHasOutput(value)) gate.classifyAndObserve("response.output_text.delta", value.byteLength);
-			}
+	options?: HeldSsePumpOptions,
+): ReadableStream<Uint8Array> {
+	const maxAttempts = options?.maxAttempts ?? 3;
+	let inner: ReadableStreamDefaultReader<Uint8Array> | undefined;
+	let settled = false;
+	const settle = () => {
+		if (!settled) {
+			settled = true;
+			options?.onSettle?.();
 		}
-	} catch (error) {
-		return { type: "failed", error };
-	}
+	};
+	return new ReadableStream<Uint8Array>({
+		async start(out) {
+			let sse = first;
+			// `start` resolving does not close the stream — every exit path must
+			// close/error the controller explicitly.
+			const close = () => {
+				try {
+					out.close();
+				} catch {}
+			};
+			try {
+				for (let attempt = 1; ; attempt++) {
+					if (settled) return;
+					let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+					try {
+						const rd = sse.getReader();
+						reader = inner = rd;
+						for (;;) {
+							const { done, value } = await rd.read();
+							if (settled) return;
+							if (done) {
+								close();
+								return;
+							}
+							out.enqueue(value);
+						}
+					} catch (error) {
+						if (settled) return;
+						if (!(error instanceof PreludeAbortedError)) {
+							try {
+								out.error(error);
+							} catch {}
+							return;
+						}
+						options?.onAbort?.(error, attempt);
+						let retryable = classifyCommitEvent(error.eventType) === "terminal-retryable";
+						if (retryable && options?.shouldRetry) {
+							try {
+								retryable = await options.shouldRetry(error);
+							} catch {
+								retryable = false;
+							}
+						}
+						if (settled) return;
+						if (!retryable || attempt >= maxAttempts) {
+							// Honest terminal: flush the dead attempt's held frames so the
+							// client sees the provider's real `response.failed`/`error`.
+							for (const frame of error.frames) out.enqueue(frame);
+							close();
+							return;
+						}
+					} finally {
+						inner = undefined;
+						if (reader) {
+							reader.releaseLock();
+							await sse.cancel().catch(() => {});
+						}
+					}
+					try {
+						if (settled) return;
+						gate.reset();
+						sse = await openNext();
+					} catch (error) {
+						const frame = options?.synthesizeFailure?.(error);
+						if (frame) out.enqueue(frame);
+						close();
+						return;
+					}
+				}
+			} finally {
+				settle();
+			}
+		},
+		async cancel(reason) {
+			settle();
+			if (inner) await inner.cancel(reason).catch(() => {});
+		},
+	});
 }
 
 /**
  * Observe encoded SSE bytes into a {@link StreamCommitGate} without altering the
- * downstream payload. Used by the gateway streaming path so a pre-commit
- * `response.failed` can be classified (Wave A does not failover yet).
+ * downstream payload. Observe-only counterpart to {@link holdSseUntilCommit} —
+ * frames pass through unbuffered, so a pre-commit terminal is classified but
+ * not held back.
  */
 export function observeSseCommit(
 	stream: ReadableStream<Uint8Array>,
@@ -391,24 +409,4 @@ export function observeSseCommit(
 			},
 		}),
 	);
-}
-
-export function observeAssistantCommit(
-	events: AssistantMessageEventStream,
-	gate: StreamCommitGate,
-): AssistantMessageEventStream {
-	const iterate = events[Symbol.asyncIterator].bind(events);
-	events[Symbol.asyncIterator] = async function* () {
-		for await (const event of { [Symbol.asyncIterator]: iterate }) {
-			if (
-				((event.type === "text_delta" || event.type === "thinking_delta" || event.type === "toolcall_delta") &&
-					event.delta.length > 0) ||
-				event.type === "toolcall_end"
-			) {
-				gate.classifyAndObserve("response.output_text.delta", 0);
-			}
-			yield event;
-		}
-	};
-	return events;
 }

@@ -94,6 +94,12 @@
 ### Fixed
 
 - Fixed `grep` on a single file showing in Tern as separate boxed snippets with no file row or syntax colors; it now looks the same as a `grep` over a directory
+- `OMP_AUTH_GATEWAY_ADMIN_TOKEN` explicitly enables authenticated route management without granting write access to inference or no-auth clients ([#10148](https://github.com/can1357/oh-my-pi/pull/10148) by [@jroth1111](https://github.com/jroth1111)).
+- `omp auth-gateway serve --routes` loads validated JSON5 route files before broker setup, preserving exact paths and rejecting unsupported actions ([#10145](https://github.com/can1357/oh-my-pi/pull/10145) by [@jroth1111](https://github.com/jroth1111)).
+
+### Fixed
+
+- Broker-backed auth-gateway continuations retain private session and response ownership across restarts, without storing credentials or bearer/usage caches locally ([#10134](https://github.com/can1357/oh-my-pi/pull/10134) by [@jroth1111](https://github.com/jroth1111)).
 
 ## [18.10.0] - 2026-10-12
 

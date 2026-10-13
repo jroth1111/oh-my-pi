@@ -567,7 +567,16 @@ describe("AuthStorage.health.check", () => {
 			disabledCause: null,
 		};
 		const store = makeStore([oauthRow(1, "alice@example.com"), openrouterRow]);
-		const storage = new AuthStorage(store);
+		const usageProbed: string[] = [];
+		const storage = new AuthStorage(store, {
+			usageProviderResolver: provider => ({
+				id: provider,
+				fetchUsage: async () => {
+					usageProbed.push(provider);
+					return { provider, fetchedAt: Date.now(), limits: [] };
+				},
+			}),
+		});
 		await storage.credentials.reload();
 		const probed: string[] = [];
 		const completionProbe: CompletionProbe = async (input: CompletionProbeInput) => {
@@ -579,6 +588,7 @@ describe("AuthStorage.health.check", () => {
 			const results = await storage.health.check({ completionProbe, excludeProviders: new Set(["openrouter"]) });
 			expect(results.map(row => row.provider)).toEqual(["anthropic"]);
 			expect(probed).toEqual(["anthropic"]);
+			expect(usageProbed).toEqual(["anthropic"]);
 		} finally {
 			storage.close();
 		}

@@ -26,8 +26,6 @@ describe("compareDisposition", () => {
 
 	it("does not use lexicographic string order (negative)", () => {
 		// String compare ranks "eligible" before "preferred" and "blocked" before "eligible".
-		expect("eligible" < "preferred").toBe(true);
-		expect("blocked" < "eligible").toBe(true);
 		expect(compareDisposition("preferred", "eligible")).toBeLessThan(0);
 		expect(compareDisposition("eligible", "blocked")).toBeLessThan(0);
 	});

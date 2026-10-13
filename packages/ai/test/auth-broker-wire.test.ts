@@ -7,6 +7,8 @@ import { AuthStorage, REMOTE_REFRESH_SENTINEL, SqliteAuthCredentialStore } from 
 import {
 	AUTH_BROKER_CAPABILITIES_HEADER,
 	AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES,
+	AUTH_BROKER_CAPABILITY_BLOCK_PROVENANCE,
+	AUTH_BROKER_CAPABILITY_RETRY_AFTER_BLOCKS,
 	AuthBrokerClient,
 	AuthBrokerError,
 	type AuthBrokerServerHandle,
@@ -312,7 +314,13 @@ describe("auth-broker wire surface", () => {
 		const unchanged = await client.fetchSnapshot({ ifGenerationGt: body.generation, waitMs: 10 });
 		expect(unchanged.status).toBe(304);
 		expect(unchanged.generation).toBe(body.generation);
-		expect(observedCapabilities).toEqual(["codex-meter-block-scopes,retry-after-blocks"]);
+		expect(observedCapabilities.map(value => value?.split(","))).toEqual([
+			[
+				AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES,
+				AUTH_BROKER_CAPABILITY_BLOCK_PROVENANCE,
+				AUTH_BROKER_CAPABILITY_RETRY_AFTER_BLOCKS,
+			],
+		]);
 
 		const rawUnchanged = await fetch(`${handle!.url}/v1/snapshot?wait=10`, {
 			headers: {

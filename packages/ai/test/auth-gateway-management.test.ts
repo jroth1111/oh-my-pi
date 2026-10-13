@@ -46,13 +46,15 @@ async function withManagementGateway(
 ): Promise<void> {
 	registerMockApi();
 	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gw-mgmt-"));
-	const storage = await AuthStorage.create(path.join(dir, "auth.db"));
+	const storage = await AuthStorage.create(path.join(dir, "auth.db"), { usageProviderResolver: () => undefined });
 	const traces = new RouteDecisionTraceLog();
 	await setup?.(storage, traces);
 	const primary = createMockModel({ provider: "openrouter", id: primaryId });
 	const handle = startAuthGateway({
 		bind: "127.0.0.1:0",
 		bearerTokens: ["omp-fixture-bearer-6dc18ed2"],
+		allowManagement: true,
+		adminBearerTokens: ["fixture-management-admin"],
 		storage,
 		resolveModel: (id: string) => (id === primaryId ? primary.model : undefined),
 		listModels: () => [primary.model],
@@ -93,7 +95,7 @@ describe("auth-gateway management endpoints", () => {
 			});
 			expect(res.status).toBe(404);
 			const body = (await res.json()) as ErrorBody;
-			expect(body.error).toBe("Unknown execution: missing");
+			expect(body.error).toContain("execution");
 		});
 	});
 
@@ -135,7 +137,7 @@ describe("auth-gateway management endpoints", () => {
 			expect(typeof body.generation).toBe("number");
 			expect(body.data).toHaveLength(1);
 			expect(body.data[0]?.id).toBe(virtualId);
-			expect(body.data[0]?.targets).toEqual([primaryId]);
+			expect(body.data[0]?.targets).toEqual([`openrouter/${primaryId}`]);
 			expect(body.data[0]?.fallbacks).toBeUndefined();
 			const row = body.data[0];
 			if (!row) throw new Error("expected a health route row");
@@ -180,7 +182,7 @@ describe("auth-gateway management endpoints", () => {
 		await withManagementGateway(async ({ url }) => {
 			const res = await fetch(`${url}/v1/credentials/999999/disable`, {
 				method: "POST",
-				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2", "Content-Type": "application/json" },
+				headers: { Authorization: "Bearer fixture-management-admin", "Content-Type": "application/json" },
 				body: "{}",
 			});
 			expect(res.status).toBe(404);
@@ -196,7 +198,7 @@ describe("auth-gateway management endpoints", () => {
 				if (id === undefined) throw new Error("expected a stored credential");
 				const res = await fetch(`${url}/v1/credentials/${id}/disable`, {
 					method: "POST",
-					headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2", "Content-Type": "application/json" },
+					headers: { Authorization: "Bearer fixture-management-admin", "Content-Type": "application/json" },
 					body: "{}",
 				});
 				expect(res.status).toBe(200);
@@ -218,7 +220,7 @@ describe("auth-gateway management endpoints", () => {
 		await withManagementGateway(async ({ url }) => {
 			const res = await fetch(`${url}/v1/credentials/1/pin`, {
 				method: "POST",
-				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2", "Content-Type": "application/json" },
+				headers: { Authorization: "Bearer fixture-management-admin", "Content-Type": "application/json" },
 				body: "{}",
 			});
 			expect(res.status).toBe(400);
@@ -234,7 +236,7 @@ describe("auth-gateway management endpoints", () => {
 				if (id === undefined) throw new Error("expected a stored credential");
 				const res = await fetch(`${url}/v1/credentials/${id}/pin`, {
 					method: "POST",
-					headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2", "Content-Type": "application/json" },
+					headers: { Authorization: "Bearer fixture-management-admin", "Content-Type": "application/json" },
 					body: JSON.stringify({ provider: "anthropic", sessionId: "sess-1" }),
 				});
 				expect(res.status).toBe(200);

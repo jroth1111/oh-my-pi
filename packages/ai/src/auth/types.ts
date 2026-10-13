@@ -6,7 +6,7 @@ import type {
 	OAuthPrompt,
 	OAuthProviderId,
 } from "../registry/oauth/types";
-import type { Provider } from "../types";
+import type { Api, Provider } from "../types";
 import type {
 	ClientUsageIdentity,
 	ClientUsageReport,
@@ -23,6 +23,22 @@ import type {
 
 /** Default remaining quota protected for accounts without an explicit policy override. */
 export const DEFAULT_USAGE_RESERVE_PCT = 10;
+
+/** Crash/abandonment backstop; owners renew reservations while inference remains active. */
+export const DEFAULT_TURN_RESERVATION_TTL_MS = 255_000;
+
+export interface TurnReservation {
+	credentialId: number;
+	incarnation: number;
+	requestId: string;
+	expiresAtMs: number;
+	release(): void;
+}
+
+export type TurnReservationResult =
+	| { ok: true; reservation: TurnReservation }
+	| { ok: false; reason: "held"; heldByRequestId: string; expiresAtMs: number }
+	| { ok: false; reason: "stale-incarnation" };
 
 /** Stored API key used by credential selection. */
 export type ApiKeyCredential = {
@@ -107,6 +123,8 @@ export interface StoredCredentialBlock {
 	blockedUntilMs: number;
 	/** True when the block came from a provider Retry-After / usage wait window. */
 	retryAfter?: boolean;
+	/** Known quota exhaustion; missing/false provenance is never eligible for a recovery probe. */
+	quotaOrigin?: boolean;
 	/** Last row update timestamp in epoch milliseconds, when provided by the backing store. */
 	updatedAtMs?: number;
 }
@@ -476,25 +494,14 @@ export interface ModelUsageHealthOptions {
 	signal?: AbortSignal;
 }
 
-/** Default in-flight turn reservation TTL; at least the gateway's 255s idleTimeout. */
-export const DEFAULT_TURN_RESERVATION_TTL_MS = 255_000;
-
-export interface TurnReservation {
-	credentialId: number;
-	incarnation: number;
-	requestId: string;
-	expiresAtMs: number;
-	release(): void;
-}
-
-export type TurnReservationResult =
-	| { ok: true; reservation: TurnReservation }
-	| { ok: false; heldByRequestId: string; expiresAtMs: number };
-
 /** Options controlling model, base URL, cancellation, and forced OAuth refresh in KeysApi.get. */
 export type AuthApiKeyOptions = {
+	/** Exact stored row owning a continuation; never widens session/account restrictions. */
+	credentialId?: number;
 	baseUrl?: string;
 	modelId?: string;
+	/** Identity of the inference attempt owning a recovery probe; callers settle or release it. */
+	requestId?: string;
 	/** {@link oauthAccountKey}s of accounts known to serve `modelId` from multi-account discovery; OAuth selection prefers them and tries other accounts only as a last resort. */
 	accountIds?: readonly string[];
 	/**
@@ -514,12 +521,6 @@ export type AuthApiKeyOptions = {
 	refreshReason?: OAuthRefreshReason;
 	/** When false, select as `sessionId` would without recording the choice as that session's sticky credential. */
 	recordAffinity?: boolean;
-	/**
-	 * Gateway request identity for in-flight turn reservations: when set, a
-	 * credential reserved by a different request counts as blocked, and the
-	 * selected credential is exclusively held for this request until release.
-	 */
-	requestId?: string;
 };
 
 /**
@@ -555,6 +556,8 @@ export interface OAuthRequestIdentity {
  */
 export interface OAuthAccess {
 	accessToken: string;
+	/** Targeted request resolution, including provider-formatted key and selected account scope. */
+	resolvedKey?: ResolvedApiKey;
 	credentialId?: number;
 	accountId?: string;
 	email?: string;
@@ -1160,8 +1163,27 @@ export interface OAuthApi {
  */
 export type SessionRestrictionLease = symbol;
 
+/** Credential and deployment binding of an upstream response, without bearer material. */
+export interface StoredResponseOwner {
+	sessionId: string;
+	target: string;
+	provider: string;
+	api: Api;
+	endpoint: string;
+	account: string;
+	credentialId?: number;
+}
+
+/** Private response-to-account bindings, persisted alongside session affinity. */
+export interface ResponseOwnersApi {
+	get(responseId: string): Readonly<StoredResponseOwner> | undefined;
+	record(responseId: string | undefined, owner: StoredResponseOwner): void;
+}
+
 /** Session credential affinity operations. */
 export interface SessionsApi {
+	/** Deliberate user pin only; automatic warm affinity is not a continuation ownership constraint. */
+	explicitCredentialId(provider: string, sessionId: string): number | undefined;
 	/**
 	 * Pin one stored OAuth account as this session's preferred credential.
 	 *

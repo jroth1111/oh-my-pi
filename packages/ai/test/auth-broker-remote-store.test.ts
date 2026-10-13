@@ -365,23 +365,30 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 			stdout: "ignore",
 			stderr: "pipe",
 		});
-		const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
-		expect(exitCode, stderr).toBe(0);
+		const deadline = setTimeout(() => child.kill("SIGKILL"), 40_000);
+		try {
+			const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+			expect(exitCode, stderr).toBe(0);
 
-		const reported = storage!.usage.clientSummary(0).clients.find(c => c.installId === "print-mode-install");
-		expect(reported?.providers).toEqual([
-			{
-				app: "omp",
-				provider: "anthropic",
-				requests: 1,
-				inputTokens: 12,
-				outputTokens: 4,
-				cacheReadTokens: 0,
-				cacheWriteTokens: 0,
-				costUsd: 0.01,
-			},
-		]);
-	});
+			const reported = storage!.usage.clientSummary(0).clients.find(c => c.installId === "print-mode-install");
+			expect(reported?.providers).toEqual([
+				{
+					app: "omp",
+					provider: "anthropic",
+					requests: 1,
+					inputTokens: 12,
+					outputTokens: 4,
+					cacheReadTokens: 0,
+					cacheWriteTokens: 0,
+					costUsd: 0.01,
+				},
+			]);
+		} finally {
+			clearTimeout(deadline);
+			child.kill("SIGTERM");
+			await child.exited;
+		}
+	}, 45_000);
 
 	test("background sync parks after the idle window and resumes on the next store use", async () => {
 		const client = new AuthBrokerClient({ url: handle!.url, token });

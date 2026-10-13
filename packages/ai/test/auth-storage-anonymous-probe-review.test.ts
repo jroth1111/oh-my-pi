@@ -23,7 +23,7 @@ beforeEach(async () => {
 		refreshToken: async credentials => credentials,
 		getApiKey: credentials => credentials.access,
 	});
-	await storage.set(provider, [
+	await storage.credentials.set(provider, [
 		{ type: "oauth", access: "fixture-access", refresh: "fixture-refresh", expires: Date.now() + 3_600_000 },
 	]);
 });
@@ -34,11 +34,11 @@ afterEach(async () => {
 });
 
 it("keeps an anonymous recovery probe pending and exclusive until inference succeeds", async () => {
-	const id = storage.listStoredCredentials(provider)[0]!.id;
-	await storage.markUsageLimitReached(provider, undefined, { credentialId: id });
-	expect(await storage.getApiKey(provider, "one")).toBe("fixture-access");
-	expect(storage.listCredentialBlocks([id])).toHaveLength(1);
-	expect(await storage.getApiKey(provider, "two")).toBeUndefined();
-	expect(storage.settleAnonymousQuotaProbe(id, "")).toBe(true);
-	expect(storage.listCredentialBlocks([id])).toEqual([]);
+	const id = storage.credentials.list(provider)[0]!.id;
+	await storage.limits.markReached(provider, undefined, { credentialId: id });
+	expect(await storage.keys.get(provider, "one")).toBe("fixture-access");
+	expect(storage.blocks.list([id])).toHaveLength(1);
+	expect(await storage.keys.get(provider, "two")).toBeUndefined();
+	expect(storage.coordination.settleAnonymousQuotaProbe(id, "")).toBe(true);
+	expect(storage.blocks.list([id])).toEqual([]);
 });

@@ -174,10 +174,13 @@ export const AUTH_BROKER_CAPABILITIES_HEADER = "OMP-Auth-Broker-Capabilities";
 /** Client understands independent Codex `chat` and `spark` credential-block scopes. */
 export const AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES = "codex-meter-block-scopes";
 
-/** Client understands Retry-After provenance on credential-block snapshots. */
+/** Client understands quota-origin and provider-wait provenance on credential blocks. */
+export const AUTH_BROKER_CAPABILITY_BLOCK_PROVENANCE = "credential-block-provenance";
+/** Older fork clients understand Retry-After, but not quota-origin, block metadata. */
 export const AUTH_BROKER_CAPABILITY_RETRY_AFTER_BLOCKS = "retry-after-blocks";
 export const AUTH_BROKER_CLIENT_CAPABILITIES = [
 	AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES,
+	AUTH_BROKER_CAPABILITY_BLOCK_PROVENANCE,
 	AUTH_BROKER_CAPABILITY_RETRY_AFTER_BLOCKS,
 ].join(",");
 

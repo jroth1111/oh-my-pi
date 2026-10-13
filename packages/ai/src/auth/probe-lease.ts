@@ -78,6 +78,12 @@ export class QuotaProbeLeaseBook {
 		return true;
 	}
 
+	isCurrentLease(credentialId: number, blockScope: string, leaseId: string): boolean {
+		const key = probeKey(credentialId, blockScope);
+		const lease = this.#leases.get(key);
+		return lease?.id === leaseId && lease.generation === (this.#generation.get(key) ?? 0);
+	}
+
 	isRetryAfterSourced(credentialId: number, blockScope: string, nowMs: number = Date.now()): boolean {
 		const until = this.#retryAfterUntil.get(probeKey(credentialId, blockScope));
 		return until !== undefined && until > nowMs;
@@ -93,16 +99,16 @@ export class QuotaProbeLeaseBook {
 
 	purgeCredential(credentialId: number): void {
 		const prefix = `${credentialId}\0`;
-		for (const key of [...this.#generation.keys()]) {
+		for (const key of this.#generation.keys()) {
 			if (key.startsWith(prefix)) this.#generation.delete(key);
 		}
-		for (const key of [...this.#leases.keys()]) {
+		for (const key of this.#leases.keys()) {
 			if (key.startsWith(prefix)) this.#leases.delete(key);
 		}
-		for (const key of [...this.#softUntil.keys()]) {
+		for (const key of this.#softUntil.keys()) {
 			if (key.startsWith(prefix)) this.#softUntil.delete(key);
 		}
-		for (const key of [...this.#retryAfterUntil.keys()]) {
+		for (const key of this.#retryAfterUntil.keys()) {
 			if (key.startsWith(prefix)) this.#retryAfterUntil.delete(key);
 		}
 	}

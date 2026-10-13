@@ -35,7 +35,6 @@ it("uses only the failing subtree's edges and retains its parent fallback", () =
 		const state: ExecutionState = {
 			routeId: route.id,
 			generation: route.generation,
-			attemptedCredentials: new Set<number>(),
 			attemptedTargets: new Set(attempted),
 			retryCount: 0,
 			fallbackCount: 0,

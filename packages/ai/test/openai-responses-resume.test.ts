@@ -281,6 +281,22 @@ describe("openai-responses socket-drop resume", () => {
 		expect(scenario.gets).toEqual([]);
 	});
 
+	it("does not enable disconnect recovery when an ordinary host explicitly stores a response", async () => {
+		const scenario = dropScenario("resp_explicit_storage", [
+			() => Response.json(completedResult("resp_explicit_storage")),
+		]);
+		const result = await streamOpenAIResponses(bundledModel("openai"), context, {
+			fetch: scenario.fetchImpl,
+			apiKey: "test-key",
+			providerRetryWait: noWait,
+			store: true,
+		}).result();
+		expect(scenario.postBodies[0]).toMatchObject({ store: true });
+		expect(scenario.gets).toEqual([]);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toMatch(/socket connection was closed/);
+	});
+
 	it("records each adopted output item once when reasoning finished before the drop", async () => {
 		// The replay re-emits every output item. A reasoning item that already hit
 		// `output_item.done` before the drop must not be recorded twice: the history

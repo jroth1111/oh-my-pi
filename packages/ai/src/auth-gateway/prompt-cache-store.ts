@@ -2,6 +2,9 @@ export interface PromptCacheHit {
 	provider: string;
 	model: string;
 	accountId: string;
+	credentialId?: number;
+	credentialIncarnation?: number;
+	generation?: number;
 }
 
 interface PromptCacheRecord {
@@ -17,6 +20,9 @@ function cloneHit(hit: PromptCacheHit): PromptCacheHit {
 		provider: hit.provider,
 		model: hit.model,
 		accountId: hit.accountId,
+		...(hit.credentialId !== undefined ? { credentialId: hit.credentialId } : {}),
+		...(hit.credentialIncarnation !== undefined ? { credentialIncarnation: hit.credentialIncarnation } : {}),
+		...(hit.generation !== undefined ? { generation: hit.generation } : {}),
 	};
 }
 
@@ -44,6 +50,10 @@ export class PromptCacheAffinityStore {
 			return undefined;
 		}
 		return cloneHit(record.hit);
+	}
+
+	forget(fingerprint: string): void {
+		this.#entries.delete(fingerprint);
 	}
 
 	#purgeExpired(nowMs: number): void {

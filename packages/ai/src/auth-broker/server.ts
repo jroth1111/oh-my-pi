@@ -35,8 +35,10 @@ import type {
 } from "./types";
 import {
 	AUTH_BROKER_CAPABILITIES_HEADER,
-	AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES,
+	AUTH_BROKER_CAPABILITY_BLOCK_PROVENANCE,
 	AUTH_BROKER_CAPABILITY_RETRY_AFTER_BLOCKS,
+	AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES,
+	AUTH_BROKER_CLIENT_CAPABILITIES,
 	DEFAULT_AUTH_BROKER_BIND,
 	DEFAULT_REFRESH_INTERVAL_MS,
 	DEFAULT_REFRESH_SKEW_MS,
@@ -98,12 +100,19 @@ export interface AuthBrokerServerHandle {
 function json(status: number, body: unknown, headers?: Record<string, string>): Response {
 	return new Response(JSON.stringify(body), {
 		status,
-		headers: { "Content-Type": "application/json", ...headers },
+		headers: {
+			"Content-Type": "application/json",
+			[AUTH_BROKER_CAPABILITIES_HEADER]: AUTH_BROKER_CLIENT_CAPABILITIES,
+			...headers,
+		},
 	});
 }
 
 function empty(status: number, headers?: Record<string, string>): Response {
-	return new Response(null, { status, headers });
+	return new Response(null, {
+		status,
+		headers: { [AUTH_BROKER_CAPABILITIES_HEADER]: AUTH_BROKER_CLIENT_CAPABILITIES, ...headers },
+	});
 }
 
 function isAuthorized(req: Request, tokens: ReadonlySet<string>): boolean {
@@ -118,10 +127,6 @@ function isAuthorized(req: Request, tokens: ReadonlySet<string>): boolean {
 function supportsBrokerCapability(req: Request, expected: string): boolean {
 	const capabilities = req.headers.get(AUTH_BROKER_CAPABILITIES_HEADER);
 	return capabilities?.split(",").some(capability => capability.trim() === expected) ?? false;
-}
-
-function supportsCodexMeterBlockScopes(req: Request): boolean {
-	return supportsBrokerCapability(req, AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES);
 }
 
 /**
@@ -360,6 +365,9 @@ function projectCredentialBlocksForLegacyClient(blocks: readonly CredentialBlock
 			blockedUntilMs: Math.max(shared?.blockedUntilMs ?? 0, block.blockedUntilMs),
 			...(updatedAtMs !== undefined ? { updatedAtMs } : {}),
 			...(block.retryAfter === true || shared?.retryAfter === true ? { retryAfter: true } : {}),
+			...(block.quotaOrigin !== undefined || shared?.quotaOrigin !== undefined
+				? { quotaOrigin: block.quotaOrigin === true && (shared === undefined || shared.quotaOrigin === true) }
+				: {}),
 		};
 	}
 	if (shared) projected.push(shared);
@@ -370,6 +378,7 @@ function buildCredentialBlockGroups(
 	blocks: readonly StoredCredentialBlock[],
 	serverNowMs: number,
 	clientSupportsCodexMeterBlockScopes: boolean,
+	clientSupportsBlockProvenance: boolean,
 	clientSupportsRetryAfterBlocks: boolean,
 ): Map<number, CredentialBlockSnapshot[]> {
 	const byCredentialId = new Map<number, CredentialBlockSnapshot[]>();
@@ -380,7 +389,10 @@ function buildCredentialBlockGroups(
 			blockScope: block.blockScope,
 			blockedUntilMs: block.blockedUntilMs,
 			updatedAtMs: block.updatedAtMs,
-			...(clientSupportsRetryAfterBlocks && block.retryAfter === true ? { retryAfter: true } : {}),
+			...(clientSupportsRetryAfterBlocks && block.retryAfter !== undefined ? { retryAfter: block.retryAfter } : {}),
+			...(clientSupportsBlockProvenance && block.quotaOrigin !== undefined
+				? { quotaOrigin: block.quotaOrigin }
+				: {}),
 		};
 		const existing = byCredentialId.get(block.credentialId);
 		if (existing) {
@@ -446,7 +458,11 @@ class SnapshotSource {
 	}
 
 	/** Wire snapshot for one client flavour, projected at the current server time. */
-	build(clientSupportsCodexMeterBlockScopes: boolean, clientSupportsRetryAfterBlocks: boolean): SnapshotResponse {
+	build(
+		clientSupportsCodexMeterBlockScopes: boolean,
+		clientSupportsBlockProvenance: boolean,
+		clientSupportsRetryAfterBlocks = clientSupportsBlockProvenance,
+	): SnapshotResponse {
 		const rows = this.#currentRows();
 		const serverNowMs = Date.now();
 		const { wire, nextSweepAt } = resolveRefresherSchedule(this.#refresher, serverNowMs);
@@ -454,6 +470,7 @@ class SnapshotSource {
 			this.#storage.blocks.list(rows.credentials.map(entry => entry.id)),
 			serverNowMs,
 			clientSupportsCodexMeterBlockScopes,
+			clientSupportsBlockProvenance,
 			clientSupportsRetryAfterBlocks,
 		);
 		const credentials: SnapshotEntry[] = rows.credentials.map(entry => {
@@ -487,14 +504,23 @@ async function serveSnapshot(
 	peer: string,
 ): Promise<Response> {
 	await source.reload();
-	const clientSupportsCodexMeterBlockScopes = supportsCodexMeterBlockScopes(req);
-	const clientSupportsRetryAfterBlocks = supportsBrokerCapability(req, AUTH_BROKER_CAPABILITY_RETRY_AFTER_BLOCKS);
+	const clientSupportsCodexMeterBlockScopes = supportsBrokerCapability(
+		req,
+		AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES,
+	);
+	const clientSupportsBlockProvenance = supportsBrokerCapability(req, AUTH_BROKER_CAPABILITY_BLOCK_PROVENANCE);
+	const clientSupportsRetryAfterBlocks =
+		clientSupportsBlockProvenance || supportsBrokerCapability(req, AUTH_BROKER_CAPABILITY_RETRY_AFTER_BLOCKS);
 	let currentGeneration = source.generation;
 	const clientGeneration = parseGenerationTag(req.headers.get("if-none-match"));
 	const waitMs = parseWaitMs(url);
 
 	if (clientGeneration === undefined || currentGeneration !== clientGeneration || waitMs <= 0) {
-		const body = source.build(clientSupportsCodexMeterBlockScopes, clientSupportsRetryAfterBlocks);
+		const body = source.build(
+			clientSupportsCodexMeterBlockScopes,
+			clientSupportsBlockProvenance,
+			clientSupportsRetryAfterBlocks,
+		);
 		logger.info("auth-broker snapshot served", {
 			peer,
 			credentials: body.credentials.length,
@@ -514,7 +540,11 @@ async function serveSnapshot(
 	await source.reload();
 	currentGeneration = source.generation;
 	if (currentGeneration !== clientGeneration) {
-		const body = source.build(clientSupportsCodexMeterBlockScopes, clientSupportsRetryAfterBlocks);
+		const body = source.build(
+			clientSupportsCodexMeterBlockScopes,
+			clientSupportsBlockProvenance,
+			clientSupportsRetryAfterBlocks,
+		);
 		logger.info("auth-broker snapshot long-poll changed", {
 			peer,
 			credentials: body.credentials.length,
@@ -555,6 +585,7 @@ function sseEvent(event: string, body: unknown): Uint8Array {
 interface SnapshotStreamSubscriber {
 	readonly peer: string;
 	readonly codexMeterBlockScopes: boolean;
+	readonly blockProvenance: boolean;
 	readonly retryAfterBlocks: boolean;
 	/** Fingerprint of the last entry frame sent per credential id. */
 	readonly sent: Map<number, string>;
@@ -712,13 +743,17 @@ class SnapshotStreamHub {
 	#fanOut(): void {
 		const frames = new Map<string, SnapshotStreamFrame>();
 		for (const subscriber of Array.from(this.#subscribers)) {
-			const flavor = `${Number(subscriber.codexMeterBlockScopes)}:${Number(subscriber.retryAfterBlocks)}`;
-			let frame = frames.get(flavor);
+			const flavour = `${subscriber.codexMeterBlockScopes}:${subscriber.blockProvenance}:${subscriber.retryAfterBlocks}`;
+			let frame = frames.get(flavour);
 			if (!frame) {
 				frame = new SnapshotStreamFrame(
-					this.#source.build(subscriber.codexMeterBlockScopes, subscriber.retryAfterBlocks),
+					this.#source.build(
+						subscriber.codexMeterBlockScopes,
+						subscriber.blockProvenance,
+						subscriber.retryAfterBlocks,
+					),
 				);
-				frames.set(flavor, frame);
+				frames.set(flavour, frame);
 			}
 			deliverStreamFrame(subscriber, frame);
 		}
@@ -772,8 +807,11 @@ function serveSnapshotStream(
 
 	const subscriber: SnapshotStreamSubscriber = {
 		peer,
-		codexMeterBlockScopes: supportsCodexMeterBlockScopes(req),
-		retryAfterBlocks: supportsBrokerCapability(req, AUTH_BROKER_CAPABILITY_RETRY_AFTER_BLOCKS),
+		codexMeterBlockScopes: supportsBrokerCapability(req, AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES),
+		blockProvenance: supportsBrokerCapability(req, AUTH_BROKER_CAPABILITY_BLOCK_PROVENANCE),
+		retryAfterBlocks:
+			supportsBrokerCapability(req, AUTH_BROKER_CAPABILITY_BLOCK_PROVENANCE) ||
+			supportsBrokerCapability(req, AUTH_BROKER_CAPABILITY_RETRY_AFTER_BLOCKS),
 		sent: new Map(),
 		lastGeneration: -1,
 		write,
@@ -783,7 +821,11 @@ function serveSnapshotStream(
 		async start(c) {
 			controller = c;
 			await source.reload();
-			const initial = source.build(subscriber.codexMeterBlockScopes, subscriber.retryAfterBlocks);
+			const initial = source.build(
+				subscriber.codexMeterBlockScopes,
+				subscriber.blockProvenance,
+				subscriber.retryAfterBlocks,
+			);
 			subscriber.lastGeneration = initial.generation;
 			for (const entry of initial.credentials) subscriber.sent.set(entry.id, fingerprintEntry(entry));
 			const initialEvent: SnapshotStreamSnapshotEvent = { kind: "snapshot", ...initial };
@@ -808,6 +850,7 @@ function serveSnapshotStream(
 		status: 200,
 		headers: {
 			"Content-Type": "text/event-stream; charset=utf-8",
+			[AUTH_BROKER_CAPABILITIES_HEADER]: AUTH_BROKER_CLIENT_CAPABILITIES,
 			"Cache-Control": "no-cache",
 			Connection: "keep-alive",
 			"X-Accel-Buffering": "no",
@@ -993,6 +1036,8 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 						providerKey: parsed.data.providerKey,
 						blockScope: parsed.data.blockScope,
 						blockedUntilMs: parsed.data.blockedUntilMs,
+						retryAfter: parsed.data.retryAfter,
+						quotaOrigin: parsed.data.quotaOrigin,
 					};
 					if (!opts.storage.credentials.snapshot().credentials.some(entry => entry.id === id)) {
 						logger.info("auth-broker credential block miss", { id, peer });

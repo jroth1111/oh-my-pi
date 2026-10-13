@@ -12,22 +12,13 @@ export interface ExecutionState {
 	routeId: string;
 	generation: number;
 	attemptedTargets: ReadonlySet<string>;
-	attemptedCredentials: ReadonlySet<number>;
 	retryCount: number;
 	fallbackCount: number;
 	committed: boolean;
 	currentTarget: string;
+	/** True after a sibling-credential retry for the current target failed. */
 	siblingsExhausted: boolean;
 }
-
-/**
- * Frozen Wave B CompiledRoute fields. RouteRegistry may still be the Wave A
- * shim (no `targets` / `fallbacks`); callers and tests supply them.
- */
-type ConductorRoute = CompiledRoute & {
-	targets: readonly string[];
-	fallbacks: Readonly<Partial<Record<GatewayErrorDisposition, readonly string[]>>>;
-};
 
 function firstUnused(ids: readonly string[] | undefined, attempted: ReadonlySet<string>): string | undefined {
 	if (!ids) return undefined;
@@ -35,6 +26,28 @@ function firstUnused(ids: readonly string[] | undefined, attempted: ReadonlySet<
 		if (!attempted.has(id)) return id;
 	}
 	return undefined;
+}
+
+function fallbackTargets(
+	route: CompiledRoute,
+	currentTarget: string,
+	disposition: GatewayErrorDisposition,
+): readonly string[] | undefined {
+	const scoped = route.fallbackByTarget[currentTarget]?.[disposition];
+	// Cache preference can start a flat fallback on a later target. Availability
+	// failure must try unused predecessors before tertiary output can commit.
+	// Nested graphs and context/credential failures retain their scoped edges.
+	if (
+		(disposition === "provider_transient" ||
+			disposition === "provider_unavailable" ||
+			disposition === "model_unavailable") &&
+		route.root.type === "fallback" &&
+		route.root.on.includes(disposition) &&
+		route.root.children.every(child => child.type === "target")
+	) {
+		return [...route.targets.slice(0, route.targets.indexOf(currentTarget)), ...(scoped ?? [])];
+	}
+	return scoped;
 }
 
 /**
@@ -46,64 +59,52 @@ export function decideAttempt(args: {
 	state: ExecutionState;
 	classification?: GatewayErrorClassification;
 	commitState: StreamCommitState;
-	preferredTargetId?: string;
 }): ConductorAction {
-	const { state, classification, commitState, preferredTargetId } = args;
-	const route = args.route as ConductorRoute;
+	const { state, classification, commitState } = args;
+	const route = args.route;
 
-	if (commitState !== "probing" || state.committed) {
+	if (
+		commitState !== "probing" ||
+		state.committed ||
+		state.routeId !== route.id ||
+		state.generation !== route.generation
+	) {
 		return { type: "terminal" };
 	}
 
 	if (!classification) {
-		const next =
-			preferredTargetId !== undefined &&
-			route.targets.includes(preferredTargetId) &&
-			!state.attemptedTargets.has(preferredTargetId)
-				? preferredTargetId
-				: firstUnused(route.targets, state.attemptedTargets);
+		const next = firstUnused(route.targets, state.attemptedTargets);
 		return next === undefined ? { type: "terminal" } : { type: "dispatch", targetModelId: next };
 	}
 
 	const { disposition } = classification;
-	const candidates = route.fallbackByTarget
-		? route.fallbackByTarget[state.currentTarget]?.[disposition]
-		: route.fallbacks[disposition];
+	if (!route.targets.includes(state.currentTarget)) return { type: "terminal" };
 	switch (disposition) {
 		case "cancelled":
 		case "request_terminal":
 		case "policy_terminal":
 		case "gateway_terminal":
 			return { type: "terminal" };
-		case "credential_permanent":
 		case "credential_quota":
-		case "credential_transient": {
+		case "credential_transient":
+		case "credential_permanent": {
 			if (!state.siblingsExhausted) {
 				return { type: "sibling_credential" };
 			}
-			const next = firstUnused(candidates, state.attemptedTargets);
+			const next = firstUnused(fallbackTargets(route, state.currentTarget, disposition), state.attemptedTargets);
 			return next === undefined ? { type: "terminal" } : { type: "fallback_target", targetModelId: next };
 		}
 		case "provider_transient":
 		case "provider_unavailable":
 		case "model_unavailable":
 		case "context_overflow": {
-			// Stay inside the disposition's compiled fallback list. Falling through
-			// to firstUnused(route.targets) would bypass the tree (e.g. retry a
-			// small model on context_overflow, or any unused leaf after a
-			// preferred-later failure).
-			const next =
-				firstUnused(candidates, state.attemptedTargets) ??
-				(disposition !== "context_overflow" &&
-				(!route.fallbackByTarget || (route.root.type === "fallback" && route.root.on.includes(disposition))) &&
-				route.fallbacks[disposition]?.includes(state.currentTarget)
-					? firstUnused(route.targets, state.attemptedTargets)
-					: undefined);
+			const next = firstUnused(fallbackTargets(route, state.currentTarget, disposition), state.attemptedTargets);
 			return next === undefined ? { type: "terminal" } : { type: "fallback_target", targetModelId: next };
 		}
 		default: {
 			const _never: never = disposition;
-			return _never;
+			void _never;
+			return { type: "terminal" };
 		}
 	}
 }

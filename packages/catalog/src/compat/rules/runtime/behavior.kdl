@@ -1,7 +1,8 @@
 // Provider and model behavior needed before or outside exact bundled-model lookup.
 
 behavior {
-	// Client-facing gateway protocol eligibility, including custom API identifiers.
+	// Native backend API capabilities, including custom API identifiers.
+	// Stateless gateway format translation does not require the same backend API.
 	gateway-surface name="openai-chat" {
 		allow substring="openai-completions"
 		allow substring="openai-chat"

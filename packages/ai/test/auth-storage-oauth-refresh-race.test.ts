@@ -29,6 +29,7 @@ describe("AuthStorage OAuth refresh race", () => {
 		store = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
 		events = [];
 		authStorage = new AuthStorage(store, {
+			usageProviderResolver: () => undefined,
 			onCredentialDisabled: event => {
 				events.push(event);
 			},
@@ -77,14 +78,13 @@ describe("AuthStorage OAuth refresh race", () => {
 
 		// Mock mirrors Anthropic: only the stale refresh token is rejected, because
 		// real rotation invalidates the previous refresh token on use.
-		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (provider, creds) => {
-			const credential = creds[provider];
+		vi.spyOn(oauthUtils, "refreshOAuthToken").mockImplementation(async (_provider, credential) => {
 			if (credential?.refresh === "stale-refresh") {
 				throw new Error(
 					'HTTP 400 invalid_grant {"error":"invalid_grant","error_description":"Refresh token not found or invalid"}',
 				);
 			}
-			return { newCredentials: credential!, apiKey: credential!.access };
+			return credential;
 		});
 
 		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
@@ -127,21 +127,20 @@ describe("AuthStorage OAuth refresh race", () => {
 		// refresh token to our snapshot will therefore see the SAME stale token
 		// and fall through to the disable. We then race a peer rotation into the
 		// window between the pre-check and the CAS, which the CAS must detect.
-		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (provider, creds) => {
-			const credential = creds[provider];
+		vi.spyOn(oauthUtils, "refreshOAuthToken").mockImplementation(async (_provider, credential) => {
 			if (credential?.refresh === "stale-refresh") {
 				throw new Error(
 					'HTTP 400 invalid_grant {"error":"invalid_grant","error_description":"Refresh token not found or invalid"}',
 				);
 			}
-			return { newCredentials: credential!, apiKey: credential!.access };
+			return credential;
 		});
 
 		const sharedStore = store;
 		const originalTryDisable = sharedStore.tryDisableAuthCredentialIfMatches.bind(sharedStore);
 		const tryDisableSpy = vi
 			.spyOn(sharedStore, "tryDisableAuthCredentialIfMatches")
-			.mockImplementation((id, expectedData, disabledCause) => {
+			.mockImplementation((id, expectedData, disabledCause, ownership) => {
 				// Simulate the peer's successful rotation landing in the window
 				// between the pre-check (which saw the stale token) and the CAS
 				// disable. The CAS predicate `data = expectedData` must now miss.
@@ -151,7 +150,7 @@ describe("AuthStorage OAuth refresh race", () => {
 					refresh: "fresh-refresh-from-peer",
 					expires: Date.now() + 60 * 60_000,
 				});
-				return originalTryDisable(id, expectedData, disabledCause);
+				return originalTryDisable(id, expectedData, disabledCause, ownership);
 			});
 
 		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
@@ -188,7 +187,7 @@ describe("AuthStorage OAuth refresh race", () => {
 			},
 		]);
 
-		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async () => {
+		vi.spyOn(oauthUtils, "refreshOAuthToken").mockImplementation(async () => {
 			throw new Error('invalid_grant {"error":"invalid_grant"}');
 		});
 

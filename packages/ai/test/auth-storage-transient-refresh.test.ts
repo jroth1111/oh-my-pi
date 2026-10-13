@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai/auth-storage";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import * as oauthUtils from "@oh-my-pi/pi-ai/registry/oauth";
+import { OAUTH_REFRESH_FAILURE_BACKOFF_MS } from "../src/auth/select";
 
 const ENV_KEYS = ["ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN"] as const;
 
@@ -46,6 +47,8 @@ describe("AuthStorage transient OAuth refresh failure", () => {
 
 	it("rejects request resolution with a retryable error and keeps the credential", async () => {
 		const auth = await open();
+		const now = Date.now();
+		const clock = vi.spyOn(Date, "now").mockReturnValue(now);
 		await auth.credentials.set("anthropic", [expiredOAuth()]);
 		const refresh = vi
 			.spyOn(oauthUtils, "refreshOAuthToken")
@@ -56,7 +59,11 @@ describe("AuthStorage transient OAuth refresh failure", () => {
 		expect(error).toBeInstanceOf(AIError.OAuthRefreshUnavailableError);
 		expect(AIError.retriable(AIError.classify(error))).toBe(true);
 		expect(auth.credentials.has("anthropic")).toBe(true);
+		expect(refresh).toHaveBeenCalledTimes(1);
+		expect(await auth.keys.getWithCredential("anthropic", "session")).toBeUndefined();
+		expect(refresh).toHaveBeenCalledTimes(1);
 
+		clock.mockReturnValue(now + OAUTH_REFRESH_FAILURE_BACKOFF_MS + 1);
 		expect((await auth.keys.getWithCredential("anthropic", "session"))?.apiKey).toBe("fresh-access");
 		expect(refresh).toHaveBeenCalledTimes(2);
 	});

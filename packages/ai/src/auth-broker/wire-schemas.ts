@@ -120,6 +120,7 @@ export const credentialBlockSnapshotSchema: FluentType<CredentialBlockSnapshot> 
 	blockedUntilMs: "number",
 	"updatedAtMs?": "number",
 	"retryAfter?": "boolean",
+	"quotaOrigin?": "boolean",
 });
 
 export const snapshotEntrySchema: FluentType<SnapshotEntry> = type({

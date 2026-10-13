@@ -1,705 +1,408 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { clearCustomApis } from "@oh-my-pi/pi-ai/api-registry";
-import { startAuthGateway } from "@oh-my-pi/pi-ai/auth-gateway";
-import { AuthStorage } from "@oh-my-pi/pi-ai/auth-storage";
-import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
+import { createAuthGatewayRouter, RouteRegistry, startAuthGateway } from "../src/auth-gateway";
+import type { RouteDefinition } from "../src/auth-gateway";
+import { AuthStorage } from "../src/auth-storage";
+import { createMockModel } from "../src/providers/mock";
 
-afterEach(() => {
-	clearCustomApis();
-});
-
-const primaryId = "primary-id";
-const backupId = "backup-id";
-
-type RoutesListResponse = {
-	object: string;
-	generation: number;
-	data: Array<{
-		id: string;
-		generation: number;
-		targets: string[];
-		fallbacks: Record<string, string[]>;
-	}>;
-};
-
-type RouteRow = {
-	id: string;
-	generation: number;
-	targets: string[];
-	fallbacks: Record<string, string[]>;
-};
-
-const virtualImplId = "virtual-impl";
-
-async function withVirtualRoutesGateway(run: (url: string) => Promise<void>): Promise<void> {
-	registerMockApi();
-	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gw-routes-get-"));
-	const storage = await AuthStorage.create(path.join(dir, "auth.db"));
-	const primary = createMockModel({ provider: "openrouter", id: primaryId });
-	const backup = createMockModel({ provider: "openrouter", id: backupId });
-	const resolveModel = (id: string) => {
-		if (id === primaryId) return primary.model;
-		if (id === backupId) return backup.model;
-		return undefined;
+async function withListing(
+	definitions: readonly RouteDefinition[],
+	run: (url: string, registry: RouteRegistry, changeAlias: () => void, storage: AuthStorage) => Promise<void>,
+	management: { allowManagement?: boolean; adminBearerTokens?: string[] } = {},
+): Promise<void> {
+	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gateway-route-list-"));
+	const storage = await AuthStorage.create(path.join(directory, "auth.db"), {
+		usageProviderResolver: () => undefined,
+	});
+	const first = {
+		...createMockModel({ provider: "fixture", id: "first" }),
+		headers: { Authorization: "private-model-fixture-bearer" },
 	};
-	const handle = startAuthGateway({
+	const second = createMockModel({ provider: "fixture", id: "second" });
+	let alias = first;
+	const registry = new RouteRegistry(id => (id === "alias" ? alias : id === "second" ? second : undefined));
+	const gateway = startAuthGateway({
 		bind: "127.0.0.1:0",
-		bearerTokens: ["omp-fixture-bearer-6dc18ed2"],
+		bearerTokens: ["listing-fixture-client"],
 		storage,
-		resolveModel,
-		listModels: () => [primary.model, backup.model],
-		routes: [
-			{
-				id: virtualImplId,
-				root: {
-					type: "fallback",
-					on: ["provider_unavailable"],
-					children: [
-						{ type: "target", model: primaryId },
-						{ type: "target", model: backupId },
-					],
-				},
+		resolveModel: () => undefined,
+		routeRegistry: registry,
+		routes: definitions,
+		listModels: () => [first, second],
+		...management,
+	});
+	try {
+		await run(
+			gateway.url,
+			registry,
+			() => {
+				alias = { ...first, id: "changed", name: "Changed fixture" };
 			},
-		],
-		version: "test",
-	});
-	try {
-		await run(handle.url);
+			storage,
+		);
 	} finally {
-		await handle.close();
+		await gateway.close();
 		storage.close();
-		await fs.rm(dir, { recursive: true, force: true });
+		await fs.rm(directory, { recursive: true });
 	}
 }
 
-const hotRouteId = "hot-route";
-
-async function withEmptyRoutesGateway(run: (url: string) => Promise<void>): Promise<void> {
-	registerMockApi();
-	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gw-routes-put-"));
-	const storage = await AuthStorage.create(path.join(dir, "auth.db"));
-	const primary = createMockModel({ provider: "openrouter", id: primaryId });
-	const backup = createMockModel({ provider: "openrouter", id: backupId });
-	const resolveModel = (id: string) => {
-		if (id === primaryId) return primary.model;
-		if (id === backupId) return backup.model;
-		return undefined;
-	};
-	const handle = startAuthGateway({
-		bind: "127.0.0.1:0",
-		bearerTokens: ["omp-fixture-bearer-6dc18ed2"],
-		storage,
-		resolveModel,
-		listModels: () => [primary.model, backup.model],
-		version: "test",
-	});
-	try {
-		await run(handle.url);
-	} finally {
-		await handle.close();
-		storage.close();
-		await fs.rm(dir, { recursive: true, force: true });
-	}
-}
-
-describe("auth-gateway GET /v1/routes", () => {
-	it("lists two registered virtual ids with generation greater than 1", async () => {
-		registerMockApi();
-		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gw-routes-list-"));
-		const storage = await AuthStorage.create(path.join(dir, "auth.db"));
-		const primary = createMockModel({ provider: "openrouter", id: primaryId });
-		const backup = createMockModel({ provider: "openrouter", id: backupId });
-		const resolveModel = (id: string) => {
-			if (id === primaryId) return primary.model;
-			if (id === backupId) return backup.model;
-			return undefined;
-		};
-		const handle = startAuthGateway({
-			bind: "127.0.0.1:0",
-			bearerTokens: ["omp-fixture-bearer-6dc18ed2"],
-			storage,
-			resolveModel,
-			listModels: () => [primary.model, backup.model],
-			routes: [
-				{
-					id: "virtual-a",
-					root: {
-						type: "fallback",
-						on: ["provider_unavailable"],
-						children: [
-							{ type: "target", model: primaryId },
-							{ type: "target", model: backupId },
-						],
-					},
-				},
-				{
-					id: "virtual-b",
-					root: { type: "target", model: backupId },
-				},
+const definitions: readonly RouteDefinition[] = [
+	{
+		id: "virtual-a",
+		root: {
+			type: "fallback",
+			on: ["provider_unavailable"],
+			children: [
+				{ type: "target", model: "alias" },
+				{ type: "target", model: "second" },
 			],
-			version: "test",
-		});
-		try {
-			const res = await fetch(`${handle.url}/v1/routes`, {
-				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2" },
-			});
-			expect(res.status).toBe(200);
-			const body = (await res.json()) as RoutesListResponse;
-			expect(body.object).toBe("list");
-			expect(body.generation).toBeGreaterThan(1);
-			expect(body.data.map(row => row.id)).toEqual(["virtual-a", "virtual-b"]);
-			expect(body.data).toEqual([
+		},
+	},
+	{ id: "virtual-b", root: { type: "target", model: "second" } },
+];
+const auth = { Authorization: "Bearer listing-fixture-client" };
+
+it("lists canonical virtual routes without private model state", async () => {
+	await withListing(definitions, async url => {
+		const response = await fetch(`${url}/v1/routes`, { headers: auth });
+		expect(response.status).toBe(200);
+		const text = await response.text();
+		expect(text).not.toContain("private-model-fixture-bearer");
+		expect(text).not.toContain("Authorization");
+		expect(JSON.parse(text)).toEqual({
+			object: "list",
+			generation: 3,
+			data: [
 				{
 					id: "virtual-a",
 					generation: 2,
-					targets: [primaryId, backupId],
-					fallbacks: { provider_unavailable: [backupId] },
+					targets: ["fixture/first", "fixture/second"],
+					fallbacks: { provider_unavailable: ["fixture/second"] },
 				},
-				{
-					id: "virtual-b",
-					generation: 2,
-					targets: [backupId],
-					fallbacks: {},
-				},
-			]);
-		} finally {
-			await handle.close();
-			storage.close();
-			await fs.rm(dir, { recursive: true, force: true });
-		}
-	});
-
-	it("returns 401 without a bearer token (negative)", async () => {
-		registerMockApi();
-		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gw-routes-list-unauth-"));
-		const storage = await AuthStorage.create(path.join(dir, "auth.db"));
-		const handle = startAuthGateway({
-			bind: "127.0.0.1:0",
-			bearerTokens: ["omp-fixture-bearer-6dc18ed2"],
-			storage,
-			resolveModel: () => undefined,
-			routes: [
-				{
-					id: "virtual-a",
-					root: { type: "target", model: primaryId },
-				},
+				{ id: "virtual-b", generation: 3, targets: ["fixture/second"], fallbacks: {} },
 			],
-			version: "test",
-		});
-		try {
-			const res = await fetch(`${handle.url}/v1/routes`);
-			expect(res.status).toBe(401);
-			const body = (await res.json()) as { error?: string };
-			expect(body.error).toBe("unauthorized");
-		} finally {
-			await handle.close();
-			storage.close();
-			await fs.rm(dir, { recursive: true, force: true });
-		}
-	});
-
-	it("returns 404 JSON for a non-GET method on /v1/routes (negative)", async () => {
-		registerMockApi();
-		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gw-routes-list-method-"));
-		const storage = await AuthStorage.create(path.join(dir, "auth.db"));
-		const handle = startAuthGateway({
-			bind: "127.0.0.1:0",
-			bearerTokens: ["omp-fixture-bearer-6dc18ed2"],
-			storage,
-			resolveModel: () => undefined,
-			version: "test",
-		});
-		try {
-			const res = await fetch(`${handle.url}/v1/routes`, {
-				method: "POST",
-				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2" },
-			});
-			expect(res.status).toBe(404);
-			const body = (await res.json()) as { error?: string };
-			expect(body.error).toBe("No route: POST /v1/routes");
-		} finally {
-			await handle.close();
-			storage.close();
-			await fs.rm(dir, { recursive: true, force: true });
-		}
-	});
-
-	it("returns empty data for a concrete-only gateway (negative)", async () => {
-		registerMockApi();
-		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gw-routes-list-empty-"));
-		const storage = await AuthStorage.create(path.join(dir, "auth.db"));
-		const primary = createMockModel({ provider: "openrouter", id: primaryId });
-		const backup = createMockModel({ provider: "openrouter", id: backupId });
-		const resolveModel = (id: string) => {
-			if (id === primaryId) return primary.model;
-			if (id === backupId) return backup.model;
-			return undefined;
-		};
-		const handle = startAuthGateway({
-			bind: "127.0.0.1:0",
-			bearerTokens: ["omp-fixture-bearer-6dc18ed2"],
-			storage,
-			resolveModel,
-			listModels: () => [primary.model, backup.model],
-			version: "test",
-		});
-		try {
-			const res = await fetch(`${handle.url}/v1/routes`, {
-				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2" },
-			});
-			expect(res.status).toBe(200);
-			const body = (await res.json()) as RoutesListResponse;
-			expect(body.object).toBe("list");
-			expect(body.data).toEqual([]);
-			const serialized = JSON.stringify(body);
-			expect(serialized).not.toContain(primaryId);
-			expect(serialized).not.toContain(backupId);
-			expect(serialized).not.toContain("openrouter/");
-		} finally {
-			await handle.close();
-			storage.close();
-			await fs.rm(dir, { recursive: true, force: true });
-		}
-	});
-});
-
-describe("auth-gateway GET /v1/routes/:id", () => {
-	it("returns 200 for a registered virtual id with matching targets", async () => {
-		await withVirtualRoutesGateway(async url => {
-			const res = await fetch(`${url}/v1/routes/${virtualImplId}`, {
-				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2" },
-			});
-			expect(res.status).toBe(200);
-			const body = (await res.json()) as RouteRow;
-			expect(body).toEqual({
-				id: virtualImplId,
-				generation: 2,
-				targets: [primaryId, backupId],
-				fallbacks: { provider_unavailable: [backupId] },
-			});
-		});
-	});
-
-	it("returns 404 for an unknown id (negative)", async () => {
-		await withVirtualRoutesGateway(async url => {
-			const res = await fetch(`${url}/v1/routes/no-such-route`, {
-				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2" },
-			});
-			expect(res.status).toBe(404);
-			const body = (await res.json()) as { error?: string };
-			expect(body.error).toBe("Unknown route: no-such-route");
-		});
-	});
-
-	it("returns 404 for a concrete catalog model id (negative)", async () => {
-		await withVirtualRoutesGateway(async url => {
-			const res = await fetch(`${url}/v1/routes/${primaryId}`, {
-				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2" },
-			});
-			expect(res.status).toBe(404);
-			const body = (await res.json()) as { error?: string };
-			expect(body.error).toBe(`Unknown route: ${primaryId}`);
-		});
-	});
-
-	it("returns 401 without a bearer token (negative)", async () => {
-		await withVirtualRoutesGateway(async url => {
-			const res = await fetch(`${url}/v1/routes/${virtualImplId}`);
-			expect(res.status).toBe(401);
-			const body = (await res.json()) as { error?: string };
-			expect(body.error).toBe("unauthorized");
-		});
-	});
-
-	it("still lists registered virtual routes on GET /v1/routes", async () => {
-		await withVirtualRoutesGateway(async url => {
-			const getRes = await fetch(`${url}/v1/routes/${virtualImplId}`, {
-				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2" },
-			});
-			expect(getRes.status).toBe(200);
-			const row = (await getRes.json()) as RouteRow;
-			const listRes = await fetch(`${url}/v1/routes`, {
-				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2" },
-			});
-			expect(listRes.status).toBe(200);
-			const listBody = (await listRes.json()) as RoutesListResponse;
-			expect(listBody.object).toBe("list");
-			expect(listBody.data).toEqual([row]);
 		});
 	});
 });
 
-describe("auth-gateway PUT /v1/routes/:id", () => {
-	it("decodes encoded route ids exactly once for GET and PUT", async () => {
-		await withEmptyRoutesGateway(async url => {
-			for (const [id, encoded] of [
-				["team/foo", "team%2Ffoo"],
-				["team route", "team%20route"],
-			] as const) {
-				const putRes = await fetch(`${url}/v1/routes/${encoded}`, {
-					method: "PUT",
-					headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2", "Content-Type": "application/json" },
-					body: JSON.stringify({ root: { type: "target", model: primaryId } }),
-				});
-				expect(putRes.status).toBe(200);
-				const putBody = (await putRes.json()) as RouteRow;
-				expect(putBody.id).toBe(id);
+it("requires an authorized bearer for route listing", async () => {
+	await withListing(definitions, async url => {
+		for (const headers of [undefined, { Authorization: "Bearer wrong-fixture-client" }]) {
+			const response = await fetch(`${url}/v1/routes`, { headers });
+			expect(response.status).toBe(401);
+			expect(await response.json()).toEqual({ error: "unauthorized" });
+		}
+	});
+});
 
-				const getRes = await fetch(`${url}/v1/routes/${encoded}`, {
-					headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2" },
+it("does not expose route writes or count concrete catalog models as virtual routes", async () => {
+	await withListing([], async url => {
+		const response = await fetch(`${url}/v1/routes`, { headers: auth });
+		expect(await response.json()).toEqual({ object: "list", generation: 1, data: [] });
+		for (const method of ["POST", "PUT", "DELETE"]) {
+			const rejected = await fetch(`${url}/v1/routes`, { method, headers: auth });
+			expect(rejected.status).toBe(404);
+			await rejected.text();
+		}
+	});
+});
+
+it("lists the same current catalog snapshot that dispatch will resolve", async () => {
+	await withListing(definitions, async (url, registry, changeAlias) => {
+		changeAlias();
+		const response = await fetch(`${url}/v1/routes`, { headers: auth });
+		const body = (await response.json()) as { generation: number; data: Array<{ id: string; targets: string[] }> };
+		expect(body.generation).toBe(3);
+		const resolved = registry.resolve("virtual-a");
+		if (!resolved) throw new Error("Expected a registered fixture route");
+		expect(body.data[0]?.targets).toEqual([...resolved.targets]);
+		expect(body.data[0]?.targets).toEqual(["fixture/changed", "fixture/second"]);
+	});
+});
+
+it("gets a virtual route by its exact encoded ID without leaking model headers", async () => {
+	const id = "virtual/雪 % +";
+	await withListing([{ id, root: { type: "target", model: "alias" } }], async (url, _registry, changeAlias) => {
+		changeAlias();
+		const response = await fetch(`${url}/v1/routes/${encodeURIComponent(id)}`, { headers: auth });
+		expect(response.status).toBe(200);
+		const text = await response.text();
+		expect(text).not.toContain("private-model-fixture-bearer");
+		expect(JSON.parse(text)).toEqual({ id, generation: 2, targets: ["fixture/changed"], fallbacks: {} });
+	});
+});
+
+it("does not wrap missing or concrete IDs into virtual route lookup", async () => {
+	await withListing(definitions, async url => {
+		for (const id of ["no-such-route", "alias", "fixture/first"]) {
+			const response = await fetch(`${url}/v1/routes/${encodeURIComponent(id)}`, { headers: auth });
+			expect(response.status).toBe(404);
+			expect(await response.json()).toEqual({ error: `Unknown route: ${id}` });
+		}
+	});
+});
+
+it("requires a bearer and rejects malformed route-ID encoding", async () => {
+	await withListing(definitions, async url => {
+		const unauthorized = await fetch(`${url}/v1/routes/virtual-a`);
+		expect(unauthorized.status).toBe(401);
+		await unauthorized.text();
+		const invalid = await fetch(`${url}/v1/routes/%GG`, { headers: auth });
+		expect(invalid.status).toBe(400);
+		expect(await invalid.json()).toEqual({ error: "invalid route id encoding" });
+	});
+});
+
+it("keeps individual lookup and collection listing consistent", async () => {
+	await withListing(definitions, async url => {
+		const response = await fetch(`${url}/v1/routes/virtual-a`, { headers: auth });
+		expect(response.status).toBe(200);
+		const row = await response.json();
+		const collection = await fetch(`${url}/v1/routes/`, { headers: auth });
+		expect(collection.status).toBe(200);
+		expect(await collection.json()).toMatchObject({ object: "list", data: expect.arrayContaining([row]) });
+	});
+});
+
+it("keeps route mutation disabled by default, including for an admin bearer", async () => {
+	await withListing(
+		definitions,
+		async (url, registry) => {
+			const generation = registry.generation;
+			for (const method of ["PUT", "DELETE"]) {
+				const response = await fetch(`${url}/v1/routes/virtual-a`, {
+					method,
+					headers: { Authorization: "Bearer management-fixture-admin" },
+					body: method === "PUT" ? "{root:{type:'target',model:'second'}}" : undefined,
 				});
-				expect(getRes.status).toBe(200);
-				const getBody = (await getRes.json()) as RouteRow;
-				expect(getBody.id).toBe(id);
+				expect(response.status).toBe(404);
+				await response.text();
 			}
-		});
-	});
+			expect(registry.generation).toBe(generation);
+		},
+		{ adminBearerTokens: ["management-fixture-admin"] },
+	);
+});
 
-	it("returns 400 for malformed encoded route ids (negative)", async () => {
-		await withEmptyRoutesGateway(async url => {
-			const res = await fetch(`${url}/v1/routes/%E0%A4%A`, {
-				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2" },
+it("requires separate admin authorization even when management is enabled", async () => {
+	await withListing(
+		definitions,
+		async (url, registry) => {
+			const generation = registry.generation;
+			for (const method of ["PUT", "DELETE"]) {
+				const response = await fetch(`${url}/v1/routes/virtual-a`, {
+					method,
+					headers: auth,
+					body: method === "PUT" ? "{root:{type:'target',model:'second'}}" : undefined,
+				});
+				expect(response.status).toBe(403);
+				await response.text();
+			}
+			expect(registry.generation).toBe(generation);
+		},
+		{ allowManagement: true, adminBearerTokens: ["management-fixture-admin"] },
+	);
+});
+
+it("admin can read and update routes but its token does not authorize inference", async () => {
+	await withListing(
+		definitions,
+		async (url, registry) => {
+			const admin = { Authorization: "Bearer management-fixture-admin" };
+			const read = await fetch(`${url}/v1/routes`, { headers: admin });
+			expect(read.status).toBe(200);
+			await read.text();
+			const denied = await fetch(`${url}/v1/chat/completions`, {
+				method: "POST",
+				headers: { ...admin, "Content-Type": "application/json" },
+				body: JSON.stringify({ model: "alias", messages: [{ role: "user", content: "fixture" }] }),
 			});
-			expect(res.status).toBe(400);
-		});
-	});
-
-	it("registers a route so GET matches and list includes it", async () => {
-		await withEmptyRoutesGateway(async url => {
-			const missing = await fetch(`${url}/v1/routes/${hotRouteId}`, {
-				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2" },
-			});
-			expect(missing.status).toBe(404);
-
-			const putRes = await fetch(`${url}/v1/routes/${hotRouteId}`, {
+			expect(denied.status).toBe(401);
+			await denied.text();
+			const changed = await fetch(`${url}/v1/routes/virtual-a`, {
 				method: "PUT",
-				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2", "Content-Type": "application/json" },
-				body: JSON.stringify({ root: { type: "target", model: primaryId } }),
+				headers: admin,
+				body: "{/*JSON5*/root:{type:'target',model:'second'},}",
 			});
-			expect(putRes.status).toBe(200);
-			const putBody = (await putRes.json()) as RouteRow;
-			expect(putBody).toEqual({
-				id: hotRouteId,
-				generation: 2,
-				targets: [primaryId],
+			expect(changed.status).toBe(200);
+			expect(await changed.json()).toEqual({
+				id: "virtual-a",
+				generation: 4,
+				targets: ["fixture/second"],
 				fallbacks: {},
 			});
-
-			const getRes = await fetch(`${url}/v1/routes/${hotRouteId}`, {
-				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2" },
-			});
-			expect(getRes.status).toBe(200);
-			expect(await getRes.json()).toEqual(putBody);
-
-			const listRes = await fetch(`${url}/v1/routes`, {
-				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2" },
-			});
-			expect(listRes.status).toBe(200);
-			const listBody = (await listRes.json()) as RoutesListResponse;
-			expect(listBody.object).toBe("list");
-			expect(listBody.data).toEqual([putBody]);
-		});
-	});
-
-	it("replaces a registered route and bumps generation", async () => {
-		await withVirtualRoutesGateway(async url => {
-			const beforeRes = await fetch(`${url}/v1/routes/${virtualImplId}`, {
-				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2" },
-			});
-			expect(beforeRes.status).toBe(200);
-			const before = (await beforeRes.json()) as RouteRow;
-			expect(before.generation).toBe(2);
-
-			const putRes = await fetch(`${url}/v1/routes/${virtualImplId}`, {
-				method: "PUT",
-				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2", "Content-Type": "application/json" },
-				body: JSON.stringify({
-					id: virtualImplId,
-					root: { type: "target", model: backupId },
-				}),
-			});
-			expect(putRes.status).toBe(200);
-			const putBody = (await putRes.json()) as RouteRow;
-			expect(putBody).toEqual({
-				id: virtualImplId,
-				generation: 3,
-				targets: [backupId],
+			const readback = await fetch(`${url}/v1/routes/virtual-a`, { headers: auth });
+			expect(await readback.json()).toEqual({
+				id: "virtual-a",
+				generation: registry.generation,
+				targets: ["fixture/second"],
 				fallbacks: {},
 			});
-			expect(putBody.generation).toBeGreaterThan(before.generation);
+		},
+		{ allowManagement: true, adminBearerTokens: ["management-fixture-admin"] },
+	);
+});
 
-			const afterRes = await fetch(`${url}/v1/routes/${virtualImplId}`, {
-				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2" },
+it("validates route replacement atomically and allows PUT preflight", async () => {
+	await withListing(
+		definitions,
+		async (url, registry) => {
+			const admin = { Authorization: "Bearer management-fixture-admin" };
+			for (const body of [
+				"{",
+				"{id:'different',root:{type:'target',model:'second'}}",
+				"{root:{type:'unknown'}}",
+				"{root:{type:'fallback',on:['provider_unavailable'],children:[{type:'target',model:'second'},{type:'target',model:'second'}]}}",
+			]) {
+				const before = JSON.stringify(registry.list());
+				const generation = registry.generation;
+				const rejected = await fetch(`${url}/v1/routes/virtual-a`, { method: "PUT", headers: admin, body });
+				expect(rejected.status).toBe(400);
+				await rejected.text();
+				expect(registry.generation).toBe(generation);
+				expect(JSON.stringify(registry.list())).toBe(before);
+			}
+			const options = await fetch(`${url}/v1/routes/virtual-a`, {
+				method: "OPTIONS",
+				headers: { Origin: "http://fixture-client", "Access-Control-Request-Method": "PUT" },
 			});
-			expect(afterRes.status).toBe(200);
-			expect(await afterRes.json()).toEqual(putBody);
+			expect(options.status).toBe(204);
+			expect(options.headers.get("Access-Control-Allow-Methods")).toContain("PUT");
+		},
+		{ allowManagement: true, adminBearerTokens: ["management-fixture-admin"] },
+	);
+});
+
+it("an empty admin capability cannot authorize a direct router mutation", async () => {
+	await withListing(definitions, async (_url, registry, _changeAlias, storage) => {
+		const router = createAuthGatewayRouter({
+			storage,
+			routeRegistry: registry,
+			resolveModel: () => undefined,
+			allowManagement: true,
+			adminBearerTokens: [],
 		});
-	});
-
-	it("returns 400 for an invalid node (negative)", async () => {
-		await withEmptyRoutesGateway(async url => {
-			const res = await fetch(`${url}/v1/routes/${hotRouteId}`, {
-				method: "PUT",
-				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2", "Content-Type": "application/json" },
-				body: JSON.stringify({ root: { type: "weighted", model: primaryId } }),
-			});
-			expect(res.status).toBe(400);
-			const body = (await res.json()) as { error?: string };
-			expect(typeof body.error).toBe("string");
-			expect(body.error).toMatch(/type/i);
-
-			const getRes = await fetch(`${url}/v1/routes/${hotRouteId}`, {
-				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2" },
-			});
-			expect(getRes.status).toBe(404);
-		});
-	});
-
-	it("returns 400 when body id does not match the path (negative)", async () => {
-		await withEmptyRoutesGateway(async url => {
-			const res = await fetch(`${url}/v1/routes/${hotRouteId}`, {
-				method: "PUT",
-				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2", "Content-Type": "application/json" },
-				body: JSON.stringify({
-					id: "other-id",
-					root: { type: "target", model: primaryId },
-				}),
-			});
-			expect(res.status).toBe(400);
-			const body = (await res.json()) as { error?: string };
-			expect(body.error).toBe(`Route definition id must equal path id "${hotRouteId}"`);
-
-			const getRes = await fetch(`${url}/v1/routes/${hotRouteId}`, {
-				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2" },
-			});
-			expect(getRes.status).toBe(404);
-		});
-	});
-
-	it("returns 401 without a bearer token (negative)", async () => {
-		await withEmptyRoutesGateway(async url => {
-			const res = await fetch(`${url}/v1/routes/${hotRouteId}`, {
-				method: "PUT",
-				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ root: { type: "target", model: primaryId } }),
-			});
-			expect(res.status).toBe(401);
-			const body = (await res.json()) as { error?: string };
-			expect(body.error).toBe("unauthorized");
-		});
-	});
-
-	it("returns 400 for malformed JSON (negative)", async () => {
-		await withEmptyRoutesGateway(async url => {
-			const res = await fetch(`${url}/v1/routes/${hotRouteId}`, {
-				method: "PUT",
-				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2", "Content-Type": "application/json" },
-				body: "{not-json",
-			});
-			expect(res.status).toBe(400);
-			const body = (await res.json()) as { error?: string };
-			expect(typeof body.error).toBe("string");
-			expect(body.error).toMatch(/json/i);
-		});
-	});
-
-	it("returns 400 for a cyclic route from register (negative)", async () => {
-		await withEmptyRoutesGateway(async url => {
-			const res = await fetch(`${url}/v1/routes/${hotRouteId}`, {
-				method: "PUT",
-				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2", "Content-Type": "application/json" },
-				body: JSON.stringify({
-					root: {
-						type: "fallback",
-						on: ["provider_unavailable"],
-						children: [
-							{ type: "target", model: primaryId },
-							{ type: "target", model: primaryId },
-						],
-					},
-				}),
-			});
-			expect(res.status).toBe(400);
-			const body = (await res.json()) as { error?: string };
-			expect(typeof body.error).toBe("string");
-			expect(body.error).toMatch(/cycle/i);
-
-			const getRes = await fetch(`${url}/v1/routes/${hotRouteId}`, {
-				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2" },
-			});
-			expect(getRes.status).toBe(404);
-		});
-	});
-
-	it("returns 404 for PUT of the list path (negative)", async () => {
-		await withEmptyRoutesGateway(async url => {
-			const listRes = await fetch(`${url}/v1/routes`, {
-				method: "PUT",
-				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2", "Content-Type": "application/json" },
-				body: JSON.stringify({ root: { type: "target", model: primaryId } }),
-			});
-			expect(listRes.status).toBe(404);
-			const listBody = (await listRes.json()) as { error?: string };
-			expect(listBody.error).toBe("No route: PUT /v1/routes");
-
-			const slashRes = await fetch(`${url}/v1/routes/`, {
-				method: "PUT",
-				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2", "Content-Type": "application/json" },
-				body: JSON.stringify({ root: { type: "target", model: primaryId } }),
-			});
-			expect(slashRes.status).toBe(404);
-			const slashBody = (await slashRes.json()) as { error?: string };
-			expect(slashBody.error).toBe("No route: PUT /v1/routes/");
-		});
+		try {
+			const generation = registry.generation;
+			for (const method of ["PUT", "DELETE"]) {
+				const response = await router.route(
+					new Request("http://fixture/v1/routes/virtual-a", {
+						method,
+						body: method === "PUT" ? "{root:{type:'target',model:'second'}}" : undefined,
+					}),
+					"fixture",
+				);
+				expect(response.status).toBe(403);
+				await response.text();
+			}
+			expect(registry.generation).toBe(generation);
+		} finally {
+			router.close();
+		}
 	});
 });
 
-describe("auth-gateway DELETE /v1/routes/:id", () => {
-	it("unregisters a PUT route so GET returns 404", async () => {
-		await withEmptyRoutesGateway(async url => {
-			const putRes = await fetch(`${url}/v1/routes/${hotRouteId}`, {
-				method: "PUT",
-				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2", "Content-Type": "application/json" },
-				body: JSON.stringify({ root: { type: "target", model: primaryId } }),
-			});
-			expect(putRes.status).toBe(200);
+it("rejects misplaced admin bearer material before a route write", async () => {
+	await withListing(
+		definitions,
+		async (url, registry) => {
+			const generation = registry.generation;
+			for (const method of ["PUT", "DELETE"]) {
+				const response = await fetch(`${url}/v1/routes/virtual-a?token=management-fixture-admin`, {
+					method,
+					headers: { Authorization: "Bearer management-fixture-admin" },
+					body: method === "PUT" ? "{root:{type:'target',model:'second'}}" : undefined,
+				});
+				expect(response.status).toBe(400);
+				await response.text();
+			}
+			expect(registry.generation).toBe(generation);
+		},
+		{ allowManagement: true, adminBearerTokens: ["management-fixture-admin"] },
+	);
+});
 
-			const delRes = await fetch(`${url}/v1/routes/${hotRouteId}`, {
+it("deletes only the named virtual route and stops future dispatch while retaining in-flight snapshots", async () => {
+	const id = "virtual/雪 % +?#";
+	await withListing(
+		[{ id, root: { type: "target", model: "alias" } }, definitions[1]],
+		async (url, registry) => {
+			const captured = registry.resolve(id);
+			if (!captured) throw new Error("Expected a captured route");
+			const response = await fetch(`${url}/v1/routes/${encodeURIComponent(id)}`, {
 				method: "DELETE",
-				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2" },
+				headers: { Authorization: "Bearer management-fixture-admin" },
 			});
-			expect(delRes.status).toBe(204);
-			expect(await delRes.text()).toBe("");
+			expect(response.status).toBe(204);
+			expect(await response.text()).toBe("");
+			const gone = await fetch(`${url}/v1/routes/${encodeURIComponent(id)}`, { headers: auth });
+			expect(gone.status).toBe(404);
+			expect(await gone.json()).toEqual({ error: `Unknown route: ${id}` });
+			const collection = await fetch(`${url}/v1/routes`, { headers: auth });
+			expect(await collection.json()).toEqual({
+				object: "list",
+				generation: 4,
+				data: [{ id: "virtual-b", generation: 3, targets: ["fixture/second"], fallbacks: {} }],
+			});
+			const inference = await fetch(`${url}/v1/chat/completions`, {
+				method: "POST",
+				headers: { ...auth, "Content-Type": "application/json" },
+				body: JSON.stringify({ model: id, messages: [{ role: "user", content: "fixture" }] }),
+			});
+			expect(inference.status).toBe(404);
+			await inference.text();
+			expect(registry.resolve(id)).toBeUndefined();
+			expect(registry.getModel(captured)?.id).toBe("first");
+		},
+		{ allowManagement: true, adminBearerTokens: ["management-fixture-admin"] },
+	);
+});
 
-			const getRes = await fetch(`${url}/v1/routes/${hotRouteId}`, {
-				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2" },
-			});
-			expect(getRes.status).toBe(404);
-			const body = (await getRes.json()) as { error?: string };
-			expect(body.error).toBe(`Unknown route: ${hotRouteId}`);
-		});
-	});
+it("rejects unknown and concrete deletions without changing routes or generation", async () => {
+	await withListing(
+		definitions,
+		async (url, registry) => {
+			const before = JSON.stringify(registry.list());
+			for (const id of ["no-such-route", "alias", "fixture/first"]) {
+				const response = await fetch(`${url}/v1/routes/${encodeURIComponent(id)}`, {
+					method: "DELETE",
+					headers: { Authorization: "Bearer management-fixture-admin" },
+				});
+				expect(response.status).toBe(404);
+				expect(await response.json()).toEqual({ error: `Unknown route: ${id}` });
+			}
+			expect(registry.generation).toBe(3);
+			expect(JSON.stringify(registry.list())).toBe(before);
+		},
+		{ allowManagement: true, adminBearerTokens: ["management-fixture-admin"] },
+	);
+});
 
-	it("returns 404 for an unknown id (negative)", async () => {
-		await withEmptyRoutesGateway(async url => {
-			const res = await fetch(`${url}/v1/routes/no-such-route`, {
-				method: "DELETE",
-				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2" },
+it("rejects empty or malformed DELETE IDs and allows browser preflight", async () => {
+	await withListing(
+		definitions,
+		async (url, registry) => {
+			const admin = { Authorization: "Bearer management-fixture-admin" };
+			const empty = await fetch(`${url}/v1/routes/`, { method: "DELETE", headers: admin });
+			expect(empty.status).toBe(404);
+			expect(await empty.json()).toEqual({ error: "Missing route id" });
+			const invalid = await fetch(`${url}/v1/routes/%GG`, { method: "DELETE", headers: admin });
+			expect(invalid.status).toBe(400);
+			expect(await invalid.json()).toEqual({ error: "invalid route id encoding" });
+			const unauthenticated = await fetch(`${url}/v1/routes/virtual-a`, { method: "DELETE" });
+			expect(unauthenticated.status).toBe(401);
+			await unauthenticated.text();
+			const options = await fetch(`${url}/v1/routes/virtual-a`, {
+				method: "OPTIONS",
+				headers: { Origin: "http://fixture-client", "Access-Control-Request-Method": "DELETE" },
 			});
-			expect(res.status).toBe(404);
-			const body = (await res.json()) as { error?: string };
-			expect(body.error).toBe("Unknown route: no-such-route");
-		});
-	});
-
-	it("returns 404 for DELETE of the list path (negative)", async () => {
-		await withEmptyRoutesGateway(async url => {
-			const listRes = await fetch(`${url}/v1/routes`, {
-				method: "DELETE",
-				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2" },
-			});
-			expect(listRes.status).toBe(404);
-			const listBody = (await listRes.json()) as { error?: string };
-			expect(listBody.error).toBe("No route: DELETE /v1/routes");
-
-			const slashRes = await fetch(`${url}/v1/routes/`, {
-				method: "DELETE",
-				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2" },
-			});
-			expect(slashRes.status).toBe(404);
-			const slashBody = (await slashRes.json()) as { error?: string };
-			expect(slashBody.error).toBe("No route: DELETE /v1/routes/");
-		});
-	});
-
-	it("returns 401 without a bearer token (negative)", async () => {
-		await withEmptyRoutesGateway(async url => {
-			const res = await fetch(`${url}/v1/routes/${hotRouteId}`, {
-				method: "DELETE",
-			});
-			expect(res.status).toBe(401);
-			const body = (await res.json()) as { error?: string };
-			expect(body.error).toBe("unauthorized");
-		});
-	});
-
-	it("bumps list generation after a successful delete", async () => {
-		await withEmptyRoutesGateway(async url => {
-			const putRes = await fetch(`${url}/v1/routes/${hotRouteId}`, {
-				method: "PUT",
-				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2", "Content-Type": "application/json" },
-				body: JSON.stringify({ root: { type: "target", model: primaryId } }),
-			});
-			expect(putRes.status).toBe(200);
-
-			const beforeRes = await fetch(`${url}/v1/routes`, {
-				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2" },
-			});
-			expect(beforeRes.status).toBe(200);
-			const before = (await beforeRes.json()) as RoutesListResponse;
-			expect(before.data.map(row => row.id)).toEqual([hotRouteId]);
-
-			const delRes = await fetch(`${url}/v1/routes/${hotRouteId}`, {
-				method: "DELETE",
-				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2" },
-			});
-			expect(delRes.status).toBe(204);
-
-			const afterRes = await fetch(`${url}/v1/routes`, {
-				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2" },
-			});
-			expect(afterRes.status).toBe(200);
-			const after = (await afterRes.json()) as RoutesListResponse;
-			expect(after.generation).toBeGreaterThan(before.generation);
-			expect(after.data).toEqual([]);
-		});
-	});
-
-	it("returns 404 for a concrete catalog model id (negative)", async () => {
-		await withEmptyRoutesGateway(async url => {
-			const res = await fetch(`${url}/v1/routes/${primaryId}`, {
-				method: "DELETE",
-				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2" },
-			});
-			expect(res.status).toBe(404);
-			const body = (await res.json()) as { error?: string };
-			expect(body.error).toBe(`Unknown route: ${primaryId}`);
-		});
-	});
-	it("does not bump generation on 404 delete (negative)", async () => {
-		await withEmptyRoutesGateway(async url => {
-			const beforeRes = await fetch(`${url}/v1/routes`, {
-				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2" },
-			});
-			expect(beforeRes.status).toBe(200);
-			const before = (await beforeRes.json()) as RoutesListResponse;
-
-			const delRes = await fetch(`${url}/v1/routes/no-such-route`, {
-				method: "DELETE",
-				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2" },
-			});
-			expect(delRes.status).toBe(404);
-
-			const afterRes = await fetch(`${url}/v1/routes`, {
-				headers: { Authorization: "Bearer omp-fixture-bearer-6dc18ed2" },
-			});
-			expect(afterRes.status).toBe(200);
-			const after = (await afterRes.json()) as RoutesListResponse;
-			expect(after.generation).toBe(before.generation);
-		});
-	});
-
-	it("CORS preflight allows PUT and DELETE", async () => {
-		await withEmptyRoutesGateway(async url => {
-			const res = await fetch(`${url}/v1/routes/${hotRouteId}`, { method: "OPTIONS" });
-			expect(res.status).toBe(204);
-			const allow = res.headers.get("Access-Control-Allow-Methods") ?? "";
-			expect(allow).toContain("PUT");
-			expect(allow).toContain("DELETE");
-			expect(allow).toContain("GET");
-		});
-	});
+			expect(options.status).toBe(204);
+			expect(options.headers.get("Access-Control-Allow-Methods")).toContain("DELETE");
+			expect(registry.generation).toBe(3);
+		},
+		{ allowManagement: true, adminBearerTokens: ["management-fixture-admin"] },
+	);
 });

@@ -8,8 +8,9 @@ import { AUTHENTICATED_SENTINEL } from "../registry/types";
 import type { SessionAffinity } from "./affinity";
 import type { CredentialCoordination } from "./coordination";
 import type { CredentialPool } from "./pool";
-import type { CredentialSelector, OAuthResolutionResult } from "./select";
 import type { ApiKeySelection } from "./rank";
+import type { CredentialSelector, OAuthResolutionResult } from "./select";
+import { resolveCredentialStateScopeKey } from "./sqlite-credential-store";
 import type {
 	AuthApiKeyOptions,
 	AuthCredential,
@@ -18,6 +19,7 @@ import type {
 	KeysApi,
 	LimitsApi,
 	OAuthRequestIdentity,
+	TurnReservation,
 } from "./types";
 
 /**
@@ -147,7 +149,6 @@ export interface KeyCascadeDeps {
 	overrides: KeyOverrides;
 	selector: CredentialSelector;
 	affinity: SessionAffinity;
-	/** In-process requestId reservations/quota-probe leases; resolution failure must release them. */
 	coordination: CredentialCoordination;
 	/** LimitsApi.rotate, injected to avoid a cascade↔rotation import cycle. */
 	rotate: LimitsApi["rotate"];
@@ -326,11 +327,20 @@ export class KeyCascade implements KeysApi {
 	): Promise<ResolvedApiKey | undefined> {
 		let credentialId: number | undefined;
 		let oauthIdentity: OAuthRequestIdentity | undefined;
-		const apiKey = await this.#resolve(provider, sessionId, options, (id, identity) => {
+		let credentialIdentity: string | undefined;
+		const apiKey = await this.#resolve(provider, sessionId, options, (id, identity, scope) => {
 			credentialId = id;
 			oauthIdentity = identity;
+			credentialIdentity = scope;
 		});
-		return apiKey === undefined ? undefined : { apiKey, credentialId, ...(oauthIdentity ? { oauthIdentity } : {}) };
+		return apiKey === undefined
+			? undefined
+			: {
+					apiKey,
+					credentialId,
+					...(oauthIdentity ? { oauthIdentity } : {}),
+					...(credentialIdentity ? { credentialIdentity } : {}),
+				};
 	}
 
 	/**
@@ -359,7 +369,7 @@ export class KeyCascade implements KeysApi {
 		provider: string,
 		sessionId?: string,
 		options?: AuthApiKeyOptions,
-		onCredentialId?: (id: number, identity?: OAuthRequestIdentity) => void,
+		onCredentialId?: (id: number, identity?: OAuthRequestIdentity, credentialIdentity?: string) => void,
 	): Promise<string | undefined> {
 		const restricted = this.#deps.affinity.isRestricted(provider, sessionId);
 		// Runtime override takes highest priority
@@ -388,21 +398,33 @@ export class KeyCascade implements KeysApi {
 		// then a stored static api_key (which may be a stale broker-migrated copy) as a last resort.
 		// A transient OAuth refresh failure still lets later sources serve the request; it is
 		// rethrown only when none can, so callers retry instead of reporting a missing key.
-		let oauthResolved: OAuthResolutionResult | undefined;
 		let oauthRefreshFailure: AIError.OAuthRefreshUnavailableError | undefined;
-		try {
-			oauthResolved = await this.#deps.selector.resolveOAuth(provider, sessionId, options);
-		} catch (error) {
-			if (!(error instanceof AIError.OAuthRefreshUnavailableError)) throw error;
-			oauthRefreshFailure = error;
-		}
-		if (oauthResolved) {
-			if (onCredentialId && oauthResolved.credentialId !== undefined) {
-				const { orgId, region, inferenceRegion } = oauthResolved.credential;
-				onCredentialId(oauthResolved.credentialId, { orgId, region, inferenceRegion });
+		const resolveOAuth = async (allowProbes: boolean, onlyQuotaProbes = false): Promise<string | undefined> => {
+			let resolved: OAuthResolutionResult | undefined;
+			try {
+				resolved = await this.#deps.selector.resolveOAuth(
+					provider,
+					sessionId,
+					options,
+					allowProbes,
+					onlyQuotaProbes,
+				);
+			} catch (error) {
+				if (!(error instanceof AIError.OAuthRefreshUnavailableError)) throw error;
+				oauthRefreshFailure = error;
 			}
-			return oauthResolved.apiKey;
-		}
+			if (resolved && onCredentialId && resolved.credentialId !== undefined) {
+				const { orgId, region, inferenceRegion } = resolved.credential;
+				onCredentialId(
+					resolved.credentialId,
+					{ orgId, region, inferenceRegion },
+					resolveCredentialStateScopeKey(provider, resolved.credential) ?? undefined,
+				);
+			}
+			return resolved?.apiKey;
+		};
+		const oauthKey = await resolveOAuth(restricted);
+		if (oauthKey !== undefined) return oauthKey;
 		if (restricted) {
 			if (oauthRefreshFailure) throw oauthRefreshFailure;
 			throw new AIError.MissingApiKeyError(
@@ -410,90 +432,88 @@ export class KeyCascade implements KeysApi {
 				`No API key for provider: ${provider} (session ${sessionId} is restricted to its OAuth account pool and none of those accounts is available)`,
 			);
 		}
-		const loginApiKeySelection = await this.#deps.selector.selectApiKey(
-			provider,
-			sessionId,
-			options,
-			credential => credential.source === "login" && !this.isKeylessFallback(provider, credential),
-		);
-		if (loginApiKeySelection) {
-			const apiKey = await this.#resolveReservedApiKey(
+		const resolveStoredKey = async (login: boolean, allowProbes: boolean): Promise<string | undefined> => {
+			const selection = await this.#deps.selector.selectApiKey(
 				provider,
 				sessionId,
-				loginApiKeySelection,
-				options?.requestId,
-				options?.recordAffinity !== false,
+				options,
+				credential =>
+					(credential.source === "login") === login && (!login || !this.isKeylessFallback(provider, credential)),
+				allowProbes,
 			);
-			if (apiKey !== undefined) {
-				if (onCredentialId) {
-					const credentialId = this.#deps.pool.entries(provider)[loginApiKeySelection.index]?.id;
-					if (credentialId !== undefined) onCredentialId(credentialId);
-				}
-				return apiKey;
-			}
-		}
-
-		// Past OAuth: the session sticky (if any) is stale — the request authenticates via
-		// env/api_key, not OAuth, so clear it now so getOAuthAccountId() correctly
-		// suppresses account_uuid for this session.
-		if (sessionId) this.#deps.affinity.forget(provider, sessionId);
+			if (!selection) return undefined;
+			const result = await this.#resolveApiKey(provider, sessionId, selection, options);
+			if (result?.credentialId !== undefined) onCredentialId?.(result.credentialId);
+			return result?.apiKey;
+		};
+		const loginKey = await resolveStoredKey(true, false);
+		if (loginKey !== undefined) return loginKey;
 
 		const fallbackKey = this.#deps.overrides.fallbackKey(provider);
-		if (fallbackKey !== undefined) return this.#deps.overrides.resolve(fallbackKey);
+		if (fallbackKey !== undefined) {
+			const apiKey = await this.#deps.overrides.resolve(fallbackKey);
+			if (apiKey !== undefined && sessionId) this.#deps.affinity.forget(provider, sessionId);
+			return apiKey;
+		}
 
 		const envKey = getEnvApiKey(provider);
-		if (envKey) return envKey;
-		const apiKeySelection = await this.#deps.selector.selectApiKey(
-			provider,
-			sessionId,
-			options,
-			credential => credential.source !== "login",
-		);
-		if (apiKeySelection) {
-			const apiKey = await this.#resolveReservedApiKey(
-				provider,
-				sessionId,
-				apiKeySelection,
-				options?.requestId,
-				options?.recordAffinity !== false,
-			);
-			if (apiKey !== undefined) {
-				if (onCredentialId) {
-					const credentialId = this.#deps.pool.entries(provider)[apiKeySelection.index]?.id;
-					if (credentialId !== undefined) onCredentialId(credentialId);
-				}
-				return apiKey;
-			}
+		if (envKey) {
+			if (sessionId) this.#deps.affinity.forget(provider, sessionId);
+			return envKey;
 		}
+		const storedKey = await resolveStoredKey(false, false);
+		if (storedKey !== undefined) return storedKey;
+		// Exhaust every healthy source before consuming a scarce recovery lease.
+		const probeOAuthKey = await resolveOAuth(true, true);
+		if (probeOAuthKey !== undefined) return probeOAuthKey;
+		const probeLoginKey = await resolveStoredKey(true, true);
+		if (probeLoginKey !== undefined) return probeLoginKey;
+		const probeStoredKey = await resolveStoredKey(false, true);
+		if (probeStoredKey !== undefined) return probeStoredKey;
 		if (oauthRefreshFailure) throw oauthRefreshFailure;
 		return undefined;
 	}
 
-	/**
-	 * Resolve a selected stored api_key's key material through the config-value
-	 * resolver. The selection already holds this request's turn reservation —
-	 * a failed resolve (missing env/command, resolver error) must release it so
-	 * a later request is not locked out by a credential that never vendored a
-	 * key. Affinity records only on success.
-	 */
-	async #resolveReservedApiKey(
+	/** Keep the selected row identity across async key resolution; abandoned selections release only their own probe. */
+	async #resolveApiKey(
 		provider: string,
 		sessionId: string | undefined,
 		selection: ApiKeySelection,
-		requestId: string | undefined,
-		recordAffinity = true,
-	): Promise<string | undefined> {
+		options?: AuthApiKeyOptions,
+	): Promise<ResolvedApiKey | undefined> {
+		const credentialId = this.#deps.pool.entries(provider)[selection.index]?.id;
+		const incarnation =
+			credentialId === undefined ? undefined : this.#deps.coordination.getCredentialIncarnation(credentialId);
+		let keepProbe = false;
+		let reservation: TurnReservation | undefined;
 		try {
-			const resolved = await this.#deps.overrides.resolve(selection.credential.key);
-			if (resolved === undefined || resolved === "") {
-				if (requestId) this.#deps.coordination.releaseTurnReservation(requestId);
+			const apiKey = await this.#deps.overrides.resolve(selection.credential.key);
+			if (!apiKey) return undefined;
+			const index = this.#deps.pool.entries(provider).findIndex(entry => entry.id === credentialId);
+			if (
+				index < 0 ||
+				(credentialId !== undefined &&
+					this.#deps.coordination.getCredentialIncarnation(credentialId) !== incarnation)
+			)
 				return undefined;
+			if (credentialId !== undefined && incarnation !== undefined) {
+				const admission = this.#deps.coordination.tryReservePreparedCredential({
+					provider,
+					credentialId,
+					incarnation,
+					options,
+					scopes: selection.blockScopes,
+					probeRequestId: selection.probeRequestId,
+				});
+				if (!admission.ok) return undefined;
+				reservation = admission.reservation;
 			}
-			if (recordAffinity) this.#deps.affinity.record(provider, sessionId, "api_key", selection.index);
-			return resolved;
-		} catch (error) {
-			if (requestId) this.#deps.coordination.releaseTurnReservation(requestId);
-			throw error;
+			if (options?.recordAffinity !== false) this.#deps.affinity.record(provider, sessionId, "api_key", index);
+			keepProbe = true;
+			return { apiKey, credentialId };
+		} finally {
+			if (!keepProbe) reservation?.release();
+			if (!keepProbe && selection.probeRequestId) this.#deps.coordination.clearQuotaProbe(selection.probeRequestId);
 		}
 	}
 

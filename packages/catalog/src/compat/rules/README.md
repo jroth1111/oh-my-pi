@@ -322,6 +322,7 @@ behavior {
     exclude-models provider="nanogpt" substring="embed" substring="tts"
     plan-requirement provider="openai-codex" { tier "pro" substring="-spark" }
     retry-reset-timezone provider="zai" offset="+08:00"
+    gateway-surface name="gemini-v1beta" { allow exact="google-generative-ai"; }
     pricing-peer provider="google-antigravity" peers="google" "google-vertex" {
         alias "gemini-3-pro" peer-id="gemini-3-pro-preview"
     }
@@ -329,6 +330,8 @@ behavior {
 ```
 
 `exclude-discovery-modes` takes one or more exact, case-sensitive upstream mode strings plus `provider=`; discovery mappers preserve missing, malformed, and unknown modes unless the provider policy explicitly lists them. Matcher properties on `route` / `exclude-models` / `tier` nodes are `exact=` / `prefix=` / `substring=` / `glob=`, repeatable. `strip-prefix=#true` on a prefix route strips the matched prefix off the wire id. Values are copied verbatim from the TS constants they replaced; runtime accessors live in `src/compat/behavior.ts`.
+
+`gateway-surface` declares a named native API capability, with one or more `allow` leaves using matcher properties or `any=#true`; `exclude-substring=` can narrow a match. Duplicate names, empty rules and malformed properties are errors. The gateway uses this for native-only controls such as Google's output schemas, not to forbid ordinary stateless cross-format translation.
 
 ## Auth grammar
 

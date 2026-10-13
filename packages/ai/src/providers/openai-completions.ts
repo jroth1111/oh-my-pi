@@ -14,6 +14,7 @@ import {
 import { renderDemotedThinking } from "../dialect/demotion";
 import * as AIError from "../error";
 import { parseToolCallArguments } from "../utils/tool-call-arguments";
+import { normalizeOpenAIResponseFormat } from "../utils/response-format";
 import { getKimiCommonHeaders } from "../registry/oauth/kimi";
 import { getEnvApiKey } from "../env-api-key";
 import type {
@@ -2032,7 +2033,10 @@ function buildParams(
 	if (options?.responseFormat !== undefined) {
 		const responseFormat = options.responseFormat;
 		if (typeof responseFormat === "object" && responseFormat !== null) {
-			params.response_format = responseFormat as OpenAICompletionsParams["response_format"];
+			params.response_format = normalizeOpenAIResponseFormat(
+				responseFormat,
+				"chat",
+			) as OpenAICompletionsParams["response_format"];
 		}
 	}
 	if (options?.user !== undefined) params.user = options.user;

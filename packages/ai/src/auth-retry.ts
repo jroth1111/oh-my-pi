@@ -42,6 +42,8 @@ export interface ResolvedApiKey {
 	apiKey: string;
 	/** Durable row id of the credential that supplied this bearer, when known. */
 	credentialId?: number;
+	/** Stable account/project scope captured from the selected credential, never looked up from a later pool snapshot. */
+	credentialIdentity?: string;
 	/**
 	 * Resolved after `LimitsApi.rotate` slept out a sibling's short block
 	 * (`afterSiblingWait`): the driver accepts this bearer even if the request

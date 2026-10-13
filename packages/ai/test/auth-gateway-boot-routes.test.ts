@@ -1,194 +1,164 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { clearCustomApis } from "@oh-my-pi/pi-ai/api-registry";
-import { startAuthGateway } from "@oh-my-pi/pi-ai/auth-gateway";
-import { AuthStorage } from "@oh-my-pi/pi-ai/auth-storage";
-import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
+import { clearCustomApis } from "../src/api-registry";
+import { createAuthGatewayRouter, RouteRegistry, serveAuthGatewayStdio, startAuthGateway } from "../src/auth-gateway";
+import type { AuthGatewayRouteOptions, RouteDefinition } from "../src/auth-gateway";
+import { AuthStorage } from "../src/auth-storage";
+import { createMockModel, registerMockApi } from "../src/providers/mock";
 
-afterEach(() => {
-	clearCustomApis();
-});
+afterEach(() => clearCustomApis());
 
-const primaryId = "primary-id";
-const backupId = "backup-id";
-
-describe("auth-gateway boot routes", () => {
-	it("registers virtual route ids from AuthGatewayBootOptions.routes without a caller RouteRegistry", async () => {
-		registerMockApi();
-		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gw-boot-routes-"));
-		const storage = await AuthStorage.create(path.join(dir, "auth.db"));
-		storage.setRuntimeApiKey("openrouter", "test-key");
-		const primary = createMockModel({
-			provider: "openrouter",
-			id: primaryId,
-			handler: () => {
-				throw new Error("service unavailable");
-			},
-		});
-		const backup = createMockModel({
-			provider: "openrouter",
-			id: backupId,
-			handler: { content: ["ok"] },
-		});
-		const resolveModel = (id: string) => {
-			if (id === primaryId) return primary.model;
-			if (id === backupId) return backup.model;
-			return undefined;
-		};
-		const handle = startAuthGateway({
-			bind: "127.0.0.1:0",
-			bearerTokens: ["omp-fixture-bearer-6dc18ed2"],
-			storage,
-			resolveModel,
-			routes: [
-				{
-					id: "virtual-impl",
-					root: {
-						type: "fallback",
-						on: ["provider_unavailable"],
-						children: [
-							{ type: "target", model: primaryId },
-							{ type: "target", model: backupId },
-						],
+type Transport = "http" | "router" | "stdio";
+async function withBootFixture(
+	transport: Transport,
+	suppliedRegistry: boolean,
+	definitions: readonly RouteDefinition[] | undefined,
+	native: boolean,
+	stream: boolean,
+	run: (
+		response: Response,
+		primaryCalls: number,
+		backupCalls: number,
+		registry: RouteRegistry | undefined,
+	) => Promise<void>,
+): Promise<void> {
+	registerMockApi();
+	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gateway-boot-routes-"));
+	const storage = await AuthStorage.create(path.join(directory, "auth.db"), {
+		usageProviderResolver: () => undefined,
+		rankingStrategyResolver: () => undefined,
+	});
+	storage.keys.setRuntime("fixture-boot", "boot-fixture-key");
+	const primary = createMockModel({
+		provider: "fixture-boot",
+		id: "primary",
+		handler: { content: [], stopReason: "error", errorMessage: "HTTP 503: service unavailable" },
+	});
+	const backup = createMockModel({
+		provider: "fixture-boot",
+		id: "backup",
+		handler: { content: ["booted fallback result"] },
+	});
+	const resolveModel = (id: string) => (id === "primary" ? primary : id === "backup" ? backup : undefined);
+	const registry = suppliedRegistry ? new RouteRegistry(resolveModel) : undefined;
+	registry?.register({ id: "existing", root: { type: "target", model: "backup" } });
+	const opts: AuthGatewayRouteOptions = { storage, resolveModel, routeRegistry: registry, routes: definitions };
+	const http =
+		transport === "http"
+			? startAuthGateway({ ...opts, bind: "127.0.0.1:0", bearerTokens: ["boot-fixture-client"] })
+			: undefined;
+	const router = transport !== "http" ? createAuthGatewayRouter(opts) : undefined;
+	const endpoint = native ? "/v1/pi/stream" : "/v1/chat/completions";
+	const body = native
+		? { modelId: "booted", context: { messages: [{ role: "user", content: "boot fixture", timestamp: 0 }] }, stream }
+		: { model: "booted", messages: [{ role: "user", content: "boot fixture" }], stream };
+	try {
+		let response: Response;
+		if (http)
+			response = await fetch(`${http.url}${endpoint}`, {
+				method: "POST",
+				headers: { Authorization: "Bearer boot-fixture-client", "Content-Type": "application/json" },
+				body: JSON.stringify(body),
+			});
+		else if (router && transport === "router")
+			response = await router.route(
+				new Request(`http://127.0.0.1${endpoint}`, {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify(body),
+				}),
+				"fixture",
+			);
+		else if (router) {
+			const frames: Array<{ ready?: boolean; id?: number; status?: number; body?: unknown }> = [];
+			await serveAuthGatewayStdio({
+				input: new ReadableStream<Uint8Array>({
+					start(controller) {
+						controller.enqueue(new TextEncoder().encode(`${JSON.stringify({ id: 42, path: endpoint, body })}\n`));
+						controller.close();
 					},
-				},
-			],
-			version: "test",
-		});
-		try {
-			const res = await fetch(`${handle.url}/v1/chat/completions`, {
-				method: "POST",
-				headers: { "Content-Type": "application/json", Authorization: "Bearer omp-fixture-bearer-6dc18ed2" },
-				body: JSON.stringify({
-					model: "virtual-impl",
-					messages: [{ role: "user", content: "hi" }],
-					stream: false,
 				}),
+				write: line => frames.push(JSON.parse(line)),
+				route: req => router.route(req, "fixture-stdio"),
 			});
-			expect(res.status).toBe(200);
-			expect(backup.calls.length).toBe(1);
-			const body = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
-			expect(body.choices?.[0]?.message?.content).toBe("ok");
-		} finally {
-			await handle.close();
-			storage.close();
-			await fs.rm(dir, { recursive: true, force: true });
-		}
-	});
+			expect(frames[0]?.ready).toBe(true);
+			const frame = frames.find(item => item.id === 42);
+			if (frame?.status === undefined) throw new Error("No stdio response to the fixture request");
+			response = new Response(typeof frame.body === "string" ? frame.body : JSON.stringify(frame.body), {
+				status: frame.status,
+			});
+		} else throw new Error("Missing fixture transport");
+		// Stream calls are counted during preflight, before response handoff.
+		await run(response, primary.calls.length, backup.calls.length, registry);
+	} finally {
+		if (http) await http.close();
+		router?.close();
+		storage.close();
+		await fs.rm(directory, { recursive: true });
+	}
+}
 
-	it("returns 404 Unknown model when routes are omitted (negative)", async () => {
-		registerMockApi();
-		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gw-boot-routes-neg-"));
-		const storage = await AuthStorage.create(path.join(dir, "auth.db"));
-		storage.setRuntimeApiKey("openrouter", "test-key");
-		const primary = createMockModel({
-			provider: "openrouter",
-			id: primaryId,
-			handler: () => {
-				throw new Error("service unavailable");
-			},
-		});
-		const backup = createMockModel({
-			provider: "openrouter",
-			id: backupId,
-			handler: { content: ["ok"] },
-		});
-		const resolveModel = (id: string) => {
-			if (id === primaryId) return primary.model;
-			if (id === backupId) return backup.model;
-			return undefined;
-		};
-		const handle = startAuthGateway({
-			bind: "127.0.0.1:0",
-			bearerTokens: ["omp-fixture-bearer-6dc18ed2"],
-			storage,
-			resolveModel,
-			version: "test",
-		});
-		try {
-			const res = await fetch(`${handle.url}/v1/chat/completions`, {
-				method: "POST",
-				headers: { "Content-Type": "application/json", Authorization: "Bearer omp-fixture-bearer-6dc18ed2" },
-				body: JSON.stringify({
-					model: "virtual-impl",
-					messages: [{ role: "user", content: "hi" }],
-					stream: false,
-				}),
-			});
-			expect(res.status).toBe(404);
-			const body = (await res.json()) as { error?: { message?: string } };
-			expect(body.error?.message).toBe("Unknown model: virtual-impl");
-			expect(primary.calls.length).toBe(0);
-			expect(backup.calls.length).toBe(0);
-		} finally {
-			await handle.close();
-			storage.close();
-			await fs.rm(dir, { recursive: true, force: true });
-		}
-	});
-	it("resolves forward route references from the complete boot definition set", async () => {
-		registerMockApi();
-		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gw-boot-routes-"));
-		const storage = await AuthStorage.create(path.join(dir, "auth.db"));
-		storage.setRuntimeApiKey("openrouter", "test-key");
-		const primary = createMockModel({
-			provider: "openrouter",
-			id: primaryId,
-			handler: () => {
-				throw new Error("service unavailable");
-			},
-		});
-		const backup = createMockModel({
-			provider: "openrouter",
-			id: backupId,
-			handler: { content: ["ok"] },
-		});
-		const resolveModel = (id: string) => {
-			if (id === primaryId) return primary.model;
-			if (id === backupId) return backup.model;
-			return undefined;
-		};
-		const handle = startAuthGateway({
-			bind: "127.0.0.1:0",
-			bearerTokens: ["omp-fixture-bearer-6dc18ed2"],
-			storage,
-			resolveModel,
-			routes: [
-				{ id: "alias", root: { type: "route-ref", route: "virtual-impl" } },
-				{
-					id: "virtual-impl",
-					root: {
-						type: "fallback",
-						on: ["provider_unavailable"],
-						children: [
-							{ type: "target", model: primaryId },
-							{ type: "target", model: backupId },
-						],
-					},
-				},
+const definitions: readonly RouteDefinition[] = [
+	{
+		id: "booted",
+		root: {
+			type: "fallback",
+			on: ["provider_unavailable"],
+			children: [
+				{ type: "target", model: "primary" },
+				{ type: "target", model: "backup" },
 			],
-			version: "test",
+		},
+	},
+];
+
+for (const transport of ["http", "router", "stdio"] as const)
+	for (const suppliedRegistry of [false, true])
+		for (const native of [false, true])
+			for (const stream of [false, true])
+				it(`boots routes through ${transport}, ${suppliedRegistry ? "supplied" : "fresh"} registry, ${native ? "pi-native" : "chat"}, ${stream ? "stream" : "complete"}`, async () => {
+					await withBootFixture(
+						transport,
+						suppliedRegistry,
+						definitions,
+						native,
+						stream,
+						async (response, primaryCalls, backupCalls, registry) => {
+							expect(response.status).toBe(200);
+							expect(await response.text()).toContain("booted fallback result");
+							expect(primaryCalls).toBe(1);
+							expect(backupCalls).toBe(1);
+							if (registry) {
+								expect(registry.resolve("booted")?.targets).toEqual([
+									"fixture-boot/primary",
+									"fixture-boot/backup",
+								]);
+								expect(registry.resolve("existing")?.targets).toEqual(["fixture-boot/backup"]);
+							}
+						},
+					);
+				});
+
+for (const empty of [undefined, []] as const)
+	for (const suppliedRegistry of [false, true])
+		it(`leaves boot routes absent for ${empty ? "an empty list" : "omitted definitions"} and ${suppliedRegistry ? "supplied" : "fresh"} registry`, async () => {
+			await withBootFixture(
+				"http",
+				suppliedRegistry,
+				empty,
+				false,
+				false,
+				async (response, primaryCalls, backupCalls, registry) => {
+					expect(response.status).toBe(404);
+					expect(await response.text()).toContain("Unknown model: booted");
+					expect(primaryCalls).toBe(0);
+					expect(backupCalls).toBe(0);
+					if (registry) {
+						expect(registry.generation).toBe(2);
+						expect(registry.resolve("existing")?.targets).toEqual(["fixture-boot/backup"]);
+					}
+				},
+			);
 		});
-		try {
-			const res = await fetch(`${handle.url}/v1/chat/completions`, {
-				method: "POST",
-				headers: { "Content-Type": "application/json", Authorization: "Bearer omp-fixture-bearer-6dc18ed2" },
-				body: JSON.stringify({
-					model: "alias",
-					messages: [{ role: "user", content: "hi" }],
-					stream: false,
-				}),
-			});
-			expect(res.status).toBe(200);
-			expect(backup.calls.length).toBe(1);
-			const body = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
-			expect(body.choices?.[0]?.message?.content).toBe("ok");
-		} finally {
-			await handle.close();
-			storage.close();
-			await fs.rm(dir, { recursive: true, force: true });
-		}
-	});
-});

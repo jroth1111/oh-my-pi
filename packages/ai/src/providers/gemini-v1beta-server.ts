@@ -66,7 +66,8 @@ function textFromGeminiParts(parts: unknown): string {
 
 function readInlineData(part: Record<string, unknown>): ImageContent | undefined {
 	const inline = part.inlineData ?? part.inline_data;
-	if (!isRecord(inline)) return undefined;
+	if (inline === undefined) return undefined;
+	if (!isRecord(inline)) throw new AIError.ValidationError("gemini-v1beta: inlineData must be an object");
 	const mimeType =
 		typeof inline.mimeType === "string"
 			? inline.mimeType
@@ -74,7 +75,8 @@ function readInlineData(part: Record<string, unknown>): ImageContent | undefined
 				? inline.mime_type
 				: undefined;
 	const data = typeof inline.data === "string" ? inline.data : undefined;
-	if (!mimeType || !data) return undefined;
+	if (!mimeType?.startsWith("image/") || !data)
+		throw new AIError.ValidationError("gemini-v1beta: inlineData requires nonempty image MIME type and data");
 	return { type: "image", mimeType, data };
 }
 
@@ -86,7 +88,10 @@ function contentFromGeminiParts(parts: unknown): string | (TextContent | ImageCo
 	let hasImage = false;
 	for (const part of parts) {
 		if (!isRecord(part)) continue;
-		if (part.thought === true) continue;
+		if (part.thought === true)
+			throw new AIError.ValidationError("gemini-v1beta: standalone thinking history is not supported");
+		if (part.thoughtSignature !== undefined)
+			throw new AIError.ValidationError("gemini-v1beta: signed text history is not supported");
 		if (typeof part.text === "string" && part.text.length > 0) {
 			textOnly += part.text;
 			blocks.push({ type: "text", text: part.text });
@@ -103,45 +108,62 @@ function contentFromGeminiParts(parts: unknown): string | (TextContent | ImageCo
 				"gemini-v1beta: unsupported part type (fileData); only text, inlineData, functionCall, and functionResponse are accepted",
 			);
 		}
+		throw new AIError.ValidationError("gemini-v1beta: unsupported or malformed content part");
 	}
 	if (!hasImage) return textOnly;
 	return blocks;
 }
 
-function readFunctionCall(part: Record<string, unknown>, lastCallIdByName?: Map<string, string>): ToolCall | undefined {
+function readFunctionCall(
+	part: Record<string, unknown>,
+	lastCallIdByName?: Map<string, string[]>,
+): ToolCall | undefined {
 	const call = part.functionCall ?? part.function_call;
-	if (!isRecord(call)) return undefined;
+	if (call === undefined) return undefined;
+	if (!isRecord(call)) throw new AIError.ValidationError("gemini-v1beta: functionCall must be an object");
 	const name = typeof call.name === "string" ? call.name : undefined;
-	if (!name) return undefined;
+	if (!name?.trim()) throw new AIError.ValidationError("gemini-v1beta: functionCall requires a name");
 	const id =
 		typeof call.id === "string" && call.id.length > 0
 			? call.id
 			: `gemini_call_${name}_${Math.random().toString(36).slice(2, 10)}`;
-	lastCallIdByName?.set(name, id);
+	if (lastCallIdByName) {
+		const pending = lastCallIdByName.get(name) ?? [];
+		pending.push(id);
+		lastCallIdByName.set(name, pending);
+	}
 	const args = call.args ?? call.arguments;
+	if (args !== undefined && !isRecord(args))
+		throw new AIError.ValidationError("gemini-v1beta: functionCall args must be an object");
 	return {
 		type: "toolCall",
 		id,
 		name,
 		arguments: isRecord(args) ? args : {},
+		...(typeof part.thoughtSignature === "string" ? { thoughtSignature: part.thoughtSignature } : {}),
 	};
 }
 
 function functionResponseToToolResult(
 	part: Record<string, unknown>,
 	timestamp: number,
-	lastCallIdByName?: Map<string, string>,
+	lastCallIdByName?: Map<string, string[]>,
 ): ToolResultMessage | undefined {
 	const resp = part.functionResponse ?? part.function_response;
-	if (!isRecord(resp)) return undefined;
-	const name = typeof resp.name === "string" ? resp.name : "unknown";
-	const correlated = lastCallIdByName?.get(name);
+	if (resp === undefined) return undefined;
+	if (!isRecord(resp) || typeof resp.name !== "string" || !resp.name.trim())
+		throw new AIError.ValidationError("gemini-v1beta: functionResponse requires a name");
+	const name = resp.name;
+	const pending = lastCallIdByName?.get(name);
+	const correlated = pending?.[0];
 	const id =
 		typeof resp.id === "string" && resp.id.length > 0
 			? resp.id
 			: (correlated ?? `gemini_resp_${name}_${Math.random().toString(36).slice(2, 10)}`);
-	if (correlated !== undefined && id === correlated) {
-		lastCallIdByName?.delete(name);
+	if (pending) {
+		const index = pending.indexOf(id);
+		if (index >= 0) pending.splice(index, 1);
+		if (pending.length === 0) lastCallIdByName?.delete(name);
 	}
 	const response = resp.response;
 	let isError = false;
@@ -276,7 +298,11 @@ function pushTurn(
 				? content
 				: content.filter((block): block is TextContent | ImageContent => block.type !== "toolCall");
 		messages.push({ role: "user", content: userContent, timestamp });
-	} else messages.push(makeAssistantMessage(content, modelId, timestamp));
+	} else {
+		if (typeof content !== "string" && content.some(block => block.type === "image"))
+			throw new AIError.ValidationError("gemini-v1beta: assistant image history is not supported");
+		messages.push(makeAssistantMessage(content, modelId, timestamp));
+	}
 }
 
 function walkContents(
@@ -287,7 +313,7 @@ function walkContents(
 	timestamp: number,
 ): void {
 	// Correlate id-less functionResponse parts with the preceding functionCall of the same name.
-	const lastCallIdByName = new Map<string, string>();
+	const lastCallIdByName = new Map<string, string[]>();
 	for (const item of contents) {
 		if (!isRecord(item)) continue;
 		const role = classifyRole(item.role) ?? "user";
@@ -310,6 +336,10 @@ function walkContents(
 			mediaParts.push(part);
 		}
 		const content = contentFromGeminiParts(mediaParts);
+		if (toolCalls.length && role !== "assistant")
+			throw new AIError.ValidationError("gemini-v1beta: functionCall parts require model role");
+		if (toolResults.length && role !== "user")
+			throw new AIError.ValidationError("gemini-v1beta: functionResponse parts require user role");
 		if (toolCalls.length > 0) {
 			const blocks: (TextContent | ImageContent | ToolCall)[] =
 				typeof content === "string"
@@ -394,15 +424,20 @@ function walkGeminiTools(tools: unknown): Tool[] | undefined {
 	if (!Array.isArray(tools)) return undefined;
 	const out: Tool[] = [];
 	for (const tool of tools) {
-		if (!isRecord(tool)) continue;
+		if (!isRecord(tool)) throw new AIError.ValidationError("gemini-v1beta: tool must be an object");
 		const decls = tool.functionDeclarations ?? tool.function_declarations;
-		if (!Array.isArray(decls)) continue;
+		if (!Array.isArray(decls))
+			throw new AIError.ValidationError("gemini-v1beta: only functionDeclarations tools are supported");
 		for (const decl of decls) {
-			if (!isRecord(decl) || typeof decl.name !== "string" || decl.name.length === 0) continue;
+			if (!isRecord(decl) || typeof decl.name !== "string" || !decl.name.trim())
+				throw new AIError.ValidationError("gemini-v1beta: function declaration requires a name");
+			const parameters = decl.parametersJsonSchema ?? decl.parameters_json_schema ?? decl.parameters ?? {};
+			if (!isRecord(parameters))
+				throw new AIError.ValidationError("gemini-v1beta: function parameters must be a schema object");
 			out.push({
 				name: decl.name,
 				description: typeof decl.description === "string" ? decl.description : "",
-				parameters: (isRecord(decl.parameters) ? decl.parameters : {}) as TSchema,
+				parameters: parameters as TSchema,
 			});
 		}
 	}
@@ -413,13 +448,18 @@ function mapGeminiToolChoice(toolConfig: unknown): ParsedRequest["options"]["too
 	if (!isRecord(toolConfig)) return undefined;
 	const fcc = toolConfig.functionCallingConfig ?? toolConfig.function_calling_config;
 	if (!isRecord(fcc)) return undefined;
+	const mode = typeof fcc.mode === "string" ? fcc.mode.toUpperCase() : "";
+	if (mode === "NONE") return "none";
+	if (mode && mode !== "ANY" && mode !== "AUTO")
+		throw new AIError.ValidationError("gemini-v1beta: unsupported function calling mode");
 	const allowed = fcc.allowedFunctionNames ?? fcc.allowed_function_names;
 	if (Array.isArray(allowed)) {
 		const names = allowed.filter((name): name is string => typeof name === "string" && name.length > 0);
-		if (names.length === 1) return { name: names[0]! };
+		if (names.length !== allowed.length || !names.length)
+			throw new AIError.ValidationError("gemini-v1beta: allowedFunctionNames must contain nonempty names");
+		if (mode !== "AUTO" && names.length === 1) return { name: names[0]! };
+		if (mode !== "AUTO") return "required";
 	}
-	const mode = typeof fcc.mode === "string" ? fcc.mode.toUpperCase() : "";
-	if (mode === "NONE") return "none";
 	if (mode === "ANY") return "required";
 	if (mode === "AUTO") return "auto";
 	return undefined;
@@ -466,12 +506,23 @@ export function parseRequest(body: unknown, _headers?: Headers, defaultStream = 
 
 	const tools = walkGeminiTools(body.tools);
 	const toolChoice = mapGeminiToolChoice(body.toolConfig ?? body.tool_config);
+	const toolConfig = body.toolConfig ?? body.tool_config;
+	const calling = isRecord(toolConfig)
+		? (toolConfig.functionCallingConfig ?? toolConfig.function_calling_config)
+		: undefined;
+	const allowed = isRecord(calling) ? (calling.allowedFunctionNames ?? calling.allowed_function_names) : undefined;
+	let selectedTools = tools;
+	if (toolChoice !== "none" && Array.isArray(allowed)) {
+		if (allowed.some(name => !tools?.some(tool => tool.name === name)))
+			throw new AIError.ValidationError("gemini-v1beta: allowedFunctionNames refers to an undeclared function");
+		selectedTools = tools?.filter(tool => allowed.includes(tool.name));
+	}
 	if (toolChoice !== undefined) options.toolChoice = toolChoice;
 
 	const context: Context = {
 		messages,
 		...(systemParts.length > 0 ? { systemPrompt: systemParts } : {}),
-		...(tools ? { tools } : {}),
+		...(selectedTools ? { tools: selectedTools } : {}),
 	};
 
 	return {
@@ -495,6 +546,7 @@ function flattenAssistantParts(message: AssistantMessage): Record<string, unknow
 		}
 		if (part.type === "toolCall") {
 			parts.push({
+				...(part.thoughtSignature !== undefined ? { thoughtSignature: part.thoughtSignature } : {}),
 				functionCall: {
 					name: part.name,
 					args: part.arguments ?? {},
@@ -562,6 +614,29 @@ export function encodeStream(
 					controller.close();
 					return;
 				}
+				const emittedCalls = new Set<string>();
+				const emitCall = (call: ToolCall) => {
+					if (emittedCalls.has(call.id)) return;
+					emittedCalls.add(call.id);
+					writeSse(
+						controller,
+						{
+							...geminiCandidate(
+								[
+									{
+										functionCall: { name: call.name, args: call.arguments, id: call.id },
+										...(call.thoughtSignature !== undefined
+											? { thoughtSignature: call.thoughtSignature }
+											: {}),
+									},
+								],
+								undefined,
+							),
+							modelVersion: requestedModelId,
+						},
+						cancelled,
+					);
+				};
 				for await (const event of events) {
 					if (cancelled) return;
 					switch (event.type) {
@@ -574,31 +649,14 @@ export function encodeStream(
 								);
 							}
 							break;
-						case "toolcall_end": {
+						case "toolcall_end":
 							// Gemini functionCall parts are complete calls, not argument deltas.
-							const call = event.toolCall;
-							writeSse(
-								controller,
-								{
-									...geminiCandidate(
-										[
-											{
-												functionCall: {
-													name: call.name,
-													args: call.arguments ?? {},
-													id: call.id,
-												},
-											},
-										],
-										undefined,
-									),
-									modelVersion: requestedModelId,
-								},
-								cancelled,
-							);
+							emitCall(event.toolCall);
 							break;
-						}
 						case "done":
+							for (const part of event.message.content) {
+								if (part.type === "toolCall") emitCall(part);
+							}
 							writeSse(
 								controller,
 								{
@@ -649,8 +707,23 @@ export function encodeStream(
  * Gemini error envelope: `{ error: { message, status, code } }`.
  * See https://ai.google.dev/gemini-api/docs/troubleshooting.
  */
-export function formatError(status: number, type: string, message: string): Response {
-	return new Response(JSON.stringify({ error: { message, status: type, code: status } }), {
+export function formatError(status: number, _type: string, message: string): Response {
+	const names: Record<number, string> = {
+		400: "INVALID_ARGUMENT",
+		401: "UNAUTHENTICATED",
+		403: "PERMISSION_DENIED",
+		404: "NOT_FOUND",
+		408: "DEADLINE_EXCEEDED",
+		409: "ABORTED",
+		429: "RESOURCE_EXHAUSTED",
+		499: "CANCELLED",
+		500: "INTERNAL",
+		501: "UNIMPLEMENTED",
+		502: "UNAVAILABLE",
+		503: "UNAVAILABLE",
+		504: "DEADLINE_EXCEEDED",
+	};
+	return new Response(JSON.stringify({ error: { message, status: names[status] ?? "UNKNOWN", code: status } }), {
 		status,
 		headers: { "Content-Type": "application/json" },
 	});

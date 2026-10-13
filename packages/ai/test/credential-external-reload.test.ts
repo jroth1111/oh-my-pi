@@ -96,7 +96,10 @@ describe("credential pool visibility across processes", () => {
 	it("rotates onto an account another process added mid-session", async () => {
 		const rows = [oauthRow(1)];
 		const { store, commitExternally } = makeExternallyMutableStore(rows);
-		const storage = new AuthStorage(store, { configValueResolver: async value => value });
+		const storage = new AuthStorage(store, {
+			configValueResolver: async value => value,
+			usageProviderResolver: () => undefined,
+		});
 		storages.push(storage);
 		await storage.credentials.reload();
 
@@ -120,7 +123,10 @@ describe("credential pool visibility across processes", () => {
 	it("selects an account another process added, with no rotation in between", async () => {
 		const rows: StoredAuthCredential[] = [];
 		const { store, commitExternally } = makeExternallyMutableStore(rows);
-		const storage = new AuthStorage(store, { configValueResolver: async value => value });
+		const storage = new AuthStorage(store, {
+			configValueResolver: async value => value,
+			usageProviderResolver: () => undefined,
+		});
 		storages.push(storage);
 		await storage.credentials.reload();
 
@@ -136,7 +142,10 @@ describe("credential pool visibility across processes", () => {
 	it("makes an externally added account visible to non-refreshing discovery", async () => {
 		const rows: StoredAuthCredential[] = [];
 		const { store, commitExternally } = makeExternallyMutableStore(rows);
-		const storage = new AuthStorage(store, { configValueResolver: async value => value });
+		const storage = new AuthStorage(store, {
+			configValueResolver: async value => value,
+			usageProviderResolver: () => undefined,
+		});
 		storages.push(storage);
 		await storage.credentials.reload();
 
@@ -148,7 +157,10 @@ describe("credential pool visibility across processes", () => {
 	it("resolves OAuth access for an account another process added", async () => {
 		const rows: StoredAuthCredential[] = [];
 		const { store, commitExternally } = makeExternallyMutableStore(rows);
-		const storage = new AuthStorage(store, { configValueResolver: async value => value });
+		const storage = new AuthStorage(store, {
+			configValueResolver: async value => value,
+			usageProviderResolver: () => undefined,
+		});
 		storages.push(storage);
 		await storage.credentials.reload();
 
@@ -170,7 +182,10 @@ describe("credential pool visibility across processes", () => {
 			listCalls += 1;
 			return listAuthCredentials(provider);
 		};
-		const storage = new AuthStorage(store, { configValueResolver: async value => value });
+		const storage = new AuthStorage(store, {
+			configValueResolver: async value => value,
+			usageProviderResolver: () => undefined,
+		});
 		storages.push(storage);
 		await storage.credentials.reload();
 		const afterInitialLoad = listCalls;
@@ -185,7 +200,10 @@ describe("credential pool visibility across processes", () => {
 	it("does not blame a sibling when another process deletes the pinned account", async () => {
 		const rows = [oauthRow(1), oauthRow(2)];
 		const { store, removeExternally, blocks } = makeExternallyMutableStore(rows);
-		const storage = new AuthStorage(store, { configValueResolver: async value => value });
+		const storage = new AuthStorage(store, {
+			configValueResolver: async value => value,
+			usageProviderResolver: () => undefined,
+		});
 		storages.push(storage);
 		await storage.credentials.reload();
 

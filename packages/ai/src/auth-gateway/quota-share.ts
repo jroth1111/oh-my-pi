@@ -26,12 +26,6 @@ export interface QuotaSharePick {
 	deficitUpdates: ReadonlyArray<QuotaShareDeficitUpdate>;
 }
 
-const DRR_DEFICIT_LIMIT = 1024;
-
-function clampDeficit(value: number): number {
-	return Math.max(-DRR_DEFICIT_LIMIT, Math.min(DRR_DEFICIT_LIMIT, value));
-}
-
 export function pickQuotaShare(inputs: readonly QuotaShareInput[]): QuotaSharePick | undefined {
 	if (inputs.length === 0) {
 		return undefined;
@@ -48,14 +42,18 @@ export function pickQuotaShare(inputs: readonly QuotaShareInput[]): QuotaSharePi
 		return { id: pickMinInFlight(inputs).id, disposition: "deprioritized", deficitUpdates: [] };
 	}
 
-	const chosen = pickTwoChoice(unsaturated);
+	const accrued = unsaturated.map(input => ({
+		...input,
+		deficit: (input.deficit ?? 0) + Math.max(1, input.weight),
+	}));
+	const chosen = pickTwoChoice(accrued);
 	// DRR accounting: serving repays the chosen candidate's debt (quantum =
 	// cohort weight sum); every skipped peer accrues its own weight. Equal
 	// health accounts therefore alternate instead of hammering the top-ranked.
 	const quantum = unsaturated.reduce((sum, input) => sum + Math.max(1, input.weight), 0);
-	const deficitUpdates = unsaturated.map(input => ({
+	const deficitUpdates = accrued.map(input => ({
 		id: input.id,
-		deficit: clampDeficit((input.deficit ?? 0) + (input.id === chosen.id ? -quantum : Math.max(1, input.weight))),
+		deficit: input.deficit - (input.id === chosen.id ? quantum : 0),
 	}));
 	return { id: chosen.id, disposition: "eligible", deficitUpdates };
 }
@@ -94,16 +92,13 @@ function pickTwoChoice(candidates: readonly QuotaShareInput[]): QuotaShareInput 
 		}
 	}
 	if (second === undefined) return lowest;
-	// Fair-share: between the two finalists, deficit outranks weight in both
-	// directions — only fall back to weight when deficits are equal.
-	const lowestDeficit = lowest.deficit ?? 0;
+	// Fair-share tiebreak: between the two finalists, debt repayment outranks
+	// weight — this is what makes equally healthy accounts alternate.
 	const secondDeficit = second.deficit ?? 0;
-	if (secondDeficit !== lowestDeficit) {
-		return secondDeficit > lowestDeficit ? second : lowest;
-	}
-	if ((second.deficit ?? 0) === (lowest.deficit ?? 0) && second.weight > lowest.weight) {
-		return second;
-	}
+	const lowestDeficit = lowest.deficit ?? 0;
+	if (secondDeficit > lowestDeficit) return second;
+	if (lowestDeficit > secondDeficit) return lowest;
+	if (second.weight > lowest.weight) return second;
 	return lowest;
 }
 

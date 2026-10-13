@@ -24,6 +24,23 @@ const HOUR_MS = 60 * 60 * 1000;
 const FIVE_HOUR_MS = 5 * HOUR_MS;
 const STALE_BLOCK_GUARD_MS = 5 * 60_000 + 1;
 
+/** A known quota cooldown without a provider wait is eligible for a leased recovery probe. */
+async function markUntimedCodexQuota(
+	storage: AuthStorage,
+	sessionId: string,
+	credentialId: number,
+	durationMs: number,
+): Promise<void> {
+	await storage.limits.markReached("openai-codex", sessionId, { credentialId });
+	storage.blocks.upsert({
+		credentialId,
+		providerKey: "openai-codex:oauth",
+		blockScope: "chat",
+		blockedUntilMs: Date.now() + durationMs,
+		quotaOrigin: true,
+	});
+}
+
 function ageCredentialBlockRows(db: Database): void {
 	db.prepare("UPDATE auth_credential_blocks SET updated_at = ?").run(
 		Math.floor((Date.now() - STALE_BLOCK_GUARD_MS) / 1000),
@@ -884,7 +901,7 @@ describe("AuthStorage codex oauth ranking", () => {
 	test("applies deterministic priority without a usage ranking strategy", async () => {
 		if (!store) throw new Error("test setup failed");
 		authStorage = new AuthStorage(store, {
-			usageProviderResolver: provider => (provider === "openai-codex" ? usageProvider : undefined),
+			usageProviderResolver: () => undefined,
 			rankingStrategyResolver: () => undefined,
 			accountPolicies: [
 				{ provider: "openai-codex", account: { accountId: "acct-preferred" }, priority: 10 },
@@ -1089,7 +1106,7 @@ describe("AuthStorage codex oauth ranking", () => {
 		expect(await authStorage.keys.get("openai-codex", "explicit-reserve-pin")).toBe("api-acct-protected");
 	});
 
-	test("routes to an explicit pin before an earlier-unblocking sibling once every account is blocked", async () => {
+	test("prefers an explicit pin for an untimed quota probe after healthy siblings are exhausted", async () => {
 		if (!authStorage) throw new Error("test setup failed");
 		await authStorage.credentials.set("openai-codex", [
 			{ type: "oauth", ...createCredential("acct-a", "a@example.com") },
@@ -1101,18 +1118,12 @@ describe("AuthStorage codex oauth ranking", () => {
 		if (!accountA || !accountB) throw new Error("expected both accounts");
 		const sessionId = "blocked-explicit-pin";
 
-		await authStorage.limits.markReached("openai-codex", sessionId, {
-			credentialId: accountB.credentialId,
-			retryAfterMs: 4 * HOUR_MS,
-		});
+		await markUntimedCodexQuota(authStorage, sessionId, accountB.credentialId, 4 * HOUR_MS);
 		expect(authStorage.sessions.pin("openai-codex", sessionId, accountB.credentialId)).toBe(true);
 		// An unblocked sibling still wins over a blocked pin.
 		expect(await authStorage.keys.get("openai-codex", sessionId)).toBe("api-acct-a");
 
-		await authStorage.limits.markReached("openai-codex", sessionId, {
-			credentialId: accountA.credentialId,
-			retryAfterMs: HOUR_MS,
-		});
+		await markUntimedCodexQuota(authStorage, sessionId, accountA.credentialId, HOUR_MS);
 		expect(authStorage.sessions.pin("openai-codex", sessionId, accountB.credentialId)).toBe(true);
 		expect(await authStorage.keys.get("openai-codex", sessionId)).toBe("api-acct-b");
 	});
@@ -1129,14 +1140,8 @@ describe("AuthStorage codex oauth ranking", () => {
 		const accountB = accounts.find(account => account.accountId === "acct-b");
 		if (!accountA || !accountB) throw new Error("expected both accounts");
 		const sessionId = "first-preflight-reorder";
-		await storage.limits.markReached("openai-codex", sessionId, {
-			credentialId: accountA.credentialId,
-			retryAfterMs: HOUR_MS,
-		});
-		await storage.limits.markReached("openai-codex", sessionId, {
-			credentialId: accountB.credentialId,
-			retryAfterMs: 4 * HOUR_MS,
-		});
+		await markUntimedCodexQuota(storage, sessionId, accountA.credentialId, HOUR_MS);
+		await markUntimedCodexQuota(storage, sessionId, accountB.credentialId, 4 * HOUR_MS);
 		expect(storage.sessions.pin("openai-codex", sessionId, accountB.credentialId)).toBe(true);
 
 		// The first preflight callback reloads B,A before the next callback
@@ -1159,14 +1164,8 @@ describe("AuthStorage codex oauth ranking", () => {
 		const accountB = accounts.find(account => account.accountId === "acct-b");
 		if (!accountA || !accountB) throw new Error("expected both accounts");
 		const sessionId = "reordered-explicit-pin";
-		await storage.limits.markReached("openai-codex", sessionId, {
-			credentialId: accountA.credentialId,
-			retryAfterMs: HOUR_MS,
-		});
-		await storage.limits.markReached("openai-codex", sessionId, {
-			credentialId: accountB.credentialId,
-			retryAfterMs: 4 * HOUR_MS,
-		});
+		await markUntimedCodexQuota(storage, sessionId, accountA.credentialId, HOUR_MS);
+		await markUntimedCodexQuota(storage, sessionId, accountB.credentialId, 4 * HOUR_MS);
 		expect(storage.sessions.pin("openai-codex", sessionId, accountB.credentialId)).toBe(true);
 		for (const row of credentialStore.listAuthCredentials("openai-codex")) {
 			if (row.credential.type === "oauth") {
@@ -2771,7 +2770,7 @@ describe("AuthStorage codex oauth ranking", () => {
 		expect(store.getCredentialBlock(blockedRow.id, "openai-codex:oauth", "spark")).toBe(blockedUntilMs);
 	});
 
-	test("falls back to earliest-unblocking account when all exhausted", async () => {
+	test("does not vend a Codex bearer before either provider-stated quota reset", async () => {
 		if (!authStorage) throw new Error("test setup failed");
 
 		await authStorage.credentials.set("openai-codex", [
@@ -2797,7 +2796,9 @@ describe("AuthStorage codex oauth ranking", () => {
 		);
 
 		const apiKey = await authStorage.keys.get("openai-codex", "session-all-exhausted");
-		expect(apiKey).toBe("api-acct-soon");
+		expect(apiKey).toBeUndefined();
+		for (const row of authStorage.credentials.list("openai-codex"))
+			expect(authStorage.coordination.tryAcquireQuotaProbeLease(row.id, "chat")).toBeNull();
 	});
 
 	test("prefers discovered model accounts over a pinned Codex account, without filtering unmatched catalogs", async () => {
@@ -3041,16 +3042,11 @@ describe("AuthStorage codex oauth ranking", () => {
 		expect(apiKey).toBe("api-acct-go");
 	});
 
-	test("yields an exhausted paid account over an idle free account for a paid-gated model", async () => {
+	test("does not bypass a paid account's reset by using a known-ineligible idle free account", async () => {
 		if (!authStorage) throw new Error("test setup failed");
 
-		// Regression: with every plan-eligible account usage-blocked and an
-		// unblocked free account present, resolution used to return NO
-		// credential at all ("No API key found") because the old last-resort
-		// fallback only fired when the top-ranked candidate happened to be
-		// blocked — and the idle free account ranked first. The plan-fitting
-		// last-resort pass must yield the exhausted paid account instead, so
-		// the caller gets real usage-limit semantics from the wire.
+		// The paid account's provider wait remains authoritative; the idle
+		// free row cannot turn that wait into an unsupported model request.
 		await authStorage.credentials.set("openai-codex", [
 			{ type: "oauth", ...createCredential("acct-free", "free@example.com") },
 			{ type: "oauth", ...createCredential("acct-paid", "paid@example.com") },
@@ -3078,17 +3074,14 @@ describe("AuthStorage codex oauth ranking", () => {
 		const apiKey = await authStorage.keys.get("openai-codex", "session-paid-gated-all-blocked", {
 			modelId: "gpt-5.6-sol",
 		});
-		expect(apiKey).toBe("api-acct-paid");
+		expect(apiKey).toBeUndefined();
 	});
 
-	test("attempts every exhausted account for a paid-gated model until one passes the plan gate", async () => {
+	test("does not probe paid or free accounts while every quota reset is pending", async () => {
 		if (!authStorage) throw new Error("test setup failed");
 
-		// Production shape of the same regression: EVERY seat is usage-blocked
-		// (the free seat resets soonest, so it leads the blocked ordering) and
-		// only a later-resetting paid seat can serve gpt-5.6-sol. The blocked
-		// pass must keep iterating past the plan-ineligible free seat instead
-		// of giving up after the first blocked candidate.
+		// Every seat is under a provider-stated wait, including the earlier
+		// resetting free seat. Model eligibility cannot bypass either reset.
 		await authStorage.credentials.set("openai-codex", [
 			{ type: "oauth", ...createCredential("acct-free", "free@example.com") },
 			{ type: "oauth", ...createCredential("acct-paid", "paid@example.com") },
@@ -3116,7 +3109,7 @@ describe("AuthStorage codex oauth ranking", () => {
 		const apiKey = await authStorage.keys.get("openai-codex", "session-sol-all-exhausted", {
 			modelId: "gpt-5.6-sol",
 		});
-		expect(apiKey).toBe("api-acct-paid");
+		expect(apiKey).toBeUndefined();
 	});
 
 	test("prefers Pro accounts for codex spark models over Plus accounts", async () => {
@@ -4297,7 +4290,7 @@ describe("AuthStorage claude oauth ranking", () => {
 		expect(apiKey).toBe("api-acct-healthy");
 	});
 
-	test("falls back to earliest-unblocking when all exhausted", async () => {
+	test("does not vend an Anthropic bearer before either provider-stated quota reset", async () => {
 		if (!authStorage) throw new Error("test setup failed");
 
 		await authStorage.credentials.set("anthropic", [
@@ -4323,7 +4316,9 @@ describe("AuthStorage claude oauth ranking", () => {
 		);
 
 		const apiKey = await authStorage.keys.get("anthropic", "session-claude-all-exhausted");
-		expect(apiKey).toBe("api-acct-soon");
+		expect(apiKey).toBeUndefined();
+		for (const row of authStorage.credentials.list("anthropic"))
+			expect(authStorage.coordination.tryAcquireQuotaProbeLease(row.id, "")).toBeNull();
 	});
 
 	test("weights 3 accounts by secondary drain rate", async () => {

@@ -7910,7 +7910,7 @@ export class AgentSession implements SettingsScope {
 			}
 
 			// Validate API key
-			const configured = this.#modelRegistry.authStorage?.hasAuth(this.model.provider);
+			const configured = this.#modelRegistry.authStorage?.keys.source(this.model.provider) !== undefined;
 			const apiKey = configured ? undefined : await this.#modelRegistry.getApiKey(this.model, this.sessionId);
 			if (!configured && !apiKey) {
 				throw new Error(

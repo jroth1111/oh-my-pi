@@ -63,7 +63,13 @@ export function credentialBlockScopesForRequest(
  * than a heuristic guess, tracking whichever deadline won the longest-wins
  * merge. `probeAfter` is the earliest time live usage reconciliation may clear it.
  */
-type CredentialBackoff = { until: number; timed: boolean; probeAfter: number; persisted?: boolean };
+type CredentialBackoff = {
+	until: number;
+	timed: boolean;
+	probeAfter: number;
+	persisted?: boolean;
+	quotaOrigin: boolean;
+};
 
 /**
  * One read of a credential's persisted blocks under a providerKey, keyed by
@@ -286,6 +292,7 @@ export class CredentialBlocks implements BlocksApi {
 	): number | undefined {
 		const credentialId = this.#deps.pool.entries(provider)[credentialIndex]?.id;
 		if (credentialId === undefined) return undefined;
+		this.#hydrateRetryAfterProvenance(credentialId);
 		return this.#blockedUntilById(
 			credentialId,
 			providerKey,
@@ -307,7 +314,6 @@ export class CredentialBlocks implements BlocksApi {
 			...PROTECTED_BLOCK_SCOPES,
 			...(typeof blockScopeOrScopes === "string" ? [blockScopeOrScopes] : (blockScopeOrScopes ?? [])),
 		].filter(scope => scope.length > 0);
-		this.#hydrateRetryAfterProvenance(credentialId);
 		let blockedUntil = this.#getCredentialBlockedUntilForKey(providerKey, credentialId, nowMs, persistedScopes);
 		for (const blockScope of scopes) {
 			const scopedBlockedUntil = this.#getCredentialBlockedUntilForKey(
@@ -332,9 +338,6 @@ export class CredentialBlocks implements BlocksApi {
 			(blockedUntil === undefined || persistedGlobalBlockedUntil > blockedUntil)
 		) {
 			blockedUntil = persistedGlobalBlockedUntil;
-			// Restarts lose in-memory Retry-After provenance; treat still-active persisted
-			// blocks as Retry-After-sourced so allowBlocked cannot bypass probe leases.
-			this.#deps.probeBook?.noteRetryAfterBlock(credentialId, "", persistedGlobalBlockedUntil);
 		}
 		for (const blockScope of scopes) {
 			const persistedScopedBlockedUntil = this.#readPersistedCredentialBlock(
@@ -348,7 +351,6 @@ export class CredentialBlocks implements BlocksApi {
 				(blockedUntil === undefined || persistedScopedBlockedUntil > blockedUntil)
 			) {
 				blockedUntil = persistedScopedBlockedUntil;
-				this.#deps.probeBook?.noteRetryAfterBlock(credentialId, blockScope, persistedScopedBlockedUntil);
 			}
 		}
 		return blockedUntil;
@@ -384,6 +386,46 @@ export class CredentialBlocks implements BlocksApi {
 		blockScope: string | readonly string[] | undefined = undefined,
 	): boolean {
 		return this.blockedUntil(provider, providerKey, credentialIndex, blockScope) !== undefined;
+	}
+
+	/** One known quota block may be probed; auth/policy, unknown legacy, timed and multiple-meter blocks may not. */
+	quotaProbeScope(
+		provider: string,
+		providerKey: string,
+		credentialIndex: number,
+		blockScopeOrScopes?: string | readonly string[],
+	): string | null {
+		const credentialId = this.#deps.pool.entries(provider)[credentialIndex]?.id;
+		if (credentialId === undefined || this.#deps.health.damaged) return null;
+		const persistedScopes = this.#readPersistedCredentialBlockScopes(credentialId, providerKey);
+		if (persistedScopes === null) return null;
+		const scopes = new Set([
+			"",
+			...PROTECTED_BLOCK_SCOPES,
+			...(typeof blockScopeOrScopes === "string" ? [blockScopeOrScopes] : (blockScopeOrScopes ?? [])),
+		]);
+		const persisted = this.list([credentialId]).filter(block => block.providerKey === providerKey);
+		let probeScope: string | null = null;
+		for (const scope of scopes) {
+			const deadline = this.#exactBlockedUntil(credentialId, providerKey, scope || undefined, persistedScopes);
+			if (deadline === undefined) continue;
+			const memory = this.#credentialBackoff
+				.get(scopedBackoffKey(providerKey, scope || undefined))
+				?.get(credentialId);
+			const durable = persisted.find(block => block.blockScope === scope);
+			const durableDeadline = this.#readPersistedCredentialBlock(credentialId, providerKey, scope, persistedScopes);
+			if (PROTECTED_BLOCK_SCOPES.some(protectedScope => protectedScope === scope)) return null;
+			if ((memory && !memory.quotaOrigin) || (durableDeadline !== undefined && durable?.quotaOrigin !== true))
+				return null;
+			if (!memory && durable?.quotaOrigin !== true) return null;
+			if (durable?.retryAfter || memory?.timed) {
+				this.#deps.probeBook?.noteRetryAfterBlock(credentialId, scope, deadline);
+				return null;
+			}
+			if (probeScope !== null) return null;
+			probeScope = scope;
+		}
+		return probeScope;
 	}
 
 	/**
@@ -428,6 +470,7 @@ export class CredentialBlocks implements BlocksApi {
 		blockedUntilMs: number,
 		blockScope: string | undefined = undefined,
 		providerTimed = false,
+		quotaOrigin = false,
 	): void {
 		const credentialId = this.#deps.pool.entries(provider)[credentialIndex]?.id;
 		if (credentialId === undefined) return;
@@ -449,13 +492,18 @@ export class CredentialBlocks implements BlocksApi {
 			until: nextBlockedUntil,
 			timed: nextTimed,
 			probeAfter: Math.min(nextBlockedUntil, Date.now() + USAGE_REPORT_TTL_MS),
+			quotaOrigin: quotaOrigin && (existing?.quotaOrigin ?? true),
 		});
 		this.#credentialBackoff.set(backoffKey, backoffMap);
 		this.#deps.usageCache.invalidate(provider);
 
 		const probeBook = this.#deps.probeBook;
-		if (probeBook && !probeBook.isRetryAfterSourced(credentialId, blockScope ?? "")) {
-			probeBook.noteHardCooldown(credentialId, blockScope ?? "");
+		if (probeBook) {
+			if (quotaOrigin && (nextTimed || probeBook.isRetryAfterSourced(credentialId, blockScope ?? ""))) {
+				probeBook.noteRetryAfterBlock(credentialId, blockScope ?? "", nextBlockedUntil);
+			} else {
+				probeBook.noteHardCooldown(credentialId, blockScope ?? "");
+			}
 		}
 
 		const upsertCredentialBlock = this.#deps.store.upsertCredentialBlock?.bind(this.#deps.store);
@@ -467,6 +515,7 @@ export class CredentialBlocks implements BlocksApi {
 				blockScope: blockScope ?? "",
 				blockedUntilMs: nextBlockedUntil,
 				retryAfter: probeBook?.isRetryAfterSourced(credentialId, blockScope ?? ""),
+				quotaOrigin: quotaOrigin && (existing?.quotaOrigin ?? true),
 			});
 			const block = backoffMap.get(credentialId);
 			if (block) block.persisted = true;

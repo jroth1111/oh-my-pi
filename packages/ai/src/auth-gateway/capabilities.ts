@@ -1,5 +1,6 @@
-import type { Api, Context, Model } from "../types";
 import { surfaceAllowsApi } from "./route-surface";
+import type { Api, Context, Model } from "../types";
+import { routeRequestFacts } from "./request-facts";
 
 export interface ModelCapabilities {
 	text: boolean;
@@ -104,8 +105,7 @@ export function fitsRequest(caps: ModelCapabilities, need: RequestNeed): boolean
 /** Request facts shared by conditional route selection. */
 export function requestNeeds(context: Context): RequestNeed {
 	return {
-		vision: context.messages.some(
-			message => Array.isArray(message.content) && message.content.some(block => block.type === "image"),
-		),
+		vision: routeRequestFacts(context).vision,
+		tools: (context.tools?.length ?? 0) > 0,
 	};
 }
