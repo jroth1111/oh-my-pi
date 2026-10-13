@@ -13,6 +13,8 @@ import {
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { cfgCompactionModelThresholds } from "@oh-my-pi/pi-coding-agent/session/context-settings";
 import {
+	describeModelCompactionPoint,
+	planModelCompactionPoint,
 	previewModelCompactionPoint,
 	resolveModelCompactionSettings,
 	setModelCompactionPoint,
@@ -232,21 +234,23 @@ describe("compaction.modelThresholds", () => {
 		} as Model;
 		const tiers = { standard: 272_000, extended: 1_050_000 };
 
-		const pending = setModelCompactionPoint(settings, model, "400k", { tiers });
-		expect(pending).toEqual({ kind: "confirm", message: "Opens 1.05M window; >272K costs more" });
-		expect(resolveModelCompactionSettings(settings, model).baseWindowTokens).toBeUndefined();
-		// The pricing note follows the scaled trigger: a 300k base compacts at 255k, inside the standard tier.
-		expect(setModelCompactionPoint(settings, model, "300k", { tiers })).toEqual({
+		// Opening the extended window needs a second Enter; the warning says when input reaches the premium tier.
+		expect(setModelCompactionPoint(settings, model, "400k", { tiers })).toMatchObject({
 			kind: "confirm",
-			message: "Opens 1.05M window",
+			extendedWindow: 1_050_000,
+			premiumFrom: 272_000,
 		});
+		expect(resolveModelCompactionSettings(settings, model).baseWindowTokens).toBeUndefined();
+		// The premium note follows the scaled trigger: a 300k base compacts at 255k, inside the standard tier.
+		const insideTier = setModelCompactionPoint(settings, model, "300k", { tiers });
+		expect(insideTier).toMatchObject({ kind: "confirm", extendedWindow: 1_050_000 });
+		expect(insideTier).not.toHaveProperty("premiumFrom");
 
-		// The saved summary says where the model now compacts: 400k minus the 60k reserve, on the extended window.
-		expect(setModelCompactionPoint(settings, model, "400k", { tiers, confirmed: true })).toEqual({
+		// Saved: 400k minus the 60k reserve, on the extended window.
+		expect(setModelCompactionPoint(settings, model, "400k", { tiers, confirmed: true })).toMatchObject({
 			kind: "saved",
 			entry: 400_000,
-			described: "400,000-token base",
-			summary: "compacts at 340K · 85% of 400K base",
+			trigger: { kind: "scaled", tokens: 340_000, share: 85, scaledFrom: 400_000, fromBase: true },
 		});
 		expect(resolveModelCompactionSettings(settings, model).baseWindowTokens).toBe(400_000);
 		expect(setModelCompactionPoint(settings, model, "200k", { tiers })).toMatchObject({
@@ -254,10 +258,9 @@ describe("compaction.modelThresholds", () => {
 			entry: 200_000,
 		});
 
-		expect(() => setModelCompactionPoint(settings, model, "1100k", { tiers, confirmed: true })).toThrow(
-			"Must not exceed the 1.05M max window",
-		);
-		expect(() => setModelCompactionPoint(settings, model, "300k")).toThrow("Must not exceed the 272K window");
+		expect(() => setModelCompactionPoint(settings, model, "1100k", { tiers, confirmed: true })).toThrow();
+		// Without tiers the current window is the ceiling.
+		expect(() => setModelCompactionPoint(settings, model, "300k")).toThrow();
 		expect(resolveModelCompactionSettings(settings, model).baseWindowTokens).toBe(200_000);
 	});
 
@@ -271,20 +274,17 @@ describe("compaction.modelThresholds", () => {
 			kind: "saved",
 			entry: 272_000,
 		});
-		expect(setModelCompactionPoint(settings, model, "f272k", { tiers })).toEqual({
+		expect(setModelCompactionPoint(settings, model, "f272k", { tiers })).toMatchObject({
 			kind: "confirm",
-			message: "Opens 1.05M window",
+			extendedWindow: 1_050_000,
 		});
-		expect(setModelCompactionPoint(settings, model, "f272k", { tiers, confirmed: true })).toEqual({
+		expect(setModelCompactionPoint(settings, model, "f272k", { tiers, confirmed: true })).toMatchObject({
 			kind: "saved",
 			entry: "f272000",
-			described: "fixed at 272,000 tokens",
-			summary: "compacts at exactly 272K",
+			trigger: { kind: "fixed", tokens: 272_000 },
 		});
 		expect(resolveModelCompactionSettings(settings, model)).toMatchObject({ thresholdTokens: 272_000 });
-		expect(() => setModelCompactionPoint(settings, model, "f1050k", { tiers, confirmed: true })).toThrow(
-			"Must be below the 1.05M max window",
-		);
+		expect(() => setModelCompactionPoint(settings, model, "f1050k", { tiers, confirmed: true })).toThrow();
 	});
 
 	it("skips the warning when extended context is already on", () => {
@@ -295,28 +295,76 @@ describe("compaction.modelThresholds", () => {
 		).toMatchObject({ kind: "saved", entry: 400_000 });
 	});
 
-	it("previews where each kind of typed limit compacts, and stays silent on input submit would reject", () => {
+	it("plans where each kind of typed limit compacts, and nothing for input submit would reject", () => {
 		const settings = Settings.isolated({ extendedContext: false });
 		const model = { provider: "openai", id: "gpt-5.6-terra", contextWindow: 272_000 } as Model;
 		const tiers = { standard: 272_000, extended: 1_050_000 };
-		const preview = (input: string) => previewModelCompactionPoint(settings, model, input, tiers);
+		const plan = (input: string) => planModelCompactionPoint(settings, model, input, tiers);
 
-		expect(preview("400k")).toBe("compacts at 340K · 85% of 400K base");
+		expect(plan("400k")).toMatchObject({
+			window: 1_050_000,
+			trigger: { kind: "scaled", tokens: 340_000, scaledFrom: 400_000, fromBase: true },
+		});
 		// A base inside the standard window keeps the model on it.
-		expect(preview("200k")).toBe("compacts at 170K · 85% of 200K base");
-		expect(preview("f400k")).toBe("compacts at exactly 400K");
-		expect(preview("50%")).toBe("compacts at 136K · 50% of window");
-		expect(preview("")).toBe("resets: compacts at 231.2K · 85% of window");
-		for (const rejected of ["abc", "1100k", "f1050k"]) expect(preview(rejected)).toBeUndefined();
+		expect(plan("200k")).toMatchObject({ window: 272_000, trigger: { tokens: 170_000, fromBase: true } });
+		expect(plan("f400k")).toMatchObject({ window: 1_050_000, trigger: { kind: "fixed", tokens: 400_000 } });
+		expect(plan("50%")).toMatchObject({ window: 272_000, trigger: { tokens: 136_000, share: 50, fromBase: false } });
+		expect(plan("")).toMatchObject({ reset: true, window: 272_000, trigger: { tokens: 231_200, fromBase: false } });
+		for (const rejected of ["abc", "1100k", "f1050k"]) {
+			expect(plan(rejected)).toBeUndefined();
+			expect(previewModelCompactionPoint(settings, model, rejected, tiers)).toBeUndefined();
+		}
 	});
 
-	it("previews a reset as the prefix entry the model falls back to", () => {
-		const settings = Settings.isolated({
-			extendedContext: false,
-			"compaction.modelThresholds": { "openai/*": "f100000", "openai/gpt-5.6-terra": 400_000 },
+	it("reports fractional shares exactly", () => {
+		const settings = Settings.isolated({ extendedContext: false });
+		const model = { provider: "openai", id: "gpt-5.6-terra", contextWindow: 272_000 } as Model;
+		const tiers = { standard: 272_000, extended: 1_050_000 };
+		expect(planModelCompactionPoint(settings, model, "12.5%", tiers)?.trigger).toMatchObject({ share: 12.5 });
+		expect(planModelCompactionPoint(settings, model, "0.5%", tiers)?.trigger).toMatchObject({ share: 1 });
+		// The reserve policy's share is the exact ratio, not a rounded percentage: 100k − 16,384 of 100k.
+		expect(planModelCompactionPoint(settings, model, "100k", tiers)?.trigger).toMatchObject({ share: 83.616 });
+	});
+
+	it("shows a fixed trigger at or past the window as capped at the window less its reserve", () => {
+		// A provider capping the window below the configured trigger (Factory serves Kimi K3 with 196,608).
+		const capped = { provider: "factory-droid", id: "kimi-k3", contextWindow: 196_608 } as Model;
+		const global = Settings.isolated({ "compaction.thresholdTokens": 300_000 });
+		const point = describeModelCompactionPoint(global, capped);
+		expect(point).toMatchObject({ tokens: 167_117, source: "global" });
+		expect(point.basis).toContain("capped by window");
+		const wide = { provider: "anthropic", id: "claude-opus-5-5", contextWindow: 1_000_000 } as Model;
+		expect(describeModelCompactionPoint(global, wide)).toMatchObject({ tokens: 300_000, basis: "fixed" });
+		// One token below the window is still the user's exact trigger.
+		const justBelow = Settings.isolated({ "compaction.thresholdTokens": 196_607 });
+		expect(describeModelCompactionPoint(justBelow, capped)).toMatchObject({ tokens: 196_607, basis: "fixed" });
+
+		// A prefix entry the model falls back to; an entry below the window stays exact.
+		const prefixed = Settings.isolated({ "compaction.modelThresholds": { "factory-droid/*": "f300000" } });
+		expect(planModelCompactionPoint(prefixed, capped, "", undefined)?.trigger).toEqual({
+			kind: "fixed",
+			tokens: 167_117,
+			cappedFrom: 300_000,
 		});
+		expect(planModelCompactionPoint(prefixed, capped, "f190k", undefined)?.trigger).toEqual({
+			kind: "fixed",
+			tokens: 190_000,
+		});
+	});
+
+	it("plans and saves a reset as the prefix entry the model falls back to", () => {
+		const settings = Settings.isolated({ extendedContext: false });
+		cfgCompactionModelThresholds.set(settings, { "openai/*": "f100000", "openai/gpt-5.6-terra": 400_000 });
 		const model = { provider: "openai", id: "gpt-5.6-terra", contextWindow: 1_050_000 } as Model;
 		const tiers = { standard: 272_000, extended: 1_050_000 };
-		expect(previewModelCompactionPoint(settings, model, "", tiers)).toBe("resets: compacts at exactly 100K");
+		expect(planModelCompactionPoint(settings, model, "", tiers)).toMatchObject({
+			reset: true,
+			trigger: { kind: "fixed", tokens: 100_000 },
+		});
+		expect(setModelCompactionPoint(settings, model, "", { tiers })).toMatchObject({
+			kind: "saved",
+			entry: undefined,
+			trigger: { kind: "fixed", tokens: 100_000 },
+		});
 	});
 });

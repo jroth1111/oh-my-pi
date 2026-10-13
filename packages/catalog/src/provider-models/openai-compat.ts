@@ -39,8 +39,17 @@ import {
 	type OpenAICompat,
 	type Provider,
 	type ThinkingConfig,
+	type TokenCost,
 } from "../types";
-import { discoveryFetch, isAnthropicOAuthToken, isRecord, toBoolean, toNumber, toPositiveNumber } from "../utils";
+import {
+	discoveryFetch,
+	isAnthropicOAuthToken,
+	isRecord,
+	toBoolean,
+	toNumber,
+	toPositiveNumber,
+	toPositiveNumberOrNull,
+} from "../utils";
 import { ALIBABA_TOKEN_PLAN_BASE_URL, parseAlibabaTokenPlanCredential } from "../wire/alibaba-token-plan";
 import { normalizeCharmHyperBaseUrl } from "../wire/charm-hyper";
 import { CLINEPASS_API_BASE_URL, clinePassClientHeaders } from "../wire/cline-pass";
@@ -547,6 +556,40 @@ function mapWithBundledReference<TApi extends Api>(
 		baseUrl: defaults.baseUrl,
 		contextWindow: toPositiveNumber(entry.context_length, reference.contextWindow),
 		maxTokens: toPositiveNumber(entry.max_completion_tokens, reference.maxTokens),
+	};
+}
+
+/**
+ * Rates from an OpenRouter-shaped `pricing` object (USD per token, as decimal
+ * strings). Missing, zero, or negative legs (`-1` marks router-priced rows)
+ * map to 0, which the model manager fills from its reference sources.
+ */
+function perTokenPricingCost(pricing: unknown): TokenCost {
+	const rates = isRecord(pricing) ? pricing : {};
+	return {
+		input: toPositiveNumber(rates.prompt, 0) * 1_000_000,
+		output: toPositiveNumber(rates.completion, 0) * 1_000_000,
+		cacheRead: toPositiveNumber(rates.input_cache_read, 0) * 1_000_000,
+		cacheWrite: toPositiveNumber(rates.input_cache_write, 0) * 1_000_000,
+	};
+}
+
+/**
+ * Rates from NanoGPT's detailed roster: prompt and completion are USD per
+ * million tokens, the cache legs per thousand. Legs the row does not price
+ * keep `fallback`.
+ */
+function nanoGptPricingCost(pricing: unknown, fallback: TokenCost): TokenCost {
+	if (!isRecord(pricing) || pricing.unit !== "per_million_tokens") return fallback;
+	const perThousand = (value: unknown, fallbackRate: number): number => {
+		const rate = toPositiveNumber(value, 0);
+		return rate > 0 ? rate * 1_000 : fallbackRate;
+	};
+	return {
+		input: toPositiveNumber(pricing.prompt, fallback.input),
+		output: toPositiveNumber(pricing.completion, fallback.output),
+		cacheRead: perThousand(pricing.cacheReadInputPer1kTokens, fallback.cacheRead),
+		cacheWrite: perThousand(pricing.cacheWriteInputPer1kTokens, fallback.cacheWrite),
 	};
 }
 
@@ -1071,8 +1114,8 @@ export interface OpenAIModelManagerConfig {
 	fetch?: FetchImpl;
 }
 
-export function openaiModelManagerOptions(config?: OpenAIModelManagerConfig): ModelManagerOptions<"openai-responses"> {
-	return createOpenAICompatibleModelManagerOptions({
+export function openaiModelManagerOptions(config?: OpenAIModelManagerConfig): ModelManagerOptions<Api> {
+	const options = createOpenAICompatibleModelManagerOptions({
 		api: "openai-responses",
 		providerId: "openai",
 		defaultBaseUrl: OPENAI_API_BASE_URL,
@@ -1081,6 +1124,30 @@ export function openaiModelManagerOptions(config?: OpenAIModelManagerConfig): Mo
 		filterModel: (_entry, model, references) => isLikelyOpenAIResponsesModelId(model.id, references),
 		mapModel: mapWithBundledReference,
 	});
+	const fetchDiscovered = options.fetchDynamicModels;
+	if (!fetchDiscovered) return options;
+	return {
+		...options,
+		fetchDynamicModels: async () => appendUnbundledSeedModels("openai", await fetchDiscovered()),
+	};
+}
+
+/**
+ * Append the authored seed rows that neither discovery nor the bundled catalog
+ * carries yet: a seed added since the last models.json regeneration (the
+ * Decisions judge row) reaches runtime through a successful discovery. Seeds
+ * already bundled keep resolving through the bundled slice, and the static
+ * catalog (and with it the cache fingerprint) stays the bundled one.
+ */
+function appendUnbundledSeedModels(
+	providerId: GeneratedProvider,
+	discovered: readonly ModelSpec<Api>[] | null,
+): readonly ModelSpec<Api>[] | null {
+	if (!discovered) return null;
+	const known = new Set(getBundledModels(providerId).map(model => model.id));
+	for (const model of discovered) known.add(model.id);
+	const seeds = seedModels(providerId).filter(seed => !known.has(seed.id));
+	return seeds.length === 0 ? discovered : [...discovered, ...seeds.map(seed => ({ ...seed }))];
 }
 
 /**
@@ -3298,8 +3365,8 @@ function openCodeModelManagerOptions(
 			},
 		},
 		...(apiKey && {
-			fetchDynamicModels: () =>
-				fetchOpenAICompatibleModels<Api>({
+			fetchDynamicModels: async () => {
+				const discovered = await fetchOpenAICompatibleModels<Api>({
 					api: "openai-completions",
 					provider: providerId,
 					baseUrl: discoveryBaseUrl,
@@ -3357,7 +3424,12 @@ function openCodeModelManagerOptions(
 						};
 					},
 					fetch: config?.fetch,
-				}),
+				});
+				if (!discovered) return null;
+				const seeds = seedModels(providerId).map(seed => ({ ...seed, baseUrl: basePath }));
+				const seedIds = new Set(seeds.map(seed => seed.id));
+				return [...discovered.filter(model => !seedIds.has(model.id)), ...seeds];
+			},
 		}),
 	};
 }
@@ -3450,8 +3522,9 @@ export interface OpenRouterModelManagerConfig {
  * OpenRouter's Decisions API lives at `/api/alpha`, a sibling of the `/api/v1`
  * chat root; derive it so a custom gateway base URL keeps both aligned.
  */
-function openrouterDecisionsBaseUrl(chatBaseUrl: string): string {
-	return chatBaseUrl.endsWith("/v1") ? `${chatBaseUrl.slice(0, -"/v1".length)}/alpha` : `${chatBaseUrl}/alpha`;
+export function openrouterDecisionsBaseUrl(chatBaseUrl: string): string {
+	const base = chatBaseUrl.replace(/\/+$/g, "");
+	return base.endsWith("/v1") ? `${base.slice(0, -"/v1".length)}/alpha` : `${base}/alpha`;
 }
 
 function mapOpenRouterThinking(entry: OpenAICompatibleModelRecord): ThinkingConfig | undefined {
@@ -3862,6 +3935,7 @@ export function kiloModelManagerOptions(config?: KiloModelManagerConfig): ModelM
 				provider: "kilo",
 				baseUrl,
 				apiKey,
+				mapModel: (entry, defaults) => ({ ...defaults, cost: perTokenPricingCost(entry.pricing) }),
 				fetch: config?.fetch,
 			}),
 	};
@@ -4696,7 +4770,9 @@ function museSparkLineageSpec(id: string): ModelSpec<"openai-responses"> | undef
 	let templateRevision: readonly [number, number, number] | undefined;
 	for (const model of seedModels<"openai-responses">("meta")) {
 		if ((billingVariantPlain(model.id) !== undefined) !== contributor) continue;
-		const candidate = parseRevision(classifyModel("meta", model.id, { lenient: true }).revision ?? "");
+		const seedIdentity = classifyModel("meta", model.id, { lenient: true });
+		if (seedIdentity.family !== "muse-spark") continue;
+		const candidate = parseRevision(seedIdentity.revision ?? "");
 		if (candidate === undefined) continue;
 		if (templateRevision === undefined || compareRevision(candidate, templateRevision) > 0) {
 			template = model;
@@ -6251,10 +6327,29 @@ export function nanoGptModelManagerOptions(
 					provider: "nanogpt",
 					baseUrl,
 					apiKey,
+					// Only the detailed roster carries per-model pricing, names, and limits.
+					query: { detailed: "true" },
 					mapModel: (entry, defaults) => {
 						const reference = resolveReference(defaults.id);
-						const mapped = mapWithBundledReference(entry, defaults, reference);
-						return { ...mapped, api: "openai-completions", provider: "nanogpt" };
+						// The detailed roster names its output cap `max_output_tokens`.
+						const maxOutputTokens = entry.max_output_tokens ?? entry.max_completion_tokens;
+						const mapped = mapWithBundledReference(
+							{ ...entry, max_completion_tokens: maxOutputTokens },
+							reference
+								? defaults
+								: {
+										...defaults,
+										contextWindow: toPositiveNumberOrNull(entry.context_length),
+										maxTokens: toPositiveNumberOrNull(maxOutputTokens),
+									},
+							reference,
+						);
+						return {
+							...mapped,
+							api: "openai-completions",
+							provider: "nanogpt",
+							cost: { ...mapped.cost, ...nanoGptPricingCost(entry.pricing, mapped.cost) },
+						};
 					},
 					filterModel: (_entry, model) => {
 						const match = NANO_GPT_THINKING_SUFFIX_RE.exec(model.id);

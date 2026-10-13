@@ -5,6 +5,17 @@
 ### Added
 
 - Added an optional `connectivity` field on retry-start events to distinguish provider-connection waits from ordinary API retries ([#14380](https://github.com/can1357/oh-my-pi/pull/14380) by [@jroth1111](https://github.com/jroth1111)).
+## [18.10.2] - 2026-10-12
+
+### Added
+
+- Added `TspPickerMark.icon`: an icon a picker mark draws instead of its initials when the terminal has it (`provider:<id>` names a model provider's logo)
+
+## [18.8.8] - 2026-10-10
+
+### Added
+
+- Added `TspToolProps.command` (the command line Copy command copies), `TspToolProps.preview: "children"` (the collapsed body stays whole while its children clamp) and `TspCodeProps.preview`
 
 ## [18.8.0] - 2026-10-07
 

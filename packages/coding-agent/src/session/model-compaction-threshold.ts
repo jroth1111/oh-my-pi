@@ -42,10 +42,10 @@ export function describeModelCompactionPoint(scope: ScopeLike, model: Model): Mo
 	const match = matchModelCompactionThreshold(thresholds, model);
 	const settings = applyModelCompactionThreshold(configured, thresholds, model);
 	const contextWindow = model.contextWindow ?? 0;
-	const trigger = settings.enabled && contextWindow > 0 ? describeTrigger(settings, contextWindow) : undefined;
+	const trigger = settings.enabled && contextWindow > 0 ? resolveTrigger(settings, contextWindow) : undefined;
 	return {
 		tokens: trigger?.tokens,
-		basis: trigger?.basis,
+		basis: trigger && formatBasis(trigger),
 		source: match?.key ?? (configured.thresholdTokens > 0 || configured.thresholdPercent > 0 ? "global" : "default"),
 		draft: match?.key === `${model.provider}/${model.id}` ? formatCompactionPointInput(match.threshold) : undefined,
 	};
@@ -57,16 +57,43 @@ function formatWindow(tokens: number): string {
 }
 
 /**
- * Where `settings` compacts on `window`, and why in a few words: `fixed`, or
- * the share of what it scales (`85% of 400K base`, `80% of window`).
+ * Where a compaction policy triggers on a window, and why: at a `fixed` token
+ * count (`cappedFrom` the configured count when it is at or past the window,
+ * which then compacts at the window less its reserve), or `scaled` to `share`
+ * percent of `scaledFrom` (the entry's base when `fromBase`, else the window).
+ * `share` is the configured percentage when one applies, else the reserve
+ * policy's exact share, so fractions survive.
  */
-function describeTrigger(settings: CompactionSettings, window: number): { tokens: number; basis: string } {
+export type ModelCompactionTrigger =
+	| { kind: "fixed"; tokens: number; cappedFrom?: number }
+	| { kind: "scaled"; tokens: number; share: number; scaledFrom: number; fromBase: boolean };
+
+function resolveTrigger(settings: CompactionSettings, window: number): ModelCompactionTrigger {
 	const tokens = resolveThresholdTokens(window, settings);
-	if (settings.thresholdTokens > 0) return { tokens, basis: "fixed" };
+	if (settings.thresholdTokens > 0) {
+		// Capped exactly when `resolveThresholdTokens` lowered it, whatever its boundary.
+		return tokens < settings.thresholdTokens
+			? { kind: "fixed", tokens, cappedFrom: settings.thresholdTokens }
+			: { kind: "fixed", tokens };
+	}
 	const base = settings.baseWindowTokens;
-	const scaled = base !== undefined && base > 0 && base < window ? base : window;
-	const share = `${Math.round((tokens / scaled) * 100)}%`;
-	return { tokens, basis: scaled === window ? `${share} of window` : `${share} of ${formatWindow(scaled)} base` };
+	const fromBase = base !== undefined && base > 0 && base < window;
+	const scaledFrom = fromBase ? base : window;
+	// Mirrors `resolveThresholdTokens`' clamp of a configured percentage.
+	const share =
+		settings.thresholdPercent > 0
+			? Math.min(99, Math.max(1, settings.thresholdPercent))
+			: (tokens / scaledFrom) * 100;
+	return { kind: "scaled", tokens, share, scaledFrom, fromBase };
+}
+
+/** Why a trigger sits where it does, in a few words: `fixed`, `fixed 300K, capped by window`, `85% of 400K base`, `12.5% of window`. */
+function formatBasis(trigger: ModelCompactionTrigger): string {
+	if (trigger.kind === "fixed") {
+		return trigger.cappedFrom === undefined ? "fixed" : `fixed ${formatWindow(trigger.cappedFrom)}, capped by window`;
+	}
+	const share = `${trigger.share.toLocaleString("en-US", { maximumFractionDigits: 1 })}%`;
+	return trigger.fromBase ? `${share} of ${formatWindow(trigger.scaledFrom)} base` : `${share} of window`;
 }
 
 /**
@@ -130,28 +157,30 @@ function describeModelCompactionEntry(threshold: CompactionThresholdPair): strin
 	return threshold.fixed ? `fixed at ${tokens} tokens` : `${tokens}-token base`;
 }
 
+/** Where the plan compacts; undefined when auto-compaction is off or the window is unknown. */
+function planTrigger(plan: ModelCompactionEntryPlan): ModelCompactionTrigger | undefined {
+	if (!plan.settings.enabled || plan.window === undefined || plan.window <= 0) return undefined;
+	return resolveTrigger(plan.settings, plan.window);
+}
+
 /** Where the plan compacts, as one short line: `compacts at 340K · 85% of 400K base`. */
 function summarizePlan(plan: ModelCompactionEntryPlan): string | undefined {
 	if (!plan.settings.enabled) return "auto-compaction is off";
-	if (plan.window === undefined || plan.window <= 0) return undefined;
-	const trigger = describeTrigger(plan.settings, plan.window);
-	return trigger.basis === "fixed"
-		? `compacts at exactly ${formatWindow(trigger.tokens)}`
-		: `compacts at ${formatWindow(trigger.tokens)} · ${trigger.basis}`;
+	const trigger = planTrigger(plan);
+	if (!trigger) return undefined;
+	if (trigger.kind === "fixed" && trigger.cappedFrom === undefined) {
+		return `compacts at exactly ${formatWindow(trigger.tokens)}`;
+	}
+	return `compacts at ${formatWindow(trigger.tokens)} · ${formatBasis(trigger)}`;
 }
 
-/**
- * Live preview of a typed compaction limit for the hub field: where `model`
- * would compact with it (`compacts at 340K · 85% of 400K base`), or with no
- * entry for empty input. Undefined for input that does not parse or fit, which
- * {@link setModelCompactionPoint} reports on submit.
- */
-export function previewModelCompactionPoint(
+/** Parse and plan typed hub input; undefined when it does not parse or fit. */
+function planInput(
 	settings: Settings,
 	model: Model,
 	input: string,
 	tiers: ContextWindowTiers | undefined,
-): string | undefined {
+): { reset: boolean; plan: ModelCompactionEntryPlan } | undefined {
 	let entry: number | string | null;
 	try {
 		entry = parseCompactionPointInput(input);
@@ -159,19 +188,60 @@ export function previewModelCompactionPoint(
 		return undefined;
 	}
 	const plan = planModelCompactionEntry(settings, model, entry ?? undefined, tiers);
-	if (plan.error) return undefined;
-	const summary = summarizePlan(plan);
-	return entry === null && summary ? `resets: ${summary}` : summary;
+	return plan.error ? undefined : { reset: entry === null, plan };
+}
+
+/**
+ * What a typed compaction limit would do to `model`: the window it runs on and
+ * where it compacts (`trigger` undefined when auto-compaction is off), or with
+ * no entry for empty input (`reset`). Undefined for input that does not parse
+ * or fit, which {@link setModelCompactionPoint} reports on submit.
+ */
+export function planModelCompactionPoint(
+	settings: Settings,
+	model: Model,
+	input: string,
+	tiers: ContextWindowTiers | undefined,
+): { reset: boolean; window: number | undefined; trigger: ModelCompactionTrigger | undefined } | undefined {
+	const planned = planInput(settings, model, input, tiers);
+	if (!planned) return undefined;
+	return { reset: planned.reset, window: planned.plan.window, trigger: planTrigger(planned.plan) };
+}
+
+/**
+ * Live preview line of a typed compaction limit for the hub field
+ * ({@link planModelCompactionPoint} in words): `compacts at 340K · 85% of 400K
+ * base`, prefixed `resets:` for empty input.
+ */
+export function previewModelCompactionPoint(
+	settings: Settings,
+	model: Model,
+	input: string,
+	tiers: ContextWindowTiers | undefined,
+): string | undefined {
+	const planned = planInput(settings, model, input, tiers);
+	if (!planned) return undefined;
+	const summary = summarizePlan(planned.plan);
+	return planned.reset && summary ? `resets: ${summary}` : summary;
 }
 
 /**
  * Outcome of {@link setModelCompactionPoint}: the entry written (`undefined` =
  * removed), that entry in words (`400,000-token base`, `reset`), and where the
- * model now compacts; or a warning to acknowledge first.
+ * model now compacts (`trigger`, and `summary` in words); or, before writing an
+ * entry that opens `extendedWindow`, a warning to acknowledge first, with
+ * `premiumFrom` set when compaction would let input reach that long-context
+ * price tier.
  */
 export type ModelCompactionPointUpdate =
-	| { kind: "saved"; entry: number | string | undefined; described: string; summary: string | undefined }
-	| { kind: "confirm"; message: string };
+	| {
+			kind: "saved";
+			entry: number | string | undefined;
+			described: string;
+			trigger: ModelCompactionTrigger | undefined;
+			summary: string | undefined;
+	  }
+	| { kind: "confirm"; message: string; extendedWindow: number; premiumFrom?: number };
 
 /**
  * Persist `input` (see {@link parseCompactionPointInput}) as `model`'s own
@@ -210,13 +280,16 @@ export function setModelCompactionPoint(
 	if (tiers && plan.opensExtended && !options.confirmed && !cfgExtendedContext.get(settings)) {
 		// Pricing follows where compaction actually triggers: the fixed point, or the policy scaled from the base.
 		const trigger = resolveThresholdTokens(tiers.extended, plan.settings);
-		const premiumThreshold = model.cost.longContext?.inputThreshold;
-		const pricing =
-			premiumThreshold !== undefined && trigger > premiumThreshold
-				? `; >${formatWindow(premiumThreshold)} costs more`
-				: "";
+		const threshold = model.cost.longContext?.inputThreshold;
+		const premiumFrom = threshold !== undefined && trigger > threshold ? threshold : undefined;
+		const pricing = premiumFrom !== undefined ? `; >${formatWindow(premiumFrom)} costs more` : "";
 		// Kept short: the hub shows it on one line beside the input field.
-		return { kind: "confirm", message: `Opens ${formatWindow(tiers.extended)} window${pricing}` };
+		return {
+			kind: "confirm",
+			message: `Opens ${formatWindow(tiers.extended)} window${pricing}`,
+			extendedWindow: tiers.extended,
+			...(premiumFrom !== undefined ? { premiumFrom } : {}),
+		};
 	}
 	cfgCompactionModelThresholds.setEntry(settings, key, entry);
 	const effective = cfgCompactionModelThresholds.get(settings)[key] ?? undefined;
@@ -230,6 +303,7 @@ export function setModelCompactionPoint(
 		kind: "saved",
 		entry,
 		described: threshold ? describeModelCompactionEntry(threshold) : "reset",
+		trigger: planTrigger(plan),
 		summary: summarizePlan(plan),
 	};
 }

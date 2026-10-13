@@ -194,20 +194,23 @@ describe("AgentSession connection wait", () => {
 		expect(active.isRetrying).toBe(false);
 	});
 
-	it("closes and evicts retained Responses transport state before reconnecting", async () => {
+	it("closes retained Responses transport state before the reconnect request", async () => {
 		let calls = 0;
+		const close = vi.fn();
 		const responsesModel: Model = { ...model, api: "openai-responses" };
 		const { active } = createSession(
-			() => (++calls === 1 ? { throw: "ECONNRESET" } : { content: ["fresh transport"] }),
+			() => {
+				if (++calls === 1) return { throw: "ECONNRESET" };
+				expect(close).toHaveBeenCalledTimes(1);
+				return { content: ["fresh transport"] };
+			},
 			{ model: responsesModel },
 		);
-		const close = vi.fn();
 		active.providerSessionState.set(`openai-responses:${model.provider}`, { close });
 		mockSchedulerWaitWithClock();
 		await active.prompt("Retire the stale connection");
 		await active.waitForIdle();
 		expect(close).toHaveBeenCalledTimes(1);
-		expect(active.providerSessionState.has(`openai-responses:${model.provider}`)).toBe(false);
 		expect(calls).toBe(2);
 	});
 

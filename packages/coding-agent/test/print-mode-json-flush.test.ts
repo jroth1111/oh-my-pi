@@ -53,6 +53,7 @@ function createFlushHarness(finalMessage?: AssistantMessage): FlushHarness {
 			await promptReleased;
 			return true;
 		},
+		disableStopTimeTodoReminders: () => {},
 		prepareForHeadlessAdvisorDrain: () => {
 			advisorDrainPrepared = true;
 		},
