@@ -13,6 +13,15 @@
 - Explicit native Opus effort-tier selectors retain their selected reasoning level, including the low tier.
 - Added Cursor Auto gateway precedence and routed-model RPC events across generated SDKs ([#10099](https://github.com/can1357/oh-my-pi/pull/10099) by [@jroth1111](https://github.com/jroth1111)).
 - Added Grok Bot login and model selection, including advertised aliases and literal bracketed selectors ([#10175](https://github.com/can1357/oh-my-pi/pull/10175) by [@jroth1111](https://github.com/jroth1111)).
+- The composer stays usable while a tool approval is pending: sending a message denies the call and steers the turn with it, so the agent knows why it was denied ([#15642](https://github.com/can1357/oh-my-pi/pull/15642) by [@H4vC](https://github.com/H4vC))
+
+### Changed
+
+- The in-composer tool approval prompt summarizes the command, path, or content to one row so the composer keeps its room; `Ctrl+O` shows them in full ([#15642](https://github.com/can1357/oh-my-pi/pull/15642) by [@H4vC](https://github.com/H4vC))
+### Changed
+
+- Background task guidance now lives in the Task tool description (and in same-name extension replacements that delegate to Task) instead of being repeated in every spawn acknowledgment ([#15477](https://github.com/can1357/oh-my-pi/pull/15477) by [@iliaal](https://github.com/iliaal))
+
 ## [18.10.4] - 2026-10-13
 
 ### Added
