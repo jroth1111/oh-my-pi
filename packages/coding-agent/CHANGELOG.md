@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserve explicit user cancellation when TODOs round-trip through the Python SDK ([#10053](https://github.com/can1357/oh-my-pi/pull/10053) by [@jroth1111](https://github.com/jroth1111)).
+
 ### Added
 
 - Added `/grokbot` status with configured credential/backend precedence and secret-redacted terminal output ([#10175](https://github.com/can1357/oh-my-pi/pull/10175) by [@jroth1111](https://github.com/jroth1111)).
