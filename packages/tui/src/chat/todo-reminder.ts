@@ -16,30 +16,43 @@ export class TodoReminderComponent extends Container {
 	readonly #notice: MessageNoticeComponent;
 	readonly #todos: TodoItem[];
 	readonly #note: string;
+	readonly #unverifiedMerge: boolean;
 	#hidden = false;
 
-	constructor(todos: TodoItem[], attempt: number, maxAttempts: number) {
+	constructor(todos: TodoItem[], attempt: number, maxAttempts: number, unverifiedMerge = false) {
 		super();
 		this.#todos = todos;
-		this.#note = `reminder ${attempt}/${maxAttempts}`;
+		this.#unverifiedMerge = unverifiedMerge;
+		const suffix = `reminder ${attempt}/${maxAttempts}`;
+		this.#note = unverifiedMerge ? `${suffix} - unverified merge` : suffix;
 		const count = todos.length;
-		const header = `${count} incomplete ${count === 1 ? "todo" : "todos"} - reminder ${attempt}/${maxAttempts}`;
+		const label = count === 1 ? "todo" : "todos";
+		const header = unverifiedMerge
+			? count > 0
+				? `${count} incomplete ${label} + unverified merge - ${suffix}`
+				: `merged changes need verification - ${suffix}`
+			: `${count} incomplete ${label} - ${suffix}`;
+		const verificationOnly = unverifiedMerge && count === 0;
+		const verificationInstruction = "run the parent verification (tests/checks) before settling";
 		this.#notice = new MessageNoticeComponent({
 			presentation: () => {
 				const todoList = todos.map(todo => `  ${theme.checkbox.unchecked} ${todo.content}`).join("\n");
-				return { icon: theme.icon.warning, header, body: new Text(theme.italic(todoList), 0, 0) };
+				const bodyText = verificationOnly ? verificationInstruction : todoList;
+				return { icon: theme.icon.warning, header, body: new Text(theme.italic(bodyText), 0, 0) };
 			},
 			nativePresentation: () => ({
 				head: [span(`${theme.icon.warning} ${header}`)],
-				body: [
-					node(
-						"list",
-						{},
-						todos.map((todo, index) =>
-							node("item", { label: [span(todo.content, "em")], tone: "pending" }, [], `t${index}`),
-						),
-					),
-				],
+				body: verificationOnly
+					? [node("text", { text: verificationInstruction })]
+					: [
+							node(
+								"list",
+								{},
+								todos.map((todo, index) =>
+									node("item", { label: [span(todo.content, "em")], tone: "pending" }, [], `t${index}`),
+								),
+							),
+						],
 			}),
 			role: "omp.notice.todo",
 		});
@@ -53,7 +66,8 @@ export class TodoReminderComponent extends Container {
 
 	/** A `checklist` reminder of the open items where the terminal lists the kind (§7.5); else the notice card. */
 	override describe(cx?: DescribeContext): NativeNode {
-		if (cx?.supports("checklist") !== true) return this.#notice.describe();
+		if (cx?.supports("checklist") !== true || (this.#unverifiedMerge && this.#todos.length === 0))
+			return this.#notice.describe();
 		const phases = todoChecklistPhases([{ name: "", tasks: this.#todos }]);
 		return withHidden(
 			node("checklist", { mode: "reminder", phases, note: this.#note, role: "omp.notice.todo" }),

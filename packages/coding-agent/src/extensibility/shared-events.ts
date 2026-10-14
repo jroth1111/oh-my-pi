@@ -314,6 +314,7 @@ export interface TodoReminderEvent {
 	todos: TodoItem[];
 	attempt: number;
 	maxAttempts: number;
+	unverifiedMerge?: boolean;
 }
 
 // ============================================================================

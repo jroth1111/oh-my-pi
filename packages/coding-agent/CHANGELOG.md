@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- Preserve parent-verification warnings on native TODO notices, including merges with no unfinished TODOs ([#10054](https://github.com/can1357/oh-my-pi/pull/10054) by [@jroth1111](https://github.com/jroth1111)).
+
+### Fixed
+
 - Preserve explicit user cancellation when TODOs round-trip through the Python SDK ([#10053](https://github.com/can1357/oh-my-pi/pull/10053) by [@jroth1111](https://github.com/jroth1111)).
 
 ### Added
