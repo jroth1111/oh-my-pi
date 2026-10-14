@@ -56,6 +56,13 @@ if (!globalThis.__omp_js_prelude_loaded__) {
 
 	const read = async (path, opts, ...rest) => {
 		const options = optionsArg("read", opts, rest, ["offset", "limit"], "{ offset, limit }");
+		if (typeof path === "string" && /^artifact:\/\/\d+$/i.test(path)) {
+			const rawPath = withReadLineSelector(`${path}:raw`, options);
+			if (rawPath === null) return "";
+			const text = callHelper("hasRoot", path) ? await callHelper("read", path, options) : undefined;
+			// Another session's, or no artifacts dir was injected: the read tool searches every registered one.
+			return text ?? readToolText(rawPath);
+		}
 		if (shouldDelegateRead(path)) {
 			const toolPath = withReadLineSelector(path, options);
 			return toolPath === null ? "" : readToolText(toolPath);
@@ -439,8 +446,8 @@ if (!globalThis.__omp_js_prelude_loaded__) {
 				"agent",
 				opts,
 				rest,
-				["agent", "label", "schema", "isolated", "apply", "merge", "schemaMode", "tools", "model"],
-				"{ agent, label, schema, schemaMode, isolated, apply, merge, tools, model }",
+				["agent", "label", "schema", "isolated", "apply", "merge", "schemaMode", "tools"],
+				"{ agent, label, schema, schemaMode, isolated, apply, merge, tools }",
 			);
 			const result = await globalThis.__omp_call_tool__("__agent__", { prompt, ...options });
 			if (!result || typeof result.id !== "string") throw new Error("agent() did not return a handle");
@@ -503,8 +510,8 @@ if (!globalThis.__omp_js_prelude_loaded__) {
 			"workpool",
 			opts,
 			rest,
-			["name", "context", "tools", "model"],
-			"{ name, context, tools, model }",
+			["name", "context", "tools"],
+			"{ name, context, tools }",
 		);
 		const result = await globalThis.__omp_call_tool__("__workpool__", {
 			op: "create",

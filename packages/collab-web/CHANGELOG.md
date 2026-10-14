@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [18.8.0] - 2026-10-07
+
+### Changed
+
+- Improved streaming transcript performance by reducing unnecessary guest updates and Markdown re-rendering, including faster rendering for transcripts with many unclosed LaTeX delimiters.
+- Stopped tracking finished or no-longer-listed subagents, reducing unnecessary polling and memory usage in the agent drawer.
+### Added
+
+- Shared sessions now show explicit provider-connection waits as informational state instead of a zero-denominator retry counter ([#14380](https://github.com/can1357/oh-my-pi/pull/14380) by [@jroth1111](https://github.com/jroth1111)).
+
 ## [18.4.10] - 2026-10-02
 
 ### Fixed

@@ -1,5 +1,4 @@
 import type { ReadToolDetails } from "@oh-my-pi/pi-tui/tools/read";
-import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { type EditStore, notebookToEditableText } from "@oh-my-pi/pi-natives";
@@ -56,7 +55,12 @@ import {
 	truncateHeadBytes,
 	truncateLine,
 } from "@oh-my-pi/pi-tui/tools/streaming-output";
-import { buildLineEntriesWithBlockContext, lineEntriesToPlainText } from "../utils/block-context";
+import {
+	buildLineEntriesWithBlockContext,
+	lineEntriesToPlainText,
+	spansCoverEveryLine,
+	warmBlockContext,
+} from "../utils/block-context";
 import { isCpuProfilePath, renderCpuProfile } from "../utils/cpuprofile";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import { loadImageInput, loadSvgImageInput } from "../utils/image-loading";
@@ -85,6 +89,7 @@ import {
 	formatPathRelativeToCwd,
 	probeLiteralPathExists,
 	resolveReadPathAsync,
+	specialFileKind,
 	splitDelimitedPathEntry,
 	splitMixedUrlPathList,
 	splitPathAndSelPreferringLiteral,
@@ -123,6 +128,7 @@ import {
 	type SuffixMatchCache,
 } from "./read-path-resolution";
 import { type PdfImageReadTarget, renderPdfPageScreenshot, splitPdfImageReadPath } from "./read-pdf";
+import { ternShowsMedia } from "./tern-media";
 import { formatDimensionNote, resizeImage } from "../utils/image-resize";
 import {
 	VideoError,
@@ -149,6 +155,7 @@ import {
 import { splitAddressableFileLines } from "@oh-my-pi/pi-tui/tools/hashline-format";
 import { readBinary, resolveBinaryViewPath } from "./read-binary";
 import { readSqlite, resolveSqliteReadPath } from "./read-sqlite";
+import { readJson, resolveJsonReadPath, splitJsonQueryTarget } from "./read-json";
 import {
 	getReadTextFileBridge,
 	isProseSummaryPath,
@@ -301,6 +308,18 @@ function formatOmittedRequestedLineNotice(
 	)} and could not fit after preceding context in the ${formatBytes(maxBytes)} read budget. Use ${rawTarget} to read that line without context (byte-capped if it exceeds the budget), or widen the requested range to increase the budget.]`;
 }
 
+/** Column-cap cuts of one read: the cap and the first-to-last cut line, for the `:raw` recovery notice. */
+interface ColumnCut {
+	maxColumn: number;
+	first: number;
+	last: number;
+}
+
+function addColumnCut(cut: ColumnCut | undefined, maxColumn: number, lineNumber: number): ColumnCut {
+	if (!cut) return { maxColumn, first: lineNumber, last: lineNumber };
+	return { maxColumn, first: Math.min(cut.first, lineNumber), last: Math.max(cut.last, lineNumber) };
+}
+
 /**
  * Slice the window {@link streamLinesFromFile} would have collected out of an
  * already-buffered file, under the identical line and byte budgets.
@@ -399,9 +418,32 @@ function collectLineWindowFromBuffer(
 	return window;
 }
 
+/** What a seek offset was measured against; a file that no longer matches is rescanned from byte zero. */
+interface SeekFileIdentity {
+	ino: number;
+	size: number;
+	mtimeMs: number;
+	ctimeMs: number;
+}
+
+function sameSeekFileIdentity(identity: SeekFileIdentity, stat: SeekFileIdentity): boolean {
+	return (
+		identity.ino === stat.ino &&
+		identity.size === stat.size &&
+		identity.mtimeMs === stat.mtimeMs &&
+		identity.ctimeMs === stat.ctimeMs
+	);
+}
+
 interface StreamFileLinesOptions {
 	includeTerminalNewline?: boolean;
 	stopScanAfterCollect?: boolean;
+	/**
+	 * Start scanning at byte `byte`, which begins 0-indexed line `line` (`line <= startLine`).
+	 * Lines before `startLine` contribute nothing but their count, so skipping them is exact.
+	 * Ignored (full scan) when the opened file no longer matches `identity`.
+	 */
+	seek?: { line: number; byte: number; identity: SeekFileIdentity };
 }
 
 async function streamLinesFromFile(
@@ -413,10 +455,11 @@ async function streamLinesFromFile(
 	signal?: AbortSignal,
 	options: StreamFileLinesOptions = {},
 ): Promise<ReadLineWindow> {
-	const { includeTerminalNewline = false, stopScanAfterCollect = false } = options;
+	const { includeTerminalNewline = false, stopScanAfterCollect = false, seek } = options;
 	const bufferChunk = Buffer.allocUnsafe(READ_CHUNK_SIZE);
 	const collectedLines: string[] = [];
-	let lineIndex = 0;
+	let lineIndex = seek?.line ?? 0;
+	let position = seek?.byte ?? 0;
 	let collectedBytes = 0;
 	let selectedBytes = 0;
 	let stoppedByByteLimit = false;
@@ -425,9 +468,13 @@ async function streamLinesFromFile(
 	let reachedEof = true;
 	let fileHandle: fs.FileHandle | null = null;
 	let currentLineLength = 0;
+	/** Copies of the current line's parts from earlier chunks. */
 	let currentLineChunks: Buffer[] = [];
-	let sawAnyByte = false;
-	let endedWithNewline = false;
+	/** The current line's part in this chunk: a view into the reused read buffer, copied only if the line continues. */
+	let pendingSegment: Buffer | undefined;
+	// A seek lands just past an LF, so the bytes it skipped already end in a newline.
+	let sawAnyByte = position > 0;
+	let endedWithNewline = position > 0;
 	let firstLinePreviewBytes = 0;
 	const firstLinePreviewChunks: Buffer[] = [];
 	let firstLineByteLength: number | undefined;
@@ -452,9 +499,8 @@ async function streamLinesFromFile(
 
 	const decodeLine = (): string => {
 		if (currentLineLength === 0) return "";
-		if (currentLineChunks.length === 1 && currentLineChunks[0]?.length === currentLineLength) {
-			return currentLineChunks[0].toString("utf-8");
-		}
+		if (currentLineChunks.length === 0) return pendingSegment?.toString("utf-8") ?? "";
+		if (pendingSegment) currentLineChunks.push(pendingSegment);
 		return Buffer.concat(currentLineChunks, currentLineLength).toString("utf-8");
 	};
 
@@ -468,12 +514,12 @@ async function streamLinesFromFile(
 		firstLinePreviewBytes += slice.length;
 	};
 
-	const appendSegment = (segment: Uint8Array) => {
+	const appendSegment = (segment: Buffer) => {
 		currentLineLength += segment.length;
 		maybeCapturePreview(segment);
 		if (!captureLine || discardLineChunks || segment.length === 0) return;
 		if (currentLineLength <= lineCaptureLimit) {
-			currentLineChunks.push(Buffer.from(segment));
+			pendingSegment = segment;
 		} else {
 			discardLineChunks = true;
 		}
@@ -521,6 +567,7 @@ async function streamLinesFromFile(
 		lineIndex++;
 		currentLineLength = 0;
 		currentLineChunks = [];
+		pendingSegment = undefined;
 		setupLineState();
 	};
 
@@ -528,10 +575,19 @@ async function streamLinesFromFile(
 
 	try {
 		fileHandle = await fs.open(filePath, "r");
+		// Offsets from an earlier scan only hold for the same, unchanged file.
+		if (seek && !sameSeekFileIdentity(seek.identity, await fileHandle.stat())) {
+			lineIndex = 0;
+			position = 0;
+			sawAnyByte = false;
+			endedWithNewline = false;
+			setupLineState();
+		}
 
 		while (true) {
 			throwIfAborted(signal);
-			const { bytesRead } = await fileHandle.read(bufferChunk, 0, bufferChunk.length, null);
+			const { bytesRead } = await fileHandle.read(bufferChunk, 0, bufferChunk.length, position);
+			position += bytesRead;
 			if (bytesRead === 0) break;
 
 			sawAnyByte = true;
@@ -563,19 +619,21 @@ async function streamLinesFromFile(
 			}
 
 			let start = 0;
-			for (let i = 0; i < chunk.length; i++) {
-				if (chunk[i] === 0x0a) {
-					const segment = chunk.subarray(start, i);
-					if (segment.length > 0) {
-						appendSegment(segment);
-					}
-					finalizeLine();
-					start = i + 1;
+			for (let newlineAt = chunk.indexOf(0x0a); newlineAt !== -1; newlineAt = chunk.indexOf(0x0a, start)) {
+				if (newlineAt > start) {
+					appendSegment(chunk.subarray(start, newlineAt));
 				}
+				finalizeLine();
+				start = newlineAt + 1;
 			}
 
 			if (start < chunk.length) {
 				appendSegment(chunk.subarray(start));
+			}
+			if (pendingSegment) {
+				// The line continues into the next read, which reuses the buffer.
+				currentLineChunks.push(Buffer.from(pendingSegment));
+				pendingSegment = undefined;
 			}
 		}
 	} finally {
@@ -608,23 +666,81 @@ async function streamLinesFromFile(
 	};
 }
 
+/** Byte reads of the newline-counting tail scan. */
+const TAIL_SCAN_CHUNK_SIZE = 64 * 1024;
+/** Most trailing line starts a tail scan retains; longer tails rescan from the top of the file. */
+const TAIL_SEEK_MAX_LINES = 64 * 1024;
+
+/** A resolved `:-N` selector, plus where the window starts in an unbuffered file when known. */
+interface ResolvedFileTail {
+	sel: ResolvedSelector;
+	/** Streamer seek for a window starting at 0-indexed `line`, when the tail scan retained its offset. */
+	seekTo?: (line: number) => StreamFileLinesOptions["seek"];
+}
+
 /**
  * Pin a `:-N` tail selector against a file's line count. Buffered files count
- * their already-split lines; larger files take one newline-counting pass with
- * zero line/byte budget so {@link streamLinesFromFile} retains nothing.
+ * their already-split lines; larger files take one native newline-counting
+ * pass that also keeps the byte offsets of the last lines, so the window read
+ * can seek straight to them instead of rescanning the whole file. The count
+ * matches {@link streamLinesFromFile}'s `totalFileLines` exactly.
  */
 async function resolveFileTailSelector(
 	parsed: ParsedSelector,
 	filePath: string,
 	buffered: BufferedFileText | undefined,
 	signal?: AbortSignal,
-): Promise<ResolvedSelector> {
-	if (parsed.kind !== "tail") return parsed;
+): Promise<ResolvedFileTail> {
+	if (parsed.kind !== "tail") return { sel: parsed };
 	const includeTerminalNewline = parsed.raw === true;
-	const totalLines = buffered
-		? collectLineWindowFromBuffer(buffered, 0, 0, 0, 0, includeTerminalNewline).totalFileLines
-		: (await streamLinesFromFile(filePath, 0, 0, 0, 0, signal, { includeTerminalNewline })).totalFileLines;
-	return resolveTailSelector(parsed, totalLines);
+	if (buffered) {
+		const totalLines = collectLineWindowFromBuffer(buffered, 0, 0, 0, 0, includeTerminalNewline).totalFileLines;
+		return { sel: resolveTailSelector(parsed, totalLines) };
+	}
+
+	// The window starts at most `count` lines plus leading context before EOF.
+	const wanted = parsed.count + RANGE_LEADING_CONTEXT_LINES + 1;
+	const keep = wanted <= TAIL_SEEK_MAX_LINES ? wanted : 0;
+	// `starts[k % keep]` holds the byte offset of line `k` (k >= 1) for the last `keep` lines.
+	const starts = new Float64Array(keep);
+	const chunk = Buffer.allocUnsafe(TAIL_SCAN_CHUNK_SIZE);
+	let newlines = 0;
+	let position = 0;
+	let lastByte = -1;
+	const handle = await fs.open(filePath, "r");
+	let identity: SeekFileIdentity;
+	try {
+		const stat = await handle.stat();
+		identity = { ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs };
+		while (true) {
+			throwIfAborted(signal);
+			const { bytesRead } = await handle.read(chunk, 0, chunk.length, position);
+			if (bytesRead === 0) break;
+			const view = chunk.subarray(0, bytesRead);
+			for (let at = view.indexOf(LF_BYTE); at !== -1; at = view.indexOf(LF_BYTE, at + 1)) {
+				newlines++;
+				if (keep > 0) starts[newlines % keep] = position + at + 1;
+			}
+			position += bytesRead;
+			lastByte = view[bytesRead - 1];
+		}
+	} finally {
+		await handle.close();
+	}
+	// A write during the scan leaves offsets that the identity no longer vouches for.
+	if (position !== identity.size) identity = { ...identity, ino: -1 };
+	// Mirror the streamer's final-line rule: an empty file, an unterminated last
+	// line, or (raw mode) the empty segment after a terminal newline is a line.
+	const endsWithNewline = lastByte === LF_BYTE;
+	const hasFinalLine = position === 0 || !endsWithNewline || includeTerminalNewline;
+	const totalLines = newlines + (hasFinalLine ? 1 : 0);
+	return {
+		sel: resolveTailSelector(parsed, totalLines),
+		seekTo: line =>
+			line > 0 && line <= newlines && newlines - line < keep
+				? { line, byte: starts[line % keep], identity }
+				: undefined,
+	};
 }
 
 const IMAGE_QUESTION_SELECTOR_ERROR =
@@ -640,6 +756,17 @@ interface LocatedRead {
 	spec: SchemeSpec;
 }
 
+interface FilesystemReadOptions {
+	located?: LocatedRead;
+	question?: string;
+	/** Model-facing path for `?q=` hints; defaults to the displayed file path. */
+	questionPath?: string;
+	signal?: AbortSignal;
+	onBufferedFile?: (bytes: Buffer) => void;
+	onConflictMarkers?: () => void;
+	lexicalAbsolutePath?: string;
+}
+
 /**
  * Workflow hint for a large located file: page it through its URL, search/copy its backing
  * file. `rawBlocked` explains a refused whole-file `:raw` read.
@@ -652,19 +779,6 @@ function formatLocatedFileNotice(url: string, backingPath: string, size: number,
 }
 
 /**
- * Kind of a non-regular, non-directory file, or undefined. Reading one in-process can block
- * forever (a FIFO, `/dev/stdin` on the TUI's terminal) or never end (`/dev/zero`).
- */
-function specialFileKind(stat: Stats): string | undefined {
-	if (stat.isFile() || stat.isDirectory()) return undefined;
-	if (stat.isCharacterDevice()) return "character device";
-	if (stat.isBlockDevice()) return "block device";
-	if (stat.isFIFO()) return "FIFO";
-	if (stat.isSocket()) return "socket";
-	return "special file";
-}
-
-/**
  * Peel `?q=<question>` (ask a vision model about an image) from a plain path or a URL whose
  * scheme declares {@link SchemeSpec.imageQuestion}; every other URL owns its query string.
  */
@@ -674,6 +788,7 @@ export function splitImageQuestionTarget(readPath: string): { path: string; ques
 		if (!scheme || !InternalUrlRouter.instance().spec(scheme)?.imageQuestion) return { path: readPath };
 	}
 	if (parseSqlitePathCandidates(readPath).length > 0) return { path: readPath };
+	if (splitJsonQueryTarget(readPath)) return { path: readPath };
 
 	const queryIndex = readPath.indexOf("?");
 	if (queryIndex === -1) return { path: readPath };
@@ -764,8 +879,7 @@ export async function resolveSpeculativeReadTarget(
 	lexicalPath: string,
 ): Promise<{ ok: true; resolved: string } | { ok: false; reason: SpeculativeReadTargetFailure }> {
 	try {
-		const workspace = await fs.realpath(cwd);
-		const resolved = await fs.realpath(path.resolve(cwd, lexicalPath));
+		const [workspace, resolved] = await Promise.all([fs.realpath(cwd), fs.realpath(path.resolve(cwd, lexicalPath))]);
 		const workspaceRelativePath = path.relative(workspace, resolved);
 		if (
 			workspaceRelativePath.length === 0 ||
@@ -788,11 +902,16 @@ export async function resolveSpeculativeReadTarget(
 export interface LocalReadSpeculationEvidence {
 	kind: "local_read";
 	resource: string;
+	/** {@link digestLocalReadBytes} of the exact bytes the speculative read consumed. */
 	snapshotDigest: string;
 }
 
-function digestSnapshotText(text: string): string {
-	return new Bun.CryptoHasher("sha256").update(text).digest("hex");
+/**
+ * Digest the raw bytes of a speculative local read. The speculation host and
+ * the speculative execution must both use this, so their evidence compares.
+ */
+export function digestLocalReadBytes(bytes: Uint8Array): string {
+	return new Bun.CryptoHasher("sha256").update(bytes).digest("hex");
 }
 
 async function assessLocalReadSpeculation(
@@ -954,8 +1073,8 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				signal,
 				undefined,
 				undefined,
-				normalizedText => {
-					snapshotDigest = digestSnapshotText(normalizedText);
+				bytes => {
+					snapshotDigest = digestLocalReadBytes(bytes);
 				},
 				() => {
 					throw new Error("Conflict-aware reads require authoritative execution");
@@ -1372,7 +1491,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		allowBridge = true,
 	): Promise<{
 		outputText: string;
-		columnTruncated: number;
+		columnCut: ColumnCut | undefined;
 		displayContent?: { text: string; startLine: number; lineNumbers?: Array<number | null> };
 		bridgeResult?: AgentToolResult<ReadToolDetails>;
 	}> {
@@ -1383,7 +1502,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		if (bridgePromise !== undefined) {
 			try {
 				const bridgeText = await bridgePromise;
-				const bridgeResult = buildInMemoryMultiRangeResult(this.session, bridgeText, ranges, {
+				const bridgeResult = await buildInMemoryMultiRangeResult(this.session, bridgeText, ranges, {
 					details: markMarkdownContentType(
 						this.session,
 						{ resolvedPath: absolutePath, suffixResolution },
@@ -1398,7 +1517,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					const firstText = bridgeResult.content.find((c): c is TextContent => c.type === "text");
 					if (firstText) firstText.text = `${notice}\n${firstText.text}`;
 				}
-				return { outputText: "", columnTruncated: 0, bridgeResult };
+				return { outputText: "", columnCut: undefined, bridgeResult };
 			} catch (error) {
 				logger.warn("ACP fs readTextFile failed; falling back to disk", { path: absolutePath, error });
 			}
@@ -1413,7 +1532,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		const visibleSpans: Array<{ startLine: number; endLine: number }> = [];
 		const displayLineByNumber = new Map<number, string>();
 		const fullLines = rawSelector ? undefined : buffered?.addressableLines;
-		let columnTruncated = 0;
+		let columnCut: ColumnCut | undefined;
 		let displayContent: { text: string; startLine: number; lineNumbers?: Array<number | null> } | undefined;
 
 		for (const range of ranges) {
@@ -1458,7 +1577,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					if (wasTruncated) {
 						if (!cloned) cloned = collectedLines.slice();
 						cloned[i] = text;
-						columnTruncated = maxColumns;
+						columnCut = addColumnCut(columnCut, maxColumns, range.startLine + i);
 					}
 				}
 				if (cloned) displayLines = cloned;
@@ -1478,6 +1597,9 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 
 		let outputText: string;
 		if (!rawSelector && fullLines && visibleSpans.length > 0) {
+			if (buffered && !spansCoverEveryLine(visibleSpans, fullLines.length)) {
+				await warmBlockContext({ path: absolutePath, text: buffered.normalizedText });
+			}
 			const entries = buildLineEntriesWithBlockContext(
 				fullLines,
 				visibleSpans,
@@ -1489,7 +1611,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						if (maxColumns <= 0) return sourceText;
 						const truncated = truncateLine(sourceText, maxColumns);
 						if (truncated.wasTruncated) {
-							columnTruncated = maxColumns;
+							columnCut = addColumnCut(columnCut, maxColumns, lineNumber);
 						}
 						return truncated.text;
 					},
@@ -1526,7 +1648,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		if (notices.length > 0) {
 			outputText = outputText ? `${outputText}\n${notices.join("\n")}` : notices.join("\n");
 		}
-		return { outputText, columnTruncated, displayContent };
+		return { outputText, columnCut, displayContent };
 	}
 
 	async execute(
@@ -1549,7 +1671,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		signal?: AbortSignal,
 		_onUpdate?: AgentToolUpdateCallback<ReadToolDetails>,
 		_toolContext?: AgentToolContext,
-		onBufferedFile?: (normalizedText: string) => void,
+		onBufferedFile?: (bytes: Buffer) => void,
 		onConflictMarkers?: () => void,
 		lexicalAbsolutePath?: string,
 	): Promise<AgentToolResult<ReadToolDetails>> {
@@ -1653,19 +1775,24 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 	 * The filesystem read pipeline: directories, archives, sqlite, PDFs, video,
 	 * images, documents, notebooks, and streamed/paged text. `located` carries
 	 * the URL a routed read resolved to `readPath`; its hints name that URL.
+	 * A whole read of a file Tern's media viewer shows records it as display-only
+	 * `details.mediaPath`, whatever content the model receives.
 	 */
 	async #readFilesystemPath(
 		readPath: string,
-		options: {
-			located?: LocatedRead;
-			question?: string;
-			/** Model-facing path for `?q=` hints; defaults to the displayed file path. */
-			questionPath?: string;
-			signal?: AbortSignal;
-			onBufferedFile?: (normalizedText: string) => void;
-			onConflictMarkers?: () => void;
-			lexicalAbsolutePath?: string;
-		},
+		options: FilesystemReadOptions,
+	): Promise<AgentToolResult<ReadToolDetails>> {
+		const media: { path?: string } = {};
+		const result = await this.#readFilesystemPipeline(readPath, options, media);
+		if (media.path === undefined || result.isError) return result;
+		return { ...result, details: { ...result.details, mediaPath: media.path } };
+	}
+
+	/** {@link #readFilesystemPath}'s body; sets `media.path` once the read is known to be a whole Tern-viewable file. */
+	async #readFilesystemPipeline(
+		readPath: string,
+		options: FilesystemReadOptions,
+		media: { path?: string },
 	): Promise<AgentToolResult<ReadToolDetails>> {
 		const { located, question, questionPath, signal, onBufferedFile, onConflictMarkers, lexicalAbsolutePath } =
 			options;
@@ -1710,6 +1837,10 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			const sqlitePath = await resolveSqliteReadPath(this.session, readPath, suffixCache, signal);
 			if (sqlitePath) {
 				return readSqlite(sqlitePath, signal);
+			}
+			const jsonPath = await resolveJsonReadPath(this.session, literalSplit.path, suffixCache, signal);
+			if (jsonPath) {
+				return readJson(this.session, jsonPath, literalSplit.sel, signal);
 			}
 
 			// `bin:main`, `bin:imports`, `bin:main:10-40`: an executable/IDB prefix
@@ -1866,6 +1997,14 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				.done();
 		}
 
+		// Whole-file reads only (no selector, `:raw`, `:img`); line ranges and video frames show their slice.
+		if (
+			(localTarget.sel === undefined || parsed.kind === "raw" || parsed.kind === "image") &&
+			ternShowsMedia(absolutePath)
+		) {
+			media.path = absolutePath;
+		}
+
 		const ext = path.extname(renderAbsolutePath).toLowerCase();
 		// Buffer once for every consumer below: the image sniff, the binary sniff,
 		// the structural summary, the rendered window, bracket context, and the
@@ -1907,7 +2046,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		let details: ReadToolDetails = {};
 		let sourcePath: string | undefined;
 		let pagedSource = false;
-		let columnTruncated = 0;
+		let columnCut: ColumnCut | undefined;
 		let truncationInfo:
 			| {
 					result: TruncationResult;
@@ -2028,7 +2167,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			}
 			// Decode only what survived the sniff.
 			const buffered = wholeFileBytes ? deriveBufferedFileText(wholeFileBytes) : undefined;
-			if (buffered) onBufferedFile?.(buffered.normalizedText);
+			if (buffered) onBufferedFile?.(buffered.bytes);
 
 			// Unbounded schemes (instruction documents) read whole: no summary, no result limits.
 			if (located?.spec.unbounded) {
@@ -2098,7 +2237,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			}
 
 			if (!content) {
-				const sel = await resolveFileTailSelector(parsed, absolutePath, buffered);
+				const { sel, seekTo: tailSeekTo } = await resolveFileTailSelector(parsed, absolutePath, buffered);
 				if (sel.kind === "lines" && sel.ranges.length > 1) {
 					const multiResult = await this.#readLocalFileMultiRange(
 						absolutePath,
@@ -2115,9 +2254,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					content = [{ type: "text", text: multiResult.outputText }];
 					sourcePath = absolutePath;
 					details = multiResult.displayContent ? { displayContent: multiResult.displayContent } : {};
-					if (multiResult.columnTruncated > 0) {
-						columnTruncated = multiResult.columnTruncated;
-					}
+					columnCut = multiResult.columnCut;
 				} else {
 					// Raw text or line-range mode
 					const { offset, limit } = selToOffsetLimit(sel);
@@ -2128,7 +2265,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					if (bridgePromise !== undefined) {
 						try {
 							const bridgeText = await bridgePromise;
-							const bridgeResult = buildInMemoryTextResult(this.session, bridgeText, offset, limit, {
+							const bridgeResult = await buildInMemoryTextResult(this.session, bridgeText, offset, limit, {
 								details: markMarkdownContentType(
 									this.session,
 									{ resolvedPath: absolutePath, suffixResolution },
@@ -2187,7 +2324,11 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 								maxBytesForRead,
 								selectedLineLimit,
 								undefined, // plain-file read: deterministic and fast, never abort mid-read
-								{ includeTerminalNewline: rawSelector, stopScanAfterCollect: fileSize > SNAPSHOT_MAX_BYTES },
+								{
+									includeTerminalNewline: rawSelector,
+									stopScanAfterCollect: fileSize > SNAPSHOT_MAX_BYTES,
+									seek: tailSeekTo?.(startLine),
+								},
 							);
 
 					const {
@@ -2234,7 +2375,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 							if (wasTruncated) {
 								if (!cloned) cloned = collectedLines.slice();
 								cloned[i] = text;
-								columnTruncated = maxColumns;
+								columnCut = addColumnCut(columnCut, maxColumns, startLineDisplay + i);
 							}
 						}
 						if (cloned) displayLines = cloned;
@@ -2253,6 +2394,17 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					const totalSelectedLines = totalFileLines - startLine;
 					const wasTruncated = reachedEof && (collectedLines.length < totalSelectedLines || stoppedByByteLimit);
 					const firstLineExceedsLimit = firstLineByteLength !== undefined && firstLineByteLength > maxBytesForRead;
+					if (
+						bracketContextFullLines &&
+						buffered &&
+						!firstLineExceedsLimit &&
+						!spansCoverEveryLine(
+							[{ startLine: startLineDisplay, endLine: displayedEndLine }],
+							bracketContextFullLines.length,
+						)
+					) {
+						await warmBlockContext({ path: absolutePath, text: buffered.normalizedText });
+					}
 					const omittedSelectedLine = omittedRequestedLine(
 						byteLimitLine,
 						requestedStart,
@@ -2335,7 +2487,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 									if (maxColumns <= 0) return sourceText;
 									const truncated = truncateLine(sourceText, maxColumns);
 									if (truncated.wasTruncated) {
-										columnTruncated = maxColumns;
+										columnCut = addColumnCut(columnCut, maxColumns, lineNumber);
 									}
 									return truncated.text;
 								},
@@ -2537,8 +2689,12 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		if (truncationInfo) {
 			resultBuilder.truncation(truncationInfo.result, truncationInfo.options);
 		}
-		if (columnTruncated > 0) {
-			resultBuilder.limits({ columnMax: columnTruncated });
+		if (columnCut) {
+			resultBuilder.limits({
+				columnMax: columnCut.maxColumn,
+				columnLines: { first: columnCut.first, last: columnCut.last },
+				columnSelectorBase: selectorBase,
+			});
 		}
 		return resultBuilder.done();
 	}
@@ -2592,7 +2748,16 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		question: string | undefined,
 		signal?: AbortSignal,
 	): Promise<AgentToolResult<ReadToolDetails>> {
-		if (parsedSel.kind === "image") throw new ToolError("The ':img' selector requires a file-backed path.");
+		if (parsedSel.kind === "image") {
+			// A file-backed URL that locate deferred to a remote resolve (an unknown skill:// while
+			// MCP is available) reports its local miss (`Unknown skill`), not the selector refusal.
+			if (spec.backing === "file") {
+				await InternalUrlRouter.instance().locate(url, sessionResolveContext(this.session, { signal }), {
+					localOnly: true,
+				});
+			}
+			throw new ToolError("The ':img' selector requires a file-backed path.");
+		}
 		const resource = await InternalUrlRouter.instance().resolve(url, sessionResolveContext(this.session, { signal }));
 		if (question !== undefined) throw new ToolError(IMAGE_QUESTION_SELECTOR_ERROR);
 		const resourceDetails: NonNullable<InternalResource["details"]> = resource.details ?? {};
@@ -2616,7 +2781,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			sourcePath: resource.sourcePath,
 			sourceInternal: url,
 			entityLabel: "resource",
-			ignoreResultLimits: spec.unbounded === true,
+			ignoreResultLimits: resource.unbounded ?? spec.unbounded === true,
 			immutable: resource.immutable,
 		});
 	}

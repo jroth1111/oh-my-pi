@@ -15,6 +15,8 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/turn-recovery";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createProviderErrorMessage } from "../../ai/src/providers/error-message";
+import { streamFactoryDroidGemini } from "../../ai/src/providers/factory-droid/gemini";
+import { captureFetch, gemini as factoryGemini } from "../../ai/test/helpers/factory-droid";
 
 const USAGE: Usage = {
 	input: 0,
@@ -48,9 +50,11 @@ function createHost(
 		messages?: readonly AgentMessage[];
 		lastModelChangeRole?: string;
 		modelRoles?: Record<string, string>;
+		shakeSucceeds?: boolean;
 	} = {},
 ): TurnRecoveryHost {
 	const settings = Settings.isolated({
+		"retry.baseDelayMs": 1,
 		...(options.fallbackChains ? { "retry.fallbackChains": options.fallbackChains } : {}),
 		...(options.modelRoles ? { modelRoles: options.modelRoles } : {}),
 	});
@@ -69,6 +73,9 @@ function createHost(
 		} as never,
 		sessionManager: {
 			getLastModelChangeRole: () => options.lastModelChangeRole,
+			getBranch: () => [],
+			getBranchView: () => [],
+			getSessionId: () => "test-session",
 		} as never,
 		persistedAssistantEntryId: () => undefined,
 		settings,
@@ -100,7 +107,7 @@ function createHost(
 		resetCurrentResponsesProviderSession: () => {},
 		maybeAutoRedeemReset: async () => ({ restored: false }),
 		runAutoCompaction: async () => ({ continuationScheduled: false }) as RecoveryCompactionResult,
-		shakeForRequestBodyReadTimeout: async () => false,
+		shakeForRequestBodyReadTimeout: async () => options.shakeSucceeds === true,
 		withBashBranchTransition: <T>(operation: () => T): T => operation(),
 	};
 }
@@ -274,6 +281,119 @@ describe("TurnRecovery replay-unsafe output classification", () => {
 		expect(modelChanges).toEqual([`${fallback.provider}/${fallback.id}`]);
 	});
 
+	it("does not reconnect a tool turn whose side-effect outcome is unresolved", async () => {
+		const message = makeMessage([{ type: "toolCall", id: "unknown-call", name: "write", arguments: {} }], model);
+		message.errorMessage = "Connection error";
+		const host = createHost(model, modelRegistry, { messages: [message] });
+		host.settings = Settings.isolated({ "retry.waitForConnection": true });
+		let scheduled = false;
+		host.scheduleAgentContinue = () => {
+			scheduled = true;
+		};
+		const recovery = new TurnRecovery(host);
+		expect(await recovery.handleConnectivityError(message)).toBe(false);
+		expect(scheduled).toBe(false);
+		expect(host.agent.state.messages).toEqual([message]);
+	});
+
+	it("cancels a connection wait superseded by a new prompt generation", async () => {
+		const message = makeMessage([], model);
+		message.errorMessage = "fetch failed";
+		const host = createHost(model, modelRegistry, { messages: [message] });
+		host.settings = Settings.isolated({ "retry.baseDelayMs": 1, "retry.waitForConnection": true });
+		host.sessionManager = {
+			getBranchView: () => [],
+			getBranch: () => [],
+			getSessionId: () => "generation-test",
+		} as never;
+		let generation = 0;
+		let scheduled = false;
+		const events: string[] = [];
+		host.promptGeneration = () => generation;
+		host.emitSessionEvent = async event => {
+			events.push(event.type);
+			if (event.type === "auto_retry_start") generation++;
+		};
+		host.scheduleAgentContinue = () => {
+			scheduled = true;
+		};
+		const recovery = new TurnRecovery(host);
+		expect(await recovery.handleConnectivityError(message)).toBe(true);
+		expect(scheduled).toBe(false);
+		expect(events).toEqual(["auto_retry_start", "auto_retry_end"]);
+		expect(recovery.retryPromise).toBeUndefined();
+	});
+
+	it("honors cancellation during persistence before starting a connection backoff", async () => {
+		const message = makeMessage([], model);
+		message.errorMessage = "fetch failed";
+		const host = createHost(model, modelRegistry, { messages: [message] });
+		host.settings = Settings.isolated({ "retry.baseDelayMs": 30_000, "retry.waitForConnection": true });
+		host.sessionManager = {
+			getBranchView: () => [],
+			getBranch: () => [],
+			getSessionId: () => "persistence-test",
+		} as never;
+		const persisting = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		host.waitForSessionMessagePersistence = async () => {
+			persisting.resolve();
+			await release.promise;
+		};
+		const events: string[] = [];
+		host.emitSessionEvent = async event => {
+			events.push(event.type);
+		};
+		const recovery = new TurnRecovery(host);
+		const handling = recovery.handleConnectivityError(message);
+		await persisting.promise;
+		recovery.abortRetry();
+		release.resolve();
+		expect(await handling).toBe(true);
+		expect(events).toEqual(["auto_retry_end"]);
+		expect(recovery.retryPromise).toBeUndefined();
+	});
+
+	it("a separate network classification cannot hide a terminal configuration diagnostic", async () => {
+		const message = makeMessage([], model);
+		message.errorMessage = "Connection configuration error: fetch failed";
+		message.errorClassificationMessage = "fetch failed";
+		const host = createHost(model, modelRegistry, { messages: [message] });
+		host.settings = Settings.isolated({ "retry.waitForConnection": true });
+		const recovery = new TurnRecovery(host);
+		expect(await recovery.handleConnectivityError(message)).toBe(false);
+		expect(recovery.retryPromise).toBeUndefined();
+	});
+
+	it("does not let an old connection continuation fail or cancel a newer retry saga", async () => {
+		const message = makeMessage([], model);
+		message.errorMessage = "fetch failed";
+		const host = createHost(model, modelRegistry, { messages: [message] });
+		host.settings = Settings.isolated({ "retry.baseDelayMs": 1, "retry.waitForConnection": true });
+		host.sessionManager = { getBranchView: () => [], getSessionId: () => "stale-continue-test" } as never;
+		const continuations: Array<Parameters<TurnRecoveryHost["scheduleAgentContinue"]>[0]> = [];
+		host.scheduleAgentContinue = options => continuations.push(options);
+		const recovery = new TurnRecovery(host);
+		await recovery.handleConnectivityError(message);
+		const old = continuations[0];
+		if (!old) throw new Error("Expected the first connection continuation");
+		recovery.abortRetry();
+		await recovery.handleConnectivityError({ ...message, timestamp: message.timestamp + 1 });
+		const pending = recovery.retryPromise;
+		expect(pending).toBeDefined();
+		expect(old.shouldContinue?.()).toBe(false);
+		old.onError?.(new Error("late continuation failure"));
+		old.onSkip?.();
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(recovery.retryPromise).toBe(pending);
+		const current = continuations[1];
+		if (!current) throw new Error("Expected a new connection continuation");
+		current.onSkip?.();
+		await pending;
+		expect(recovery.isRetrying).toBe(false);
+	});
+
 	it("treats a failed turn with partial non-whitespace text as NOT retriable", () => {
 		const recovery = new TurnRecovery(createHost(model, modelRegistry));
 		const message = makeMessage([{ type: "text", text: "Here is the first part of my answer" }], model);
@@ -319,6 +439,43 @@ describe("TurnRecovery replay-unsafe output classification", () => {
 		};
 		const recovery = new TurnRecovery(createHost(model, modelRegistry, { messages: [message] }));
 		expect(await recovery.handleResponsesRequestBodyReadTimeout(message)).toBe("not-applicable");
+	});
+
+	describe("full-replay timeout one-shot lifecycle", () => {
+		const timeoutTurn = (): AssistantMessage => ({
+			...makeMessage([], model),
+			api: "openai-responses" as const,
+			errorStatus: 408,
+			errorMessage: "Timed out reading request body.",
+			requestBodyReadTimeoutFullReplay: true,
+		});
+		const settledTurn = (content: AssistantMessage["content"]): AssistantMessage => ({
+			...makeMessage(content, model),
+			stopReason: "stop" as const,
+			errorMessage: undefined,
+		});
+
+		it("re-arms the recovery after an intervening turn that produced output", async () => {
+			const recovery = new TurnRecovery(createHost(model, modelRegistry, { shakeSucceeds: true }));
+			expect(await recovery.handleResponsesRequestBodyReadTimeout(timeoutTurn())).toBe("handled-retry");
+			await recovery.onAssistantSettledSuccessfully(
+				settledTurn([{ type: "toolCall", id: "call-progress", name: "bash", arguments: { command: "pwd" } }]),
+			);
+			expect(await recovery.handleResponsesRequestBodyReadTimeout(timeoutTurn())).toBe("handled-retry");
+		});
+
+		it("stays bound to one changed retry while the same prompt makes no progress", async () => {
+			const recovery = new TurnRecovery(createHost(model, modelRegistry, { shakeSucceeds: true }));
+			expect(await recovery.handleResponsesRequestBodyReadTimeout(timeoutTurn())).toBe("handled-retry");
+			expect(await recovery.handleResponsesRequestBodyReadTimeout(timeoutTurn())).toBe("handled-terminal");
+		});
+
+		it("does not re-arm on a settled turn that produced no output", async () => {
+			const recovery = new TurnRecovery(createHost(model, modelRegistry, { shakeSucceeds: true }));
+			expect(await recovery.handleResponsesRequestBodyReadTimeout(timeoutTurn())).toBe("handled-retry");
+			await recovery.onAssistantSettledSuccessfully(settledTurn([]));
+			expect(await recovery.handleResponsesRequestBodyReadTimeout(timeoutTurn())).toBe("handled-terminal");
+		});
 	});
 
 	it("does not replay a long OpenCode Go usage limit after committed text", () => {
@@ -1215,6 +1372,24 @@ describe("TurnRecovery replay-unsafe output classification", () => {
 				expect(new TurnRecovery(host).handleCommittedTextStreamStall(message)).toBe(true);
 				expect(continues).toEqual(["stream-stall-continue"]);
 			}
+		});
+
+		it("resumes a Factory Droid Gemini text stream that ends without a finish reason", async () => {
+			const truncated = JSON.stringify({
+				candidates: [{ content: { role: "model", parts: [{ text: "Here is the first half" }] } }],
+			});
+			const message = await streamFactoryDroidGemini(
+				factoryGemini(),
+				{ messages: [{ role: "user", content: "hi", timestamp: 1 }] },
+				{
+					baseUrl: "https://api.factory.ai/api/llm/g/v1",
+					headers: { "x-api-provider": "google" },
+					fetch: captureFetch([], [truncated]),
+				},
+			).result();
+			const { host, continues } = continuationHost(message);
+			expect(new TurnRecovery(host).handleCommittedTextStreamStall(message)).toBe(true);
+			expect(continues).toEqual(["stream-stall-continue"]);
 		});
 
 		it("stops continuing past the per-prompt cap and resets on a new prompt", () => {

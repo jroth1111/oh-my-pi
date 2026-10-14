@@ -85,6 +85,7 @@ export const eventDefs = {
 	},
 	AutoRetryStartEvent: {
 		type: "'auto_retry_start'",
+		"connectivity?": doc("boolean", "Waiting without an attempt limit for a failed provider connection."),
 		attempt: "number.integer",
 		maxAttempts: "number.integer",
 		delayMs: "number.integer",
@@ -153,7 +154,18 @@ export const eventDefs = {
 		"Goal mode changed, by a host `goal` command or the agent's `goal` tool.",
 	),
 	QueueUpdateEvent: doc(
-		{ type: "'queue_update'", steering: "string[]", followUp: "string[]" },
+		{
+			type: "'queue_update'",
+			steering: "string[]",
+			followUp: "string[]",
+			liveSteered: absentAs(
+				doc(
+					"number.integer",
+					"Leading `steering` entries are live steering already sent into the streaming response; `remove_queued_message` cannot reach them.",
+				),
+				0,
+			),
+		},
 		"Coalesced snapshot of the displayable steering/follow-up queue, sent whenever it changes.",
 	),
 
